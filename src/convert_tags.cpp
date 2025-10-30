@@ -11,7 +11,7 @@ using namespace panindexer;
 using handlegraph::pos_t;
 
 static void usage(const char* prog) {
-    cerr << "Usage: " << prog << " <input_algorithm_file> <output_compressed_file> [encoded_starts_tmp] [bwt_intervals_tmp]\n";
+    cerr << "Usage: " << prog << " <input_algorithm_file> <output_compressed_file> [--num-seq N]\n";
 }
 
 int main(int argc, char** argv) {
@@ -23,19 +23,30 @@ int main(int argc, char** argv) {
     const string input_file = argv[1];
     const string output_file = argv[2];
 
-    string encoded_starts_tmp;
-    string bwt_intervals_tmp;
+    // Default sidecar tmp paths; we always auto-generate
+    string encoded_starts_tmp = output_file + ".encoded_starts.tmp";
+    string bwt_intervals_tmp = output_file + ".bwt_intervals.tmp";
 
-    if (argc >= 4) {
-        encoded_starts_tmp = argv[3];
-    } else {
-        encoded_starts_tmp = output_file + ".encoded_starts.tmp";
-    }
-
-    if (argc >= 5) {
-        bwt_intervals_tmp = argv[4];
-    } else {
-        bwt_intervals_tmp = output_file + ".bwt_intervals.tmp";
+    // Flags parsing (after 2 required positional args)
+    size_t bwt_offset = 0; // Optional initial BWT offset (e.g., number of sequences)
+    for (int i = 3; i < argc; ++i) {
+        string arg = argv[i];
+        if (arg == "--num-seq" || arg == "-n") {
+            if (i + 1 >= argc) {
+                cerr << "Error: missing value for " << arg << "\n";
+                return 1;
+            }
+            try {
+                bwt_offset = static_cast<size_t>(stoull(argv[++i]));
+            } catch (const std::exception&) {
+                cerr << "Error: invalid value for --num-seq (expected unsigned integer)\n";
+                return 1;
+            }
+        } else {
+            cerr << "Error: unknown option '" << arg << "'\n";
+            usage(argv[0]);
+            return 1;
+        }
     }
 
     // Read the entire input file (algorithm.hpp format: raw gbwt::ByteCode runs) into memory
@@ -67,17 +78,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Open outputs
-    ofstream main_out(output_file, ios::binary | ios::trunc);
-    if (!main_out) {
-        cerr << "Error: cannot open output file: " << output_file << "\n";
-        return 1;
-    }
-
-    // Reserve space for encoded_runs size header; will be filled in merge step
-    size_t zero_size = 0;
-    main_out.write(reinterpret_cast<const char*>(&zero_size), sizeof(zero_size));
-
+    // Open sidecar outputs (encoded_starts and bwt_intervals). Encoded runs go to a temp int_vector file.
     ofstream encoded_starts_out(encoded_starts_tmp, ios::binary | ios::trunc);
     if (!encoded_starts_out) {
         cerr << "Error: cannot open tmp file: " << encoded_starts_tmp << "\n";
@@ -91,42 +92,219 @@ int main(int argc, char** argv) {
     }
 
     TagArray tag_array;
+    
+    // Pass 1: find max node id to determine width bits for int_vector encoding
+    uint64_t scan_loc = 0;
+    uint64_t max_node_id = 0;
+    if (bwt_offset > 0) { max_node_id = std::max<uint64_t>(max_node_id, 0); }
+    while (scan_loc < encoded_bytes.size()) {
+        gbwt::size_type decc = gbwt::ByteCode::read(encoded_bytes, scan_loc);
+        auto decoded = TagArray::decode_run(decc);
+        uint64_t nid = gbwtgraph::id(decoded.first);
+        if (nid > max_node_id) max_node_id = nid;
+    }
+    auto compute_bits = [](uint64_t x) -> size_t {
+        if (x == 0) return 1;
+        return 64 - __builtin_clzll(x);
+    };
+    size_t node_bits = compute_bits(max_node_id);
+    size_t width_bits = 10 + 1 + node_bits; // offset(10) + is_rev(1) + node id bits
 
-    // Decode runs and stream them into compressed serializer in batches
-    const size_t batch_runs = 8192;
-    vector<pair<pos_t, uint16_t>> batch;
-    batch.reserve(batch_runs);
+    // Prepare temp file for encoded runs (sdsl int_vector<0>) and stream runs
+    const std::string encoded_runs_path = output_file + ".encoded_runs.tmp";
+    tag_array.begin_encoded_runs_sdsl(encoded_runs_path, width_bits);
+
+    // Pass 2: stream all runs into encoded_runs_iv and sidecars
+    // Note: runs are already merged by build_tags, BUT we need to check if the first run
+    // should be merged with endmarkers if bwt_offset > 0
+    
+    // Track the previous run to handle merging with endmarkers
+    pos_t previous_tag;
+    uint16_t previous_length = 0;
+    bool has_previous = false;
+    
+    // Prepend endmarkers if requested
+    if (bwt_offset > 0) {
+        previous_tag = pos_t{0, 0, 0};
+        previous_length = static_cast<uint16_t>(bwt_offset);
+        has_previous = true;
+    }
 
     uint64_t loc = 0;
     while (loc < encoded_bytes.size()) {
         gbwt::size_type decc = gbwt::ByteCode::read(encoded_bytes, loc);
         auto decoded = TagArray::decode_run(decc);
-        batch.emplace_back(decoded.first, decoded.second);
-        if (batch.size() >= batch_runs) {
-            tag_array.compressed_serialize_compact(main_out, encoded_starts_out, bwt_intervals_out, batch);
-            batch.clear();
+        
+        // If current run has the same tag as previous, merge them (like merge_tags does)
+        if (has_previous && previous_tag == decoded.first) {
+            // Merge runs: add the lengths together
+            uint32_t merged_length = static_cast<uint32_t>(previous_length) + static_cast<uint32_t>(decoded.second);
+            // Handle uint16_t overflow
+            while (merged_length > 65535) {
+                tag_array.append_compact_run_streamed(previous_tag, 65535, encoded_starts_out, bwt_intervals_out);
+                merged_length -= 65535;
+            }
+            previous_length = static_cast<uint16_t>(merged_length);
+            // previous_tag stays the same
+        } else {
+            // Write previous run if it exists, then start new one
+            if (has_previous) {
+                tag_array.append_compact_run_streamed(previous_tag, previous_length, encoded_starts_out, bwt_intervals_out);
+            }
+            previous_tag = decoded.first;
+            previous_length = decoded.second;
+            has_previous = true;
         }
     }
-    if (!batch.empty()) {
-        tag_array.compressed_serialize_compact(main_out, encoded_starts_out, bwt_intervals_out, batch);
-        batch.clear();
+
+    // Write the last run
+    if (has_previous) {
+        tag_array.append_compact_run_streamed(previous_tag, previous_length, encoded_starts_out, bwt_intervals_out);
     }
 
-    main_out.flush();
-    main_out.close();
+    // Finish encoded runs iv
+    tag_array.end_encoded_runs_sdsl();
     encoded_starts_out.flush();
     encoded_starts_out.close();
     bwt_intervals_out.flush();
     bwt_intervals_out.close();
 
-    // Merge sidecar tmp files into the main compressed index and write header
+    // Write encoded runs iv into main index file, then append sdsl sidecars
     try {
-        tag_array.merge_compressed_files(output_file, encoded_starts_tmp, bwt_intervals_tmp);
+        // Write encoded_runs_iv first
+        {
+            std::ofstream main_out(output_file, std::ios::binary | std::ios::trunc);
+            if (!main_out) { cerr << "Error: cannot open output file: " << output_file << "\n"; return 1; }
+            std::ifstream iv_in(encoded_runs_path, std::ios::binary);
+            if (!iv_in) { cerr << "Error: cannot open temp encoded runs: " << encoded_runs_path << "\n"; return 1; }
+            tag_array.load_encoded_runs_sdsl(iv_in);
+            tag_array.serialize_encoded_runs_sdsl(main_out);
+        }
+        std::remove(encoded_runs_path.c_str());
+
+        // Append encoded_starts_sd and bwt_intervals
+        tag_array.merge_compressed_files_sdsl(output_file, encoded_starts_tmp, bwt_intervals_tmp);
     } catch (const std::exception& e) {
         cerr << "Error while merging compressed files: " << e.what() << "\n";
         return 1;
     }
 
+    // Verification: Try to load the converted file
+    cerr << "\n=== Verification: Testing file loading ===" << endl;
+    try {
+        TagArray verify_array;
+        std::ifstream verify_in(output_file, std::ios::binary);
+        if (!verify_in) {
+            cerr << "ERROR: Cannot open converted file for verification: " << output_file << endl;
+            return 1;
+        }
+        verify_array.load_compressed_tags_compact(verify_in);
+        cerr << "✓ Successfully loaded converted file!" << endl;
+        cerr << "  - Number of runs: " << verify_array.number_of_runs_compressed() << endl;
+        cerr << "  - Bytes in encoded runs: " << verify_array.bytes_encoded_runs() << endl;
+        cerr << "  - Bytes in encoded starts: " << verify_array.bytes_encoded_runs_starts_sd() << endl;
+        cerr << "  - Bytes in BWT intervals: " << verify_array.bytes_bwt_intervals() << endl;
+        cerr << "  - Total bytes: " << verify_array.bytes_total_compressed() << endl;
+        verify_in.close();
+    } catch (const std::exception& e) {
+        cerr << "ERROR: Failed to load converted file: " << e.what() << endl;
+        return 1;
+    }
+
+    // Comparison: Try to load and compare with merge_tags output
+    const string merge_tags_file = "whole_genome_tag_array_compressed.tags";
+    cerr << "\n=== Comparison: Checking against merge_tags output ===" << endl;
+    try {
+        std::ifstream merge_file(merge_tags_file, std::ios::binary);
+        if (!merge_file) {
+            cerr << "Note: Cannot find merge_tags file (" << merge_tags_file << ") for comparison" << endl;
+        } else {
+            TagArray merge_array;
+            merge_array.load_compressed_tags_compact(merge_file);
+            cerr << "✓ Successfully loaded merge_tags file!" << endl;
+            cerr << "  - Number of runs: " << merge_array.number_of_runs_compressed() << endl;
+            cerr << "  - Bytes in encoded runs: " << merge_array.bytes_encoded_runs() << endl;
+            cerr << "  - Bytes in encoded starts: " << merge_array.bytes_encoded_runs_starts_sd() << endl;
+            cerr << "  - Bytes in BWT intervals: " << merge_array.bytes_bwt_intervals() << endl;
+            cerr << "  - Total bytes: " << merge_array.bytes_total_compressed() << endl;
+
+            // Now compare with converted file
+            TagArray converted_array;
+            std::ifstream converted_in(output_file, std::ios::binary);
+            converted_array.load_compressed_tags_compact(converted_in);
+            converted_in.close();
+
+            bool matches = true;
+            if (converted_array.number_of_runs_compressed() != merge_array.number_of_runs_compressed()) {
+                cerr << "✗ MISMATCH: Number of runs differs: " 
+                     << converted_array.number_of_runs_compressed() << " vs " 
+                     << merge_array.number_of_runs_compressed() << endl;
+                matches = false;
+            }
+            if (converted_array.bytes_encoded_runs() != merge_array.bytes_encoded_runs()) {
+                cerr << "✗ MISMATCH: Encoded runs bytes differ: " 
+                     << converted_array.bytes_encoded_runs() << " vs " 
+                     << merge_array.bytes_encoded_runs() << endl;
+                matches = false;
+            }
+            if (converted_array.bytes_encoded_runs_starts_sd() != merge_array.bytes_encoded_runs_starts_sd()) {
+                cerr << "✗ MISMATCH: Encoded starts bytes differ: " 
+                     << converted_array.bytes_encoded_runs_starts_sd() << " vs " 
+                     << merge_array.bytes_encoded_runs_starts_sd() << endl;
+                matches = false;
+            }
+            if (converted_array.bytes_bwt_intervals() != merge_array.bytes_bwt_intervals()) {
+                cerr << "✗ MISMATCH: BWT intervals bytes differ: " 
+                     << converted_array.bytes_bwt_intervals() << " vs " 
+                     << merge_array.bytes_bwt_intervals() << endl;
+                matches = false;
+            }
+
+            // Compare actual run data using for_each_run_compact
+            if (matches) {
+                std::vector<std::pair<pos_t, uint64_t>> converted_runs, merge_runs;
+                converted_array.for_each_run_compact([&](pos_t p, uint64_t len) {
+                    converted_runs.push_back({p, len});
+                });
+                merge_array.for_each_run_compact([&](pos_t p, uint64_t len) {
+                    merge_runs.push_back({p, len});
+                });
+
+                if (converted_runs.size() != merge_runs.size()) {
+                    cerr << "✗ MISMATCH: Run count from iteration differs: " 
+                         << converted_runs.size() << " vs " << merge_runs.size() << endl;
+                    matches = false;
+                } else {
+                    size_t diff_count = 0;
+                    for (size_t i = 0; i < converted_runs.size() && diff_count < 10; ++i) {
+                        if (converted_runs[i].first != merge_runs[i].first || 
+                            converted_runs[i].second != merge_runs[i].second) {
+                            cerr << "✗ MISMATCH: Run " << i << " differs: " 
+                                 << "pos=" << converted_runs[i].first << " len=" << converted_runs[i].second
+                                 << " vs pos=" << merge_runs[i].first << " len=" << merge_runs[i].second << endl;
+                            matches = false;
+                            diff_count++;
+                        }
+                    }
+                    if (diff_count >= 10) {
+                        cerr << "  (stopped after 10 differences)" << endl;
+                    }
+                }
+            }
+
+            if (matches) {
+                cerr << "\n✓ Files match! Converted file is identical to merge_tags output." << endl;
+            } else {
+                cerr << "\n✗ Files differ! There are differences between the converted file and merge_tags output." << endl;
+            }
+            merge_file.close();
+        }
+    } catch (const std::exception& e) {
+        cerr << "ERROR: Failed to load/compare with merge_tags file: " << e.what() << endl;
+        return 1;
+    }
+
+    cerr << "\n=== Conversion complete ===" << endl;
     return 0;
 }
 

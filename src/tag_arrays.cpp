@@ -854,8 +854,8 @@ namespace panindexer {
     }
 
     void TagArray::query_compressed_compact(size_t start, size_t end, size_t &number_of_runs) {
-        size_t first_bit_index = this->bwt_intervals_rank(start + 1);
-        size_t end_bit_index = this->bwt_intervals_rank(end + 1);
+        size_t first_bit_index = this->bwt_intervals_rank(start + 1) - 1;
+        size_t end_bit_index = this->bwt_intervals_rank(end + 1) - 1;
         auto run_nums = end_bit_index - first_bit_index + 1;
         number_of_runs = run_nums;
 
@@ -868,7 +868,7 @@ namespace panindexer {
         // Starting item index in the int_vector (not a bit location)
         size_t item_index = this->encoded_runs_sd_starts_select(current_tag_run_index / this->encoded_start_every_k_run + 1);
 
-        while (move_tags > 1){
+        while (move_tags > 0){
             (void) this->encoded_runs_iv[item_index++];
             move_tags--;
         }
@@ -878,6 +878,8 @@ namespace panindexer {
             pos_t decoded_pos = decode_run_length_compact(enc_val);
             run_nums--;
             unique_positions.push_back(gbwtgraph::Position::encode(decoded_pos).value);
+            // also print the decoded nodes
+            std::cout << gbwtgraph::id(decoded_pos) << ", " << gbwtgraph::offset(decoded_pos) << ", " << gbwtgraph::is_rev(decoded_pos) << std::endl;
         }
         std::sort(unique_positions.begin(), unique_positions.end());
         unique_positions.erase(std::unique(unique_positions.begin(), unique_positions.end()), unique_positions.end());
@@ -887,6 +889,9 @@ namespace panindexer {
             std::cout << pos << ", ";
         }
         std::cout << std::endl;
+
+        
+        
     }
 
     void TagArray::compressed_serialize_compact(std::ostream &main_out, std::ostream &encoded_starts_file, std::ostream &bwt_intervals_file, std::vector<std::pair<pos_t, uint16_t>> &tag_runs){
@@ -997,7 +1002,6 @@ namespace panindexer {
             size_t start_pos = select_tmp(r);
             size_t end_pos = (r == run_count) ? this->bwt_intervals.size() : select_tmp(r + 1);
             uint64_t run_len = end_pos - start_pos; // length in BWT positions
-            std::cerr << "Decoded position: " << decoded_pos << " Run length: " << run_len << std::endl;
             fn(decoded_pos, run_len);
         }
     }

@@ -5,11 +5,17 @@
 
 #include "../include/pangenome_index/r-index.hpp"
 #include <gbwt/utils.h>
+#include <cstdlib>
 
 
 //TODO: MAKE THE copy, swap, ... function with the new variables
 
 namespace panindexer {
+    // Debug toggle via environment variable PANINDEX_DEBUG
+    static inline bool PANIDX_DEBUG() {
+        static bool enabled = (std::getenv("PANINDEX_DEBUG") != nullptr);
+        return enabled;
+    }
     /*
   Copyright (c) 2020, 2021, 2022 Jouni Siren
 
@@ -82,8 +88,7 @@ namespace panindexer {
     }
 
     void FastLocate::EncodedBlock::skip_header(gbwt::size_type &loc) const {
-        for (size_t i = 0; i < 6; ++i) {
-            // if (!this->hasN && i == 4) { continue; }
+        for (size_t i = 0; i < this->cum_len; ++i) {
             (void) gbwt::ByteCode::read(*this->stream, loc);
         }
     }
@@ -521,7 +526,7 @@ namespace panindexer {
         if (block_id >= this->blocks_encoded_start_bits.size()) { return 0; }
         gbwt::size_type loc = static_cast<gbwt::size_type>(this->blocks_encoded_start_bits[block_id]);
         size_t end_pos = (block_id + 1 < this->blocks_encoded_start_bits.size()) ? this->blocks_encoded_start_bits[block_id + 1] : this->blocks_encoded_stream.size();
-        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, 6, &this->sym_map);
+        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
         size_t code = blk.char_at(loc, end_pos, rel);
         return this->code_to_symbol(static_cast<int>(code));
     }
@@ -575,7 +580,7 @@ namespace panindexer {
 
         gbwt::size_type loc = static_cast<gbwt::size_type>(this->blocks_encoded_start_bits[block_id]);
         size_t end_pos = (block_id + 1 < this->blocks_encoded_start_bits.size()) ? this->blocks_encoded_start_bits[block_id + 1] : this->blocks_encoded_stream.size();
-        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, 6, &this->sym_map);
+        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
         size_t cum[6] = {0,0,0,0,0,0};
         blk.read_cumulative(loc, cum);
         int target_code = this->symbol_to_code(symbol);
@@ -593,11 +598,28 @@ namespace panindexer {
     std::vector<size_t> FastLocate::rank_at_cached(size_t pos) const {
         auto iter = this->blocks_start_pos.predecessor(pos);
         std::vector<size_t> rank_vec(this->C.size(), 0);
-        for (size_t i = 0; i < this->C.size(); i++) {
+        // For each sym_map code j, find its symbol and compute cumulative in sym_map order
+        for (size_t j = 0; j < rank_vec.size(); ++j) {
+            // find symbol whose sym_map equals j
+            size_t sym = static_cast<size_t>(NENDMARKER);
+            for (size_t i = 0; i < nuc.size(); ++i) {
+                size_t s = static_cast<size_t>(nuc[i]);
+                if (static_cast<size_t>(this->sym_map[s]) == j) { sym = s; break; }
+            }
             size_t run_num = 0;
             size_t cur_pos = 0;
-            auto cum_rank = this->blocks[iter->first].rankAt(pos - iter->second, nuc[i], run_num, cur_pos);
-            rank_vec[i] = cum_rank + this->blocks[iter->first].get_cum_ranks()[this->sym_map[nuc[i]]];
+            auto cum_rank = this->blocks[iter->first].rankAt(pos - iter->second, sym, run_num, cur_pos);
+            rank_vec[j] = cum_rank + this->blocks[iter->first].get_cum_ranks()[j];
+        }
+        if (PANIDX_DEBUG()) {
+            std::cerr << "[rank_at_cached] pos=" << pos << " C.size=" << this->C.size() << " encoded?=0" << std::endl;
+            std::cerr << "  sym_map: ";
+            for (size_t i = 0; i < nuc.size(); ++i) {
+                std::cerr << (char)nuc[i] << "->" << (size_t)this->sym_map[(size_t)nuc[i]] << " ";
+            }
+            std::cerr << "\n  ranks(sym_map order): ";
+            for (size_t i = 0; i < rank_vec.size(); ++i) { std::cerr << rank_vec[i] << (i+1<rank_vec.size()?",":""); }
+            std::cerr << std::endl;
         }
         return rank_vec;
     }
@@ -621,21 +643,36 @@ namespace panindexer {
         auto iter = this->blocks_start_pos.predecessor(pos);
         gbwt::size_type loc = static_cast<gbwt::size_type>(this->blocks_encoded_start_bits[iter->first]);
         size_t end_pos = (iter->first + 1 < this->blocks_encoded_start_bits.size()) ? this->blocks_encoded_start_bits[iter->first + 1] : this->blocks_encoded_stream.size();
-        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->encoded_has_N ? 6 : 5, &this->sym_map);
+        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
         size_t rel = pos - iter->second;
         size_t counts6[6] = {0,0,0,0,0,0};
         blk.ranks_at(loc, end_pos, rel, counts6);
-        // Follow rank_at_cached indexing: vector size C, entries correspond to nuc[i] for i < C.size()
         std::vector<size_t> rank_vec(this->C.size(), 0);
-        // std::cerr << "counts6: ";
-        // for (size_t i = 0; i < 6; i++) { std::cerr << counts6[i] << " "; }
-        // std::cerr << std::endl;
-        // std::cerr << "this->C.size(): " << this->C.size() << std::endl;
-        for (size_t i = 0; i < this->C.size(); i++) {
-            // if (!this->encoded_has_N && i == 4) { rank_vec[i] = 0; }
-            // else { rank_vec[i] = counts6[i]; }
-            rank_vec[i] = counts6[this->sym_map[nuc[i]]];
-            // std::cerr << "rank_vec[" << i << "]=" << rank_vec[i] << std::endl;
+        // Fill by sym_map code: for each code j, find its symbol and take counts6 at nuc code
+        for (size_t j = 0; j < rank_vec.size(); ++j) {
+            size_t sym = static_cast<size_t>(NENDMARKER);
+            for (size_t i = 0; i < nuc.size(); ++i) {
+                size_t s = static_cast<size_t>(nuc[i]);
+                if (static_cast<size_t>(this->sym_map[s]) == j) { sym = s; break; }
+            }
+            // If sym is 'N' but encoded_has_N is false, treat count as 0
+            if (sym == static_cast<size_t>('N') && !this->encoded_has_N) { rank_vec[j] = 0; }
+            else {
+                size_t code_nuc = static_cast<size_t>(this->symbol_to_code(sym));
+                rank_vec[j] = counts6[code_nuc];
+            }
+        }
+        if (PANIDX_DEBUG()) {
+            std::cerr << "[rank_at_cached_encoded] pos=" << pos << " C.size=" << this->C.size() << " encoded?=1 hasN=" << (this->encoded_has_N?1:0) << std::endl;
+            std::cerr << "  counts6(nuc order): ";
+            for (size_t i = 0; i < 6; ++i) { std::cerr << counts6[i] << (i+1<6?",":""); }
+            std::cerr << "\n  sym_map: ";
+            for (size_t i = 0; i < nuc.size(); ++i) {
+                std::cerr << (char)nuc[i] << "->" << (size_t)this->sym_map[(size_t)nuc[i]] << " ";
+            }
+            std::cerr << "\n  ranks(sym_map order): ";
+            for (size_t i = 0; i < rank_vec.size(); ++i) { std::cerr << rank_vec[i] << (i+1<rank_vec.size()?",":""); }
+            std::cerr << std::endl;
         }
         return rank_vec;
     }
@@ -715,43 +752,34 @@ namespace panindexer {
         size_t k = bint.forward;
         size_t k_prime = bint.reverse;
         int64_t s = bint.size;
-        size_t b = 0;
 
-        // std::cerr << "[backward_extend_encoded] k=" << k << " k'=" << k_prime << " s=" << s << std::endl;
         auto rank_cache_ks = rank_at_cached_encoded(k + s);
         auto rank_cache_k = rank_at_cached_encoded(k);
 
-        // Advance over all symbols strictly smaller than complement(a) in sym_map order,
-        // guarding against running past the nuc alphabet size.
+        // Advance over codes strictly smaller than complement(a) in sym_map order (unique codes)
         const size_t comp_sym = this->complement(a);
         const size_t comp_idx = this->sym_map[comp_sym];
-        // std::cerr << "[backward_extend_encoded] a='" << (char)a << "' (" << (size_t)a
-        //           << ") comp='" << (char)comp_sym << "' (" << comp_sym << ")"
-        //           << " k=" << k << " k'=" << k_prime << " s=" << s
-        //           << " C.size()=" << this->C.size() << " comp_idx=" << comp_idx
-        //           << " sym_map[a]=" << (size_t)this->sym_map[a]
-        //           << std::endl;
-        while (b < nuc.size() && this->sym_map[(size_t)nuc[b]] < comp_idx) {
-            const size_t nuc_sym = static_cast<size_t>(nuc[b]);
-            const size_t nuc_comp = this->complement(nuc_sym);
-            const size_t idx = this->sym_map[nuc_comp];
-            const long long delta = static_cast<long long>(rank_cache_ks[idx]) - static_cast<long long>(rank_cache_k[idx]);
-            // std::cerr << "  [loop] b=" << b
-            //           << " nuc='" << (char)nuc_sym << "' (" << nuc_sym << ")"
-            //           << " sym_idx=" << (size_t)this->sym_map[nuc_sym]
-            //           << " comp_sym='" << (char)nuc_comp << "' idx=" << idx
-            //           << " add=" << delta << " k'=" << k_prime << std::endl;
-            k_prime += delta;
-            b++;
+        // Build inverse mapping: code -> symbol for present alphabet
+        std::vector<size_t> code_to_symbol_vec(this->C.size(), static_cast<size_t>(NENDMARKER));
+        for (size_t i = 0; i < nuc.size(); i++) {
+            size_t sym = static_cast<size_t>(nuc[i]);
+            size_t code = static_cast<size_t>(this->sym_map[sym]);
+            if (code < code_to_symbol_vec.size()) { code_to_symbol_vec[code] = sym; }
+        }
+        for (size_t code = 0; code < comp_idx; ++code) {
+            size_t sym = code_to_symbol_vec[code];
+            size_t comp_of_sym = this->complement(sym);
+            size_t comp_code = static_cast<size_t>(this->sym_map[comp_of_sym]);
+            if (comp_code < rank_cache_ks.size()) {
+                k_prime += (rank_cache_ks[comp_code] - rank_cache_k[comp_code]);
+            }
         }
 
         auto rank_ks = rank_cache_ks[this->sym_map[a]];
         auto rank_k = rank_cache_k[this->sym_map[a]];
-        // std::cerr << "[backward_extend_encoded] ranks: rank_k=" << rank_k << " rank_ks=" << rank_ks << std::endl;
         if (rank_k >= rank_ks) { return bi_interval(0, 0, 0); }
         s = rank_ks - rank_k;
         k = rank_k + this->C[this->sym_map[a]];
-        // std::cerr << "[backward_extend_encoded] out: k=" << k << " k'=" << k_prime << " s=" << s << std::endl;
         return bi_interval(k, k_prime, s);
     }
 
@@ -1198,7 +1226,7 @@ namespace panindexer {
         }
         // Encoded
         gbwt::size_type loc = static_cast<gbwt::size_type>(this->blocks_encoded_start_bits[block_id]);
-        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, 6, &this->sym_map);
+        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
         blk.skip_header(loc);
         size_t cur = 0; size_t runnum = 0;
         while (true) {
@@ -1309,7 +1337,7 @@ namespace panindexer {
             auto iter = this->blocks_start_pos.predecessor(state.first);
             size_t block_id = iter->first; size_t block_start = iter->second;
             std::uint64_t bitloc = this->blocks_encoded_start_bits[block_id];
-            EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, 6, &this->sym_map);
+            EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
             blk.skip_header(bitloc);
             size_t cur = 0; size_t runnum = 0;
             while (true) {
@@ -1401,14 +1429,38 @@ FastLocate::bi_interval FastLocate::backward_extend(const bi_interval& bint, siz
     auto rank_cache_ks = rank_at_cached(k + s);
     auto rank_cache_k = rank_at_cached(k);
 
-    // Advance over all symbols strictly smaller than complement(a) in sym_map order,
-    // guarding against running past the nuc alphabet size.
+    // Advance over codes strictly smaller than complement(a) in sym_map order,
+    // using only the actually present alphabet (size = C.size()).
     const size_t comp_sym = this->complement(a);
     const size_t comp_idx = this->sym_map[comp_sym];
-    while (b < nuc.size() && this->sym_map[(size_t)nuc[b]] < comp_idx) {
-        k_prime += (rank_cache_ks[this->sym_map[this->complement(nuc[b])]] - rank_cache_k[this->sym_map[this->complement(nuc[b])]]);
-        //        k_prime += (this->rankAt(k + s , this->complement(nuc[b])) - this->rankAt(k, this->complement(nuc[b])));
-        b++;
+    // Build inverse mapping: code -> symbol (restricted to codes < C.size())
+    std::vector<size_t> code_to_symbol_vec(this->C.size(), static_cast<size_t>(NENDMARKER));
+    for (size_t i = 0; i < nuc.size(); i++) {
+        size_t sym = static_cast<size_t>(nuc[i]);
+        size_t code = static_cast<size_t>(this->sym_map[sym]);
+        if (code < code_to_symbol_vec.size()) { code_to_symbol_vec[code] = sym; }
+    }
+    if (PANIDX_DEBUG()) {
+        std::cerr << "[backward_extend] a='" << (char)a << "' comp='" << (char)comp_sym << "' comp_idx=" << comp_idx
+                  << " | k=" << k << " k'=" << k_prime << " s=" << s << std::endl;
+        std::cerr << "  rank_cache_k(sym_map): ";
+        for (size_t i = 0; i < rank_cache_k.size(); ++i) { std::cerr << rank_cache_k[i] << (i+1<rank_cache_k.size()?",":""); }
+        std::cerr << "\n  rank_cache_ks(sym_map): ";
+        for (size_t i = 0; i < rank_cache_ks.size(); ++i) { std::cerr << rank_cache_ks[i] << (i+1<rank_cache_ks.size()?",":""); }
+        std::cerr << std::endl;
+    }
+    for (size_t code = 0; code < comp_idx; ++code) {
+        size_t sym = code_to_symbol_vec[code];
+        size_t comp_of_sym = this->complement(sym);
+        size_t comp_code = static_cast<size_t>(this->sym_map[comp_of_sym]);
+        if (comp_code < rank_cache_ks.size()) {
+            k_prime += (rank_cache_ks[comp_code] - rank_cache_k[comp_code]);
+            if (PANIDX_DEBUG()) {
+                std::cerr << "    add for code=" << code << " sym='" << (char)sym << "' comp_code=" << comp_code
+                          << " delta=" << (long long)(rank_cache_ks[comp_code] - rank_cache_k[comp_code])
+                          << " -> k'=" << k_prime << std::endl;
+            }
+        }
     }
 
 //    auto rank_ks = this->rankAt(k + s, a);
@@ -1424,6 +1476,9 @@ FastLocate::bi_interval FastLocate::backward_extend(const bi_interval& bint, siz
     s = rank_ks - rank_k;
 
     k = rank_k + this->C[this->sym_map[a]];
+    if (PANIDX_DEBUG()) {
+        std::cerr << "  out: k=" << k << " k'=" << k_prime << " s=" << s << std::endl;
+    }
     return bi_interval(k, k_prime, s);
 }
 

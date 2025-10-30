@@ -16,6 +16,8 @@
 #include <gbwt/internal.h>
 #include "utils.hpp"
 #include <condition_variable>
+#include <mutex>
+#include <sdsl/util.hpp>
 
 namespace panindexer {
 
@@ -342,6 +344,12 @@ namespace panindexer {
         // If last[i] = 1, last_to_run[last_rank(i)] is the identifier of the run.
         sdsl::int_vector<0> last_to_run;
 
+        // Lazy supports for last (constructed on-demand)
+        mutable sdsl::sd_vector<>::rank_1_type last_rank_support;
+        mutable sdsl::sd_vector<>::select_1_type last_select_support;
+        mutable std::once_flag last_rank_once;
+        mutable std::once_flag last_select_once;
+
 
         // variables for FMD-index
         std::array<uint8_t, 256> complement_table{};
@@ -501,6 +509,30 @@ namespace panindexer {
             }
             return prev;
         };
+
+        // Ensure helpers for last supports (lazy)
+        inline void ensure_last_rank() const {
+            std::call_once(last_rank_once, [&]() {
+                sdsl::util::init_support(last_rank_support, &last);
+            });
+        }
+
+        inline void ensure_last_select() const {
+            std::call_once(last_select_once, [&]() {
+                sdsl::util::init_support(last_select_support, &last);
+            });
+        }
+
+        // Thin wrappers used by sampled-tag queries
+        inline size_type last_rank_1(size_type i) const {
+            ensure_last_rank();
+            return last_rank_support(i);
+        }
+
+        inline size_type last_select_1(size_type k) const {
+            ensure_last_select();
+            return last_select_support(k);
+        }
 
         gbwt::range_type LF(gbwt::range_type range, size_t sym, bool &starts_with_to, size_t &first_run) const;
 

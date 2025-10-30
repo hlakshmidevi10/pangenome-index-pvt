@@ -75,6 +75,9 @@ namespace panindexer {
         // Merge sidecar files with main file (sdsl layout: [int_vector][encoded_starts_sd][bwt_intervals])
         void merge_compressed_files_sdsl(const std::string filename, const std::string encoded_starts_file, const std::string bwt_intervals_file);
 
+        // Set initial BWT offset before writing runs (e.g., number of endmarker positions)
+        inline void set_initial_bwt_offset(size_t offset) { this->cumulative_run_bwt_position = offset; }
+
         // Statistics helpers for compressed format
         size_t number_of_runs_compressed() const;
         size_t bytes_encoded_runs() const;
