@@ -35,14 +35,19 @@ int main(int argc, char** argv) {
     };
     std::cerr << "Building sampled tags" << std::endl;
     sampled.build_from_enumerator(enumerator, tags.bwt_size());
-    std::cerr << "Built sampled tags" << std::endl;
 
+    // On macOS, add a small delay to ensure all destructors are called
+    // This helps identify if the issue is during destruction
+    std::cerr << "About to serialize..." << std::endl;
 
     // Serialize sampled structure
     ofstream out(out_path, ios::binary);
     if (!out) { cerr << "Cannot open output: " << out_path << endl; return 1; }
+    std::cerr << "Calling serialize..." << std::endl;
     sampled.serialize(out);
+    std::cerr << "Serialize completed, closing file..." << std::endl;
     out.close();
+    std::cerr << "File closed successfully" << std::endl;
     return 0;
 }
 

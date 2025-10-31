@@ -12,6 +12,31 @@ namespace panindexer {
         return SampledTagArray::encode_value(gbwtgraph::id(p), gbwtgraph::is_rev(p));
     }
 
+    // Helper function to construct wt_gmr from values
+    // wt_gmr uses grammar-based compression which is more memory-efficient and stable on macOS
+    static void construct_wt_gmr_from_values(sdsl::wt_gmr<>& target, const std::vector<uint64_t>& values) {
+        if (values.empty()) {
+            target = sdsl::wt_gmr<>();
+            return;
+        }
+        
+        uint64_t maxv = 0;
+        for (auto v : values) { if (v > maxv) maxv = v; }
+        size_t width = std::max<size_t>(1, sdsl::bits::hi(maxv) + 1);
+        
+        // Create int_vector and populate it
+        sdsl::int_vector<> iv(values.size(), 0, width);
+        for (size_t i = 0; i < values.size(); ++i) {
+            iv[i] = values[i];
+        }
+        
+        // Construct wt_gmr directly - it should handle memory more reliably than wm_int
+        sdsl::construct_im(target, iv);
+        
+        // iv will be destroyed when it goes out of scope
+        // target should have its own independent copy of the data
+    }
+
     void SampledTagArray::build_from_runs(const std::vector<std::pair<pos_t, uint64_t>>& runs, size_t bwt_size) {
         // First, transform runs into (start position markers) using cumulative lengths, and values merged.
         // We'll collect run_starts positions and run values in order.
@@ -37,21 +62,15 @@ namespace panindexer {
         }
 
         // Build sd_vector for run starts
-        sdsl::sd_vector_builder builder(bwt_size + 1, starts.size());
-        for (uint64_t s : starts) builder.set(s);
-        bwt_intervals = sdsl::sd_vector<>(builder);
-
-        // Build wm_int from values (guard for empty and set width explicitly)
-        if (values.empty()) {
-            sampled_values = sdsl::wm_int<>();
-        } else {
-            uint64_t maxv = 0;
-            for (auto v : values) { if (v > maxv) maxv = v; }
-            size_t width = std::max<size_t>(1, sdsl::bits::hi(maxv) + 1);
-            sdsl::int_vector<> iv(values.size(), 0, width);
-            for (size_t i = 0; i < values.size(); ++i) iv[i] = values[i];
-            sdsl::construct_im(sampled_values, iv);
+        {
+            sdsl::sd_vector_builder builder(bwt_size + 1, starts.size());
+            for (uint64_t s : starts) builder.set(s);
+            bwt_intervals = sdsl::sd_vector<>(builder);
+            // Builder is destroyed here, but bwt_intervals has its own copy
         }
+
+        // Build wt_gmr from values using helper function
+        construct_wt_gmr_from_values(sampled_values, values);
     }
 
     void SampledTagArray::build_from_enumerator(const std::function<void(const std::function<void(pos_t,uint64_t)>&)>& enumerator,
@@ -72,59 +91,26 @@ namespace panindexer {
         };
 
         enumerator(sink);
-        std::cerr << "Enumerated runs" << std::endl;
 
-        // print the last 10 values of the starts vector and the last 10 values of the values vector
-        std::cerr << "Last 10 values of starts: ";
-        for (size_t i = 0; i < 10; ++i) {
-            std::cerr << starts[starts.size() - 10 + i] << " ";
-        }
         std::cerr << std::endl;
-        std::cerr << "Last 10 values of values: ";
-        for (size_t i = 0; i < 10; ++i) {
-            // Decode the value before printing (assume pos_t is int64_t and direction encoded in bit 0, id in high bits)
-            uint64_t encoded_val = values[values.size() - 10 + i];
-            if (encoded_val == 0) {
-                std::cerr << "[GAP] ";
-            } else {
-                int64_t node_id = static_cast<int64_t>((encoded_val - 1) >> 1) + 1;
-                bool is_rev = (encoded_val - 1) & 1;
-                std::cerr << "(node_id=" << node_id << ",is_rev=" << is_rev << ") ";
-            }
+        
+        // Build sd_vector for run starts
+        {
+            sdsl::sd_vector_builder builder(bwt_size + 1, starts.size());
+            for (uint64_t s : starts) builder.set(s);
+            bwt_intervals = sdsl::sd_vector<>(builder);
+            // Builder is destroyed here, but bwt_intervals has its own copy
         }
-        std::cerr << std::endl;
-        // print value size and start size  
-        std::cerr << "Value size: " << values.size() << std::endl;
-        std::cerr << "Start size: " << starts.size() << std::endl;
-        // print all values
-        std::cerr << "All values: ";
-        for (size_t i = 0; i < values.size(); ++i) {
-            std::cerr << values[i] << " ";
-        }
-        std::cerr << std::endl;
-        sdsl::sd_vector_builder builder(bwt_size + 1, starts.size());
-        for (uint64_t s : starts) builder.set(s);
-        bwt_intervals = sdsl::sd_vector<>(builder);
-        std::cerr << "Built bwt_intervals" << std::endl;
-        if (values.empty()) {
-            sampled_values = sdsl::wm_int<>();
-        } else {
-            uint64_t maxv = 0;
-            for (auto v : values) { if (v > maxv) maxv = v; }
-            size_t width = std::max<size_t>(1, sdsl::bits::hi(maxv) + 1);
-            sdsl::int_vector<> iv(values.size(), 0, width);
-            std::cerr << "Created int_vector of size: " << values.size() << " width=" << width << std::endl;
-            // print bwt size
-            std::cerr << "Bwt size: " << bwt_size << std::endl;
-            for (size_t i = 0; i < values.size(); ++i) iv[i] = values[i];
-            std::cerr << "Filled int_vector" << std::endl;
-            sdsl::construct_im(sampled_values, iv);
-            std::cerr << "Constructed sampled_values" << std::endl;
-        }
+        
+        // Build wt_gmr from values using helper function
+        construct_wt_gmr_from_values(sampled_values, values);
+        
         std::cerr << "Finished building sampled_tag_array" << std::endl;
     }
 
     void SampledTagArray::serialize(std::ostream& out) const {
+        // On macOS, ensure supports are not accessed during serialization
+        // Serialize the structures directly without accessing lazy supports
         sdsl::serialize(sampled_values, out);
         sdsl::serialize(bwt_intervals, out);
     }
