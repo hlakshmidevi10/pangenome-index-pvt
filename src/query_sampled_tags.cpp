@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <sstream>
+#include <limits>
 
 using namespace std;
 using namespace panindexer;
@@ -465,25 +466,72 @@ int main(int argc, char** argv) {
             cerr << "    Tag " << tag_code << " has " << total_occ << " total occurrences" << endl;
             
             // Gather aligned positions for each run where this tag appears
+            // We need to locate each position individually to get full (seq_id, offset) pairs
             unordered_set<unsigned long long> seen_all;
             unordered_set<unsigned long long> seen_other;
             for (size_t j = 1; j <= total_occ; ++j) {
                 size_t occ_run = wm.select(j, tag_code);
                 auto sp = sampled.run_span(occ_run);
-                gbwt::range_type run_interval{sp.first, sp.second};
-                auto locs = r_index.locate_encoded(run_interval);
-                for (auto packed : locs) {
-                    auto pr = r_index.unpack(packed);
-                    unsigned long long key = (static_cast<unsigned long long>(pr.first) << 32) | static_cast<unsigned long long>(pr.second);
-                    if (seen_all.insert(key).second) {
-                        res.aligned_positions.emplace_back(pr.first, pr.second);
-                    }
-                    // If this occurrence comes from a run not overlapping the current [l, r], treat as "other"
-                    auto it = present_runs.find(tag_code);
-                    bool is_present_run = (it != present_runs.end() && it->second.find(occ_run) != it->second.end());
-                    if (!is_present_run) {
-                        if (seen_other.insert(key).second) {
-                            res.other_aligned_positions.emplace_back(pr.first, pr.second);
+                
+                // Check if this run overlaps the query interval [l, r]
+                auto it = present_runs.find(tag_code);
+                bool is_present_run = (it != present_runs.end() && it->second.find(occ_run) != it->second.end());
+                
+                // Determine which interval to locate: only positions in [l, r] for runs overlapping query
+                size_t locate_start, locate_end;
+                if (is_present_run) {
+                    // For runs overlapping query interval, only locate positions within [l, r]
+                    locate_start = max(sp.first, l);
+                    locate_end = min(sp.second, r);
+                } else {
+                    // For runs not overlapping query interval, locate entire run
+                    locate_start = sp.first;
+                    locate_end = sp.second;
+                }
+                
+                if (locate_start <= locate_end) {
+                    // Locate each position individually to get full packed positions (seq_id, offset)
+                    // Optimize by caching run info when positions are in the same run
+                    size_t current_packed = 0;
+                    size_t cached_run_start = 0;
+                    size_t cached_pos = locate_start;
+                    size_t cached_run_id = numeric_limits<size_t>::max();
+                    
+                    for (size_t pos = locate_start; pos <= locate_end; pos++) {
+                        // Check if we need to recompute (new run or first position)
+                        size_t rank = r_index.last_rank_1(pos + 1);
+                        size_t run_id = (rank > 0 && rank <= r_index.last_to_run.size()) 
+                            ? r_index.last_to_run[rank - 1] : 0;
+                        
+                        if (run_id != cached_run_id || pos == locate_start) {
+                            // New run or first position: recompute from run start
+                            cached_run_id = run_id;
+                            current_packed = r_index.getSample(run_id);
+                            cached_run_start = (rank > 0) ? r_index.last_select_1(rank - 1) + 1 : 0;
+                            
+                            // Navigate from run_start to pos
+                            for (size_t p = cached_run_start; p < pos; p++) {
+                                current_packed = r_index.locateNext(current_packed);
+                            }
+                            cached_pos = pos;
+                        } else {
+                            // Same run: continue from previous position
+                            current_packed = r_index.locateNext(current_packed);
+                            cached_pos = pos;
+                        }
+                        
+                        // Now current_packed is the packed position for BWT position pos
+                        auto pr = r_index.unpack(current_packed);
+                        unsigned long long key = (static_cast<unsigned long long>(pr.first) << 32) | static_cast<unsigned long long>(pr.second);
+                        
+                        if (seen_all.insert(key).second) {
+                            res.aligned_positions.emplace_back(pr.first, pr.second);
+                        }
+                        // If this occurrence comes from a run not overlapping the current [l, r], treat as "other"
+                        if (!is_present_run) {
+                            if (seen_other.insert(key).second) {
+                                res.other_aligned_positions.emplace_back(pr.first, pr.second);
+                            }
                         }
                     }
                 }
@@ -496,34 +544,80 @@ int main(int argc, char** argv) {
     
     // Print summary for this path interval
     cerr << "Writing results..." << endl;
-    cout << "seq_id=" << seq_id
-         << "\tinterval=" << seq_start << ".." << seq_end
-         << "\tbwt_start=" << l
-         << "\tbwt_end=" << r
-         << "\ttags=" << results.size()
-         << endl;
+    
+    // Print the query sequence
+    cout << "Query Sequence:" << endl;
+    cout << "  Sequence ID: " << seq_id << endl;
+    cout << "  Interval: " << seq_start << ".." << seq_end << endl;
+    cout << "  Sequence: " << query_seq << endl;
+    cout << "  BWT interval: [" << l << ", " << r << "]" << endl;
+    cout << "  Number of tags found: " << results.size() << endl;
+    cout << endl;
+    
+    // Print results for each tag
+    const auto& wm = sampled.values();
     for (const auto& kv : results) {
         uint64_t code = kv.first;
         const TagResult& res = kv.second;
-        cout << "  tag_code=" << code << "\toffsets=";
-        for (size_t i = 0; i < res.query_offsets.size(); ++i) {
-            if (i) cout << ",";
-            cout << res.query_offsets[i];
-        }
-        cout << "\taligned_count=" << res.aligned_positions.size();
-        if (!res.aligned_positions.empty()) {
-            cout << "\taligned_positions=";
-            for (size_t i = 0; i < res.aligned_positions.size(); ++i) {
-                if (i) cout << ",";
-                cout << res.aligned_positions[i].first << ":" << res.aligned_positions[i].second;
+        
+        // Decode tag code to get node_id and is_rev
+        // Tag encoding: 1 + ((node_id - 1) << 1) | is_rev
+        uint64_t decoded = code - 1;
+        int64_t node_id = (decoded >> 1) + 1;
+        bool is_rev = (decoded & 1) != 0;
+        
+        // Get total occurrences of this tag
+        size_t total_occ = wm.rank(wm.size(), code);
+        
+        cout << "Tag Code: " << code << endl;
+        cout << "  Tag Details:" << endl;
+        cout << "    Node ID: " << node_id << endl;
+        cout << "    Is Reverse: " << (is_rev ? "true" : "false") << endl;
+        cout << "    Total occurrences in BWT: " << total_occ << endl;
+        cout << "    Occurrences in query interval: " << res.query_offsets.size() << endl;
+        
+        // Show runs that contain this tag and overlap the query interval
+        auto it_runs = present_runs.find(code);
+        if (it_runs != present_runs.end() && !it_runs->second.empty()) {
+            cout << "  Runs overlapping query interval [" << l << ", " << r << "]:" << endl;
+            cout << "    Count: " << it_runs->second.size() << endl;
+            vector<size_t> run_ids_vec(it_runs->second.begin(), it_runs->second.end());
+            sort(run_ids_vec.begin(), run_ids_vec.end());
+            for (size_t i = 0; i < run_ids_vec.size(); ++i) {
+                size_t run_id = run_ids_vec[i];
+                auto span = sampled.run_span(run_id);
+                size_t overlap_start = max(span.first, l);
+                size_t overlap_end = min(span.second, r);
+                cout << "    [" << i << "] Run ID: " << run_id 
+                     << ", BWT span: [" << span.first << ", " << span.second << "]"
+                     << ", Overlap with query: [" << overlap_start << ", " << overlap_end << "]" << endl;
             }
         }
-        cout << "\tother_aligned_count=" << res.other_aligned_positions.size();
+        
+        cout << "  Query offsets (relative to query start): ";
+        for (size_t i = 0; i < res.query_offsets.size(); ++i) {
+            if (i) cout << ", ";
+            cout << res.query_offsets[i];
+        }
+        cout << endl;
+        
+        // Print aligned positions (from runs overlapping query interval)
+        cout << "  Aligned positions (from runs overlapping query interval):" << endl;
+        cout << "    Count: " << res.aligned_positions.size() << endl;
+        if (!res.aligned_positions.empty()) {
+            for (size_t i = 0; i < res.aligned_positions.size(); ++i) {
+                cout << "    [" << i << "] Sequence ID: " << res.aligned_positions[i].first 
+                     << ", Offset: " << res.aligned_positions[i].second << endl;
+            }
+        }
+        
+        // Print other aligned positions (from runs not overlapping query interval)
+        cout << "  Other aligned positions (from runs not overlapping query interval):" << endl;
+        cout << "    Count: " << res.other_aligned_positions.size() << endl;
         if (!res.other_aligned_positions.empty()) {
-            cout << "\tother_aligned_positions=";
             for (size_t i = 0; i < res.other_aligned_positions.size(); ++i) {
-                if (i) cout << ",";
-                cout << res.other_aligned_positions[i].first << ":" << res.other_aligned_positions[i].second;
+                cout << "    [" << i << "] Sequence ID: " << res.other_aligned_positions[i].first 
+                     << ", Offset: " << res.other_aligned_positions[i].second << endl;
             }
         }
         cout << endl;
