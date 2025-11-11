@@ -520,7 +520,7 @@ namespace panindexer {
         sdsl::sd_vector_builder builder(this->start_pos + 1, this->encoded_start_ones);
 
         while (in_encoded_starts.read(reinterpret_cast<char*>(&start_pos_read), sizeof(start_pos_read))){
-            //        std::cerr << "Read start pos " << start_pos_read << std::endl;
+            // std::cerr << "Read start pos " << start_pos_read << std::endl;
             builder.set(start_pos_read);
         }
         in_encoded_starts.close();
@@ -549,6 +549,7 @@ namespace panindexer {
         sdsl::sd_vector_builder builder_bwt(this->cumulative_run_bwt_position + 1, this->remaining_run_to_write_start);
 
         while (in_bwt_intervals.read(reinterpret_cast<char*>(&bwt_pos_read), sizeof(bwt_pos_read))){
+            // std::cerr << "BWT (1) pos: "  << bwt_pos_read << std::endl;
             builder_bwt.set(bwt_pos_read);
         }
         in_bwt_intervals.close();
@@ -615,12 +616,19 @@ namespace panindexer {
                 }
 
                 if (run_length > 0){
+                    // std::cerr << "---------" << std::endl;
+                    // cumulative_run_bwt_position --> BWT pointer - jumps from one run end to next
+                    // std::cerr << "BWT (st) POS: " << this->cumulative_run_bwt_position << " Handling run: " << value << " Run Length: " << run_length << std::endl;
                     bwt_intervals_file.write(reinterpret_cast<const char*>(&this->cumulative_run_bwt_position), sizeof(this->cumulative_run_bwt_position));
                     this->cumulative_run_bwt_position += run_length;
 
 
                     // keeping the data for creating the encoded starts
                     if (this->remaining_run_to_write_start % this->encoded_start_every_k_run == 0){
+                        // remaining_run_to_write -> no. of runs processed so far
+                        // encoded start_ones -> no. of encoded starts written
+                        // std::cerr << "run_to_write idx: " << this->remaining_run_to_write_start << " Encoded st idx: " << this->encoded_start_ones << " Prev Start Pos: " << this->start_pos << " Curr start pos: " << this->cumulative_starts + encoded_runs.size()<<  std::endl;
+                        // std::cerr << "---------" << std::endl;
                         this->start_pos = this->cumulative_starts + encoded_runs.size();
                         // write the encoded start in file
                         encoded_starts_file.write(reinterpret_cast<const char*>(&this->start_pos), sizeof(this->start_pos));
@@ -648,6 +656,7 @@ namespace panindexer {
 //            out.write(reinterpret_cast<const char *>(&size), sizeof(size));
             main_out.write(reinterpret_cast<const char *>(encoded_runs.data()), size * sizeof(gbwt::byte_type));
             this->cumulative_starts += size;
+            // std::cerr << "Updated cumulative starts: " << this->cumulative_starts << std::endl;
 
         } else {
             std::cerr << "No tags to compress and write" << std::endl;
@@ -667,17 +676,71 @@ namespace panindexer {
         this->encoded_runs.resize(encoded_runs_size);
         in.read(reinterpret_cast<char*>(this->encoded_runs.data()), encoded_runs_size * sizeof(gbwt::byte_type));
 
+        // std::cerr << "=== Printing all decoded runs from encoded_runs ===" << std::endl;
+        // std::cerr << "Total encoded_runs size: " << this->encoded_runs.size() << " bytes" << std::endl;
+        //
+        // if (this->encoded_runs.empty()) {
+        //     std::cerr << "No encoded runs to decode" << std::endl;
+        //     return;
+        // }
+        //
+        // std::uint64_t bit_location = 0;
+        // size_t run_index = 0;
+        //
+        // try {
+        //     while (bit_location < this->encoded_runs.size()) {
+        //         // Store the current bit location before reading
+        //         std::uint64_t current_position = bit_location;
+        //
+        //         // Read and decode the run
+        //         gbwt::size_type encoded_value = gbwt::ByteCode::read(this->encoded_runs, bit_location);
+        //         auto decoded_run = decode_run(encoded_value);
+        //
+        //         std::cerr << "Run: " << run_index << " Curr Bit position:" << current_position << " Decoded node: " << decoded_run.first << " Decode run len: " << decoded_run.second << endl;
+        //         run_index++;
+        //
+        //         // Safety check to prevent infinite loops
+        //         if (run_index > 100000) {
+        //             std::cerr << "Warning: Stopped printing after 100000 runs" << std::endl;
+        //             break;
+        //         }
+        //     }
+        //
+        //     std::cerr << "Total runs decoded: " << run_index << std::endl;
+        //
+        // } catch (const std::exception& e) {
+        //     std::cerr << "Error while decoding at run " << run_index << ", bit position " << bit_location << ": " << e.what() << std::endl;
+        // }
+        //
+        // std::cerr << "=== End of decoded runs ===" << std::endl;
+
         // Read the encoded_runs_starts_sd vector
         this->encoded_runs_starts_sd.load(in);
 
         // Read the bwt_intervals vector
         this->bwt_intervals.load(in);
 
+        // std::cerr << "Printing all values in bwt_intervals (size: " << bwt_intervals.size() << "):" << std::endl;
+        // for (size_t i = 0; i < bwt_intervals.size(); i++) {
+        //     std::cerr << "bwt_intervals[" << i << "] = " << bwt_intervals[i] << std::endl;
+        // }
+        // std::cerr << "Finished printing bwt_intervals values" << std::endl;
+
         std::cerr << "Loaded encoded runs_starts_sd of size: " << this->encoded_runs_starts_sd.size() << std::endl;
         std::cerr << "Loaded bwt_intervals of size: " << this->bwt_intervals.size() << std::endl;
 
         this->encoded_runs_sd_starts_select = sdsl::sd_vector<>::select_1_type(&this->encoded_runs_starts_sd);
         this->bwt_intervals_rank = sdsl::sd_vector<>::rank_1_type(&this->bwt_intervals);
+
+
+        // // Print the rank value of all positions
+        // std::cerr << "Printing rank values for all positions in bwt_intervals:" << std::endl;
+        // for (size_t i = 0; i <= bwt_intervals.size(); i++) {
+        //     size_t rank_val = bwt_intervals_rank(i);
+        //     std::cerr << "rank(" << i << ") = " << rank_val << std::endl;
+        // }
+        // std::cerr << "Finished printing rank values" << std::endl;
+
 
         std::cerr << "Select and rank data structures initialized" << std::endl;
     }
@@ -689,19 +752,24 @@ namespace panindexer {
 
         // first have to find ranks of start and end in the bwt_intervals which are number of 1's less than start and end
 
+        // std::cerr << "bwt_intervals_rank[7717]: " << this->bwt_intervals_rank(7717) << std::endl;
+        // std::cerr << "bwt_intervals_rank[7720]: " << this->bwt_intervals_rank(7720) << std::endl;
+        // std::cerr << "bwt_intervals_rank[7721]: " << this->bwt_intervals_rank(7721) << std::endl;
+        // std::cerr << "bwt_intervals_rank[7722]: " << this->bwt_intervals_rank(7722) << std::endl;
+
 //        sdsl::sd_vector<>::rank_1_type bwt_intervals_rank(&bwt_intervals);
-//        std::cerr << "Finding the tags between " << start << " and " << end << std::endl;
-        size_t first_bit_index = this->bwt_intervals_rank(start + 1);
+        std::cerr << "Finding the tags between " << start << " and " << end << std::endl;
+        size_t first_bit_index = this->bwt_intervals_rank(start + 1) - 1;       // gets the right idx, matches compress-tags output
 //        if (start > 0 && bwt_intervals[start] == 1) {
 //            // if the start is 1, then the tags start from start position and we don't need the last 1 before start
 //            first_bit_index++;
 //        }
-//        std::cerr << "First bit index: " << first_bit_index << std::endl;
+        std::cerr << "First bit index: " << first_bit_index << std::endl;
 
         // TODO: can handle this without the rank data structure
-        size_t end_bit_index = this->bwt_intervals_rank(end + 1);
+        size_t end_bit_index = this->bwt_intervals_rank(end + 1) - 1;
 
-//        std::cerr << "End bit index: " << end_bit_index << std::endl;
+        std::cerr << "End bit index: " << end_bit_index << std::endl;
 
 
 
@@ -715,19 +783,26 @@ namespace panindexer {
         size_t current_tag_run_index = first_bit_index - (first_bit_index % this->encoded_start_every_k_run);
         size_t move_tags = first_bit_index % this->encoded_start_every_k_run;
 
+        std:cerr << "Current run index: " << current_tag_run_index << std::endl;        // Seems to be correct
+
         // where the first run starts
         // this is the actual bit location of latest % encoded_start_every_k_run == 0 in the encoded_runs vector
         std::uint64_t bit_location = this->encoded_runs_sd_starts_select(current_tag_run_index / this->encoded_start_every_k_run + 1);
         gbwt::size_type decc;
 
 
-        while (move_tags > 1){
+        std::cerr << "encoded runs index: " << (current_tag_run_index / this->encoded_start_every_k_run + 1) << std::endl;
+        std::cerr << "Starting Run Index: " << bit_location << " move_tags" << move_tags <<" " << " " << std::endl;
+
+        while (move_tags > 0){
             // the read function changes the bit_location to the next bit location
             decc = gbwt::ByteCode::read(this->encoded_runs, bit_location);
             move_tags--;
+            std::cerr << "position after move: " << bit_location << std::endl;
         }
 
 
+        std::cerr << "Final starting Run Index: " << bit_location << std::endl;
         while (run_nums > 0) {
             // the read function changes the bit_location to the next bit location
             decc = gbwt::ByteCode::read(this->encoded_runs, bit_location);
@@ -744,6 +819,9 @@ namespace panindexer {
 //            cerr << "Decoded length: " << static_cast<int>(decoded_length) << endl;
 //            cerr << "Decoded node ID: " << decoded_node_id << endl;
 
+            std::cerr << "Decoded node: " << decoded.first << " Decode run len: " << decoded.second << endl;
+            // std::cerr << "Next Run Index: " << bit_location << std::endl;
+
             run_nums--;
             unique_positions.push_back(gbwtgraph::Position::encode(decoded.first).value);
 //            unique_positions.insert(
@@ -757,9 +835,50 @@ namespace panindexer {
        for (auto pos : unique_positions) {
            std::cout << pos << ", ";
        }
-       std::cout << std::endl;
+        std::cout << std::endl;
+        std::cerr << "------------------" << std::endl;
+
     }
 
+    void TagArray::query_compressed_decoded_runs(size_t bwt_start, size_t bwt_end,
+        std::vector<std::pair<pos_t, uint16_t>>& decoded_runs) {
+
+        // Clear the output vector to ensure clean state
+        decoded_runs.clear();
+
+        // Get sequence IDs from r_index.locate()
+        gbwt::range_type range(bwt_start, bwt_end);
+
+        // Get rank positions for the BWT interval
+        size_t first_bit_index = this->bwt_intervals_rank(bwt_start + 1) - 1;
+        size_t end_bit_index = this->bwt_intervals_rank(bwt_end + 1) - 1;
+
+        auto run_nums = end_bit_index - first_bit_index + 1;
+
+        // Get the starting position for reading runs
+        size_t current_tag_run_index = first_bit_index - (first_bit_index % this->encoded_start_every_k_run);
+        size_t move_tags = first_bit_index % this->encoded_start_every_k_run;
+
+        // Get bit location in encoded runs
+        std::uint64_t bit_location = this->encoded_runs_sd_starts_select(current_tag_run_index / this->encoded_start_every_k_run + 1);
+
+        // Skip to the correct starting position
+        gbwt::size_type decc;
+        while (move_tags > 0) {
+            decc = gbwt::ByteCode::read(this->encoded_runs, bit_location);
+            move_tags--;
+        }
+
+        // Read all runs for this interval
+        size_t run_count = run_nums;
+        while (run_count > 0) {
+            decc = gbwt::ByteCode::read(this->encoded_runs, bit_location);
+            auto decoded_run = decode_run(decc);
+            decoded_runs.push_back(decoded_run);
+            run_count--;
+        }
+
+    }
 
 
 }

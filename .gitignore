@@ -30,3 +30,7 @@
 *.exe
 *.out
 *.app
+
+.idea
+test_data/bidirectional_test/hl-test/1004/yeast-8/
+test_data/bidirectional_test/hl-test/.DS_Store

@@ -1,0 +1,42 @@
+
+reduce gafpack - go further - coverage vector - compute coverage while walking
+graphviz - better to present; show paths
+vega - check it out
+gaf as vectors of little haplotypes
+
+check how packing works
+need to work on actual graphs
+
+Computational complexity of performing mapping using tag array
+ring-select-dictionary - run-length-compressed-space
+or have a bit vector having the sequence starts
+or different endMarkers
+
+Goal: MEM Matches -> GAF
+Step 1: MEM Matches -> seq_info(seq_id, match_info) + graph_pos
+Step 2: custom paf-like format -> GAF output
+
+(Step 1):
+Usage: find_mems <r_index> <tag_array_index> <reads> <min_mem_length> <min_occ> [output_file_prefix]
+
+for each read in reads_file:
+    find set of mems for the reads using r-index
+    for each mem in mems:   # BWT interval [i, j]
+        <-query tag array for graph positions
+        <-query document array for sequence id (locate operation)
+
+    vector of <seq_id, node_id, offset, strand, mem_len, read_st, read_id>
+
+Sort the vector by (seq_id, node_id)
+
+
+--------------------------------------------------
+Final Output (input to path-finder):
+
+*_path_pos.csv
+node_id     offset      strand(0/1)      mem_len     read_st     read_id
+
+*_seq_id_starts.out
+seq_id      run_length/count
+
+

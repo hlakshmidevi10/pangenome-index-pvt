@@ -1,0 +1,11 @@
+H	VN:Z:1.1	RS:Z:HG001
+S	5	NATT
+S	1	AAAG
+S	4	CGGG
+S	2	ATGA
+S	3	TCCC
+L	1	+	2	+	0M
+L	4	+	5	+	0M
+L	2	+	3	+	0M
+L	3	+	4	+	0M
+W	HG001	1	ctg001	0	20	>1>2>3>4>5

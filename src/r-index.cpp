@@ -825,9 +825,13 @@ namespace panindexer {
 
 
         // TODO: change this sort to parallel ones like in gbwt
-        std::sort(result.begin(), result.end());
-        result.resize(std::unique(result.begin(), result.end()) - result.begin());
-
+        // std::sort(result.begin(), result.end());
+        // result.resize(std::unique(result.begin(), result.end()) - result.begin());
+        std::cerr << "Document Array contents DA[SA[i]] : [ ";
+        for (const auto& val : result) {
+            std::cerr << val << " ";
+        }
+        std::cerr << "]" << std::endl;
         return result;
     }
 

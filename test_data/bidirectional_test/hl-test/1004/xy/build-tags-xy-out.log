@@ -1,0 +1,1 @@
+Assertion failed: (ifs.good()), function bwt_buff_reader, file bwt_io.h, line 43.

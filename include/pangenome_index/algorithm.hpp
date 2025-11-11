@@ -146,6 +146,7 @@ void kmers_to_bplustree_worker(FastLocate &idx, std::vector<std::pair<Run, size_
         if (it != index.end()) {
 
             Run run = {interval.first, it->second};
+            // cerr << " kmers run: kmer:  " << current_kmer << " kmer_key: " << kmer_key.get_key() << " run bwt start: " <<  run.start_position << " run graph pos: " << run.graph_position.decode() << " interval: " << interval.second - interval.first + 1 << endl;
 
             queue.push_back({run, interval.second - interval.first + 1});
 
@@ -383,6 +384,12 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
 
     cerr << "Filling the gaps on the bptree" << endl;
 
+    // std::vector<gbwt::size_type> result;
+    // result.reserve(gbz.index.sequences() / 2);
+    // for(gbwt::size_type i = 0; i < gbz.index.sequences() / 2; i++) { result.push_back(i); }
+    // std::cerr << "Result: " << result << std::endl;
+    std::cerr << "Total no. of sequences: " << gbz.index.sequences() << std::endl;
+
     // Using `num_threads` for efficient merging
     int num_threads = omp_get_max_threads();
     std::vector<std::vector<Run>> thread_tmp(num_threads); // Each thread gets its own vector
@@ -395,12 +402,42 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
 #pragma omp for
         for (int seq_num = 0; seq_num < number_of_sequences; ++seq_num) {
 
+            // TODO: print seq_num, bwt_index, and seq_id
             auto seq_graph_nodes = gbz.index.extract(seq_num);
             auto bwt_index = end_of_seq[seq_num].first;
+
+            // bwt_index, and seq_id makes sense but gbwt stores seq_id in the order of insertions followed by their reverse strand
+            // std::cerr << "Seq num: " << seq_num << " bwt index: " << bwt_index << " SA val: " << end_of_seq[seq_num].second << std::endl;
+            //
+            // for (int i = 0; i < seq_graph_nodes.size(); ++i) {
+            //     auto curr_node = GBWTGraph::node_to_handle(seq_graph_nodes[i]);
+            //     std::cerr << "Node: "  << gbz.graph.get_id(curr_node) << " Seq: " << gbz.graph.get_sequence(curr_node) << std::endl;
+            //     if (i == 0) {
+            //         std ::cerr << "Iterating over steps: " << gbz.graph.get_step_count(curr_node) << std::endl;
+            //         gbz.graph.for_each_step_on_handle(curr_node, [&](const step_handle_t& step) {
+            //             std::cerr << "Path Name: " << gbz.graph.get_path_name(gbz.graph.get_path_handle_of_step(step)) << std::endl;
+            //         });
+            //     }
+            // }
+            // std::cerr << std::endl;
+
+            // gbwt::size_type seq_id = gbwt::Path::encode(seq_num, false);
+            // gbwt::edge_type curr = gbz.index.start(seq_id);
+            // int i = 2;
+            // while(i > -1)
+            // {
+            //     handle_t handle = GBWTGraph::node_to_handle(curr.first);
+            //     view_type view = gbz.graph.get_sequence_view(handle);
+            //     std::cerr << "seq val: " << view.first << " seq_len: " << view.second << std::endl;
+            //     curr = gbz.index.LF(curr);
+            //     i--;
+            // }
 
             auto current_nodes_index = seq_graph_nodes.size() - 1;
             auto current_node = GBWTGraph::node_to_handle(seq_graph_nodes[current_nodes_index]);
             auto in_node_index = gbz.graph.get_length(current_node) - 1;
+
+            // std::cerr << "node id: " << gbz.graph.get_id(current_node) << " Seq: " << gbz.graph.get_sequence(current_node) << std::endl;
 
             while (true) {
                 auto temp = idx.psi(bwt_index);
@@ -467,6 +504,8 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
     cerr << "The traverse completed" << endl;
     std::cerr << "Adding runs with size 1 to the BPlusTree" << std::endl;
 
+    int totalRunsProcessed = 0;
+
     // Merge all thread-local results into `tmp1` (single-threaded step)
     for (auto& local_tmp : thread_tmp) {
 //        for (auto &i : local_tmp) {
@@ -498,6 +537,7 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
     std::pair<Run, uint16_t> latest_run;
     bool has_latest_run = false;
     std::vector<std::pair<gbwtgraph::Position, uint16_t>> runs_to_add;
+    int total_run_positions_processed = 0;
 
     // the case when we have to start from the tmp1 runs
     if (current_item.start_position > tmp1[runs_current_position].start_position){
@@ -509,6 +549,9 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
                 latest_run.second++;
             } else {
                 runs_to_add.push_back({latest_run.first.graph_position, latest_run.second});
+                // std::cerr << "Adding run to runs_to_add (" << runs_to_add.size() - 1 <<"): bwt_start: " << latest_run.first.start_position << " graph pos: " << latest_run.first.graph_position.decode()
+// << " Len: " << latest_run.second << std::endl;
+                total_run_positions_processed += latest_run.second;
                 latest_run = {tmp1[i], 1};
             }
 
@@ -537,6 +580,9 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
                         latest_run.second += total_length;
                     } else {
                         runs_to_add.push_back({latest_run.first.graph_position, latest_run.second});
+//                         std::cerr << "Adding run to runs_to_add (" << runs_to_add.size() - 1 <<"): bwt_start: " << latest_run.first.start_position << " graph pos: " << latest_run.first.graph_position.decode()
+// << " Len: " << latest_run.second << std::endl;
+                        total_run_positions_processed += latest_run.second;
                         latest_run = {current_item, total_length};
                     }
                 }
@@ -556,6 +602,9 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
                         latest_run.second++;
                     } else {
                         runs_to_add.push_back({latest_run.first.graph_position, latest_run.second});
+                        // std::cerr << "Adding run to runs_to_add (" << runs_to_add.size() - 1 <<"): bwt_start: " << latest_run.first.start_position << " graph pos: " << latest_run.first.graph_position.decode()
+                        // << " Len: " << latest_run.second << std::endl;
+                        total_run_positions_processed += latest_run.second;
                         latest_run = {tmp1[runs_current_position + i], 1};
                     }
                 }
@@ -568,11 +617,17 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
                         latest_run.second++;
                     } else {
                         runs_to_add.push_back({latest_run.first.graph_position, latest_run.second});
+//                         std::cerr << "Adding run to runs_to_add (" << runs_to_add.size() - 1 <<"): bwt_start: " << latest_run.first.start_position << " graph pos: " << latest_run.first.graph_position.decode()
+// << " Len: " << latest_run.second << std::endl;
+                        total_run_positions_processed += latest_run.second;
                         latest_run = {tmp1[i], 1};
                     }
                 }
 
                 runs_to_add.push_back({latest_run.first.graph_position, latest_run.second});
+//                 std::cerr << "Adding run to runs_to_add (" << runs_to_add.size() - 1 <<"): bwt_start: " << latest_run.first.start_position << " graph pos: " << latest_run.first.graph_position.decode()
+// << " Len: " << latest_run.second << std::endl;
+                total_run_positions_processed += latest_run.second;
 
             }
 
@@ -580,14 +635,30 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
 
         if (runs_to_add.size() >= 1024){
             tag_array.serialize_run_by_run_batch(out, runs_to_add);
+            // std::cerr << "Iterating through runs_to_add vector (size: " << runs_to_add.size() << ")" << std::endl;
+            totalRunsProcessed += runs_to_add.size();
             runs_to_add.clear();
         }
     }
 
     // add the remaining runs to the output
     if (runs_to_add.size() > 0){
+        // Iterate through runs_to_add vector and print contents
+        // std::cerr << "Iterating through runs_to_add vector (size: " << runs_to_add.size() << ")" << std::endl;
+        // for (size_t i = 0; i < runs_to_add.size(); ++i) {
+        //     const auto& run = runs_to_add[i];
+        //     std::cerr << "Run " << i << ": Position=" << run.first.decode()
+        //               << ", Length=" << run.second << std::endl;
+        // }
+
+
         tag_array.serialize_run_by_run_batch(out, runs_to_add);
+        totalRunsProcessed += runs_to_add.size();
     }
+
+    std::cerr << "Total RunsProcessed (len): " << totalRunsProcessed << std::endl;
+    std::cerr << "Total Run positions processed : " << total_run_positions_processed << "/" << idx.bwt_size() << std::endl;
+
 
 
 }
@@ -656,7 +727,7 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         // Step 1: initial interval from P[x + min_len - 1]
         FastLocate::bi_interval bint = {0, 0, fmd_index.bwt_size()};
         // bint = fmd_index.backward_extend(bint, pattern[x + min_len - 1]);
-//         std::cerr << "here" << std::endl;
+         std::cerr << "here" << std::endl;
         for (j = x + min_len - 1; j >= x; --j) {
             bint = fmd_index.backward_extend(bint, pattern[j]);
 //            std::cerr << j << " " << (char) pattern[j] << " " << bint.forward << " " << bint.reverse << " " << bint.size << std::endl;
@@ -699,7 +770,7 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         auto e = j;
         output.push_back({x, e, bint2.forward, bint2.size});
 
-        // if (j == len) return len;
+        if (j == len) return len;
         // std::cerr << "here4" << std::endl;
         // Step 3: reset to P[j], backward extend from j−1 to x+1
         FastLocate::bi_interval back = {0, 0, fmd_index.bwt_size()};

@@ -102,6 +102,7 @@ int main(int argc, char** argv) {
         gbwt::size_type decc = gbwt::ByteCode::read(encoded_bytes, loc);
         auto decoded = TagArray::decode_run(decc);
         batch.emplace_back(decoded.first, decoded.second);
+        std::cerr << "Handling run(outer loop): " << decoded.first << " Run Length: " << decoded.second << std::endl;
         if (batch.size() >= batch_runs) {
             tag_array.compressed_serialize(main_out, encoded_starts_out, bwt_intervals_out, batch);
             batch.clear();
