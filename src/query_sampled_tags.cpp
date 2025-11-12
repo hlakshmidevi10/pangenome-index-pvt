@@ -1,8 +1,6 @@
 #include "pangenome_index/r-index.hpp"
 #include "pangenome_index/sampled_tag_array.hpp"
 #include <sdsl/wavelet_trees.hpp>
-#include <gbwtgraph/utils.h>
-#include <gbwtgraph/gbz.h>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -16,9 +14,8 @@
 
 using namespace std;
 using namespace panindexer;
-using namespace gbwtgraph;
 
-static bool debug = false;
+static bool debug = true;
 
 struct TagResult {
     vector<size_t> query_offsets; // offsets within the query interval (relative to l)
@@ -40,36 +37,26 @@ static pair<size_t, size_t> parse_interval(const string& interval_str) {
 }
 
 static void usage(const char* prog) {
-    cerr << "Usage: " << prog << " <r_index.ri> <sampled.tags> <gbz_file> [--sample SAMPLE] [--contig CONTIG] [--haplotype H] [--interval START..END]" << endl;
-    cerr << "  OR:   " << prog << " <r_index.ri> <sampled.tags> <gbz_file> --seq-id ID --interval START..END" << endl;
+    cerr << "Usage: " << prog << " <r_index.ri> <sampled.tags> --seq-id ID --interval START..END" << endl;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
+    if (argc < 3) {
         usage(argv[0]);
         return 1;
     }
     
     string r_index_file = argv[1];
     string sampled_tags_file = argv[2];
-    string gbz_file = argv[3];
     
     // Parse optional arguments
-    string sample, contig;
-    size_t haplotype = 0;
     size_t seq_id = numeric_limits<size_t>::max();
     pair<size_t, size_t> interval = {0, 0};
     bool has_interval = false;
     
-    for (int i = 4; i < argc; i++) {
+    for (int i = 3; i < argc; i++) {
         string arg = argv[i];
-        if (arg == "--sample" && i + 1 < argc) {
-            sample = argv[++i];
-        } else if (arg == "--contig" && i + 1 < argc) {
-            contig = argv[++i];
-        } else if (arg == "--haplotype" && i + 1 < argc) {
-            haplotype = stoull(argv[++i]);
-        } else if (arg == "--interval" && i + 1 < argc) {
+        if (arg == "--interval" && i + 1 < argc) {
             interval = parse_interval(argv[++i]);
             has_interval = true;
         } else if (arg == "--seq-id" && i + 1 < argc) {
@@ -81,39 +68,15 @@ int main(int argc, char** argv) {
         }
     }
     
-    if (!has_interval) {
-        cerr << "Error: --interval is required" << endl;
+    if (seq_id == numeric_limits<size_t>::max()) {
+        cerr << "Error: --seq-id is required" << endl;
         usage(argv[0]);
         return 1;
     }
     
-    // Load GBZ file
-    GBZ gbz;
-    {
-        if (debug) cerr << "Loading GBZ file: " << gbz_file << "..." << endl;
-        ifstream gbz_in(gbz_file, ios::binary);
-        if (!gbz_in) {
-            cerr << "Cannot open GBZ file: " << gbz_file << endl;
-            return 1;
-        }
-        gbz_in.close();
-    }
-    sdsl::simple_sds::load_from(gbz, gbz_file);
-    if (debug) cerr << "GBZ file loaded successfully. Total sequences: " << gbz.index.sequences() << endl;
-    
-    // Determine sequence ID
-    if (seq_id == numeric_limits<size_t>::max()) {
-        if (sample.empty() || contig.empty()) {
-            cerr << "Error: must provide --sample and --contig OR --seq-id" << endl;
-            usage(argv[0]);
-            return 1;
-        }
-        cerr << "Warning: Path name lookup not fully implemented. Using --seq-id directly is recommended." << endl;
-        return 1;
-    }
-    
-    if (seq_id >= gbz.index.sequences()) {
-        cerr << "Error: sequence ID " << seq_id << " is out of range (max: " << (gbz.index.sequences() - 1) << ")" << endl;
+    if (!has_interval) {
+        cerr << "Error: --interval is required" << endl;
+        usage(argv[0]);
         return 1;
     }
     
@@ -143,46 +106,9 @@ int main(int argc, char** argv) {
     }
     if (debug) cerr << "Sampled tag array loaded successfully. Total runs: " << sampled.total_runs() << endl;
     
-    // Extract path sequence from GBWT
-    if (debug) cerr << "Extracting sequence " << seq_id << " from GBWT..." << endl;
-    auto path_nodes = gbz.index.extract(seq_id);
-    if (path_nodes.empty()) {
-        cerr << "Error: sequence " << seq_id << " is empty" << endl;
-        return 1;
-    }
-    if (debug) cerr << "Extracted " << path_nodes.size() << " nodes from sequence " << seq_id << endl;
-    
-    // Convert path interval to GBWT sequence interval
+    // Convert path interval to sequence interval
     size_t seq_start = interval.first;
     size_t seq_end = interval.second;
-    
-    // Build full sequence string from path
-    if (debug) cerr << "Building full sequence from path nodes..." << endl;
-    string full_seq;
-    for (size_t i = 0; i < path_nodes.size(); ++i) {
-        gbwt::short_type node_short = path_nodes[i];
-        size_t node_id = gbwt::Node::id(node_short);
-        bool is_rev = gbwt::Node::is_reverse(node_short);
-        
-        handle_t handle = gbz.graph.get_handle(node_id, is_rev);
-        string node_seq = gbz.graph.get_sequence(handle);
-        full_seq += node_seq;
-    }
-    if (debug) cerr << "Full sequence length: " << full_seq.size() << " characters" << endl;
-    
-    if (seq_end >= full_seq.size()) {
-        cerr << "Warning: interval end " << seq_end << " exceeds sequence length " << full_seq.size() << ", truncating" << endl;
-        seq_end = full_seq.size() - 1;
-    }
-    
-    // Extract query substring from path interval
-    string query_seq = full_seq.substr(seq_start, seq_end - seq_start + 1);
-    
-    if (query_seq.empty()) {
-        cerr << "Error: query sequence is empty" << endl;
-        return 1;
-    }
-    if (debug) cerr << "Query sequence length: " << query_seq.size() << " characters (interval " << seq_start << ".." << seq_end << ")" << endl;
     
     // Step 1: Convert sequence interval to packed text positions in last space
     // last marks packed text positions (not BWT positions)
@@ -200,11 +126,11 @@ int main(int argc, char** argv) {
     
     auto successor_result = r_index.last_successor(text_pos_j);
     size_t text_pos_x = successor_result.first;   // The marked text position at or after j
-    size_t rank_x = successor_result.second;      // The rank of text_pos_x
+    size_t rank_x = successor_result.second;      // 0-based index into last_to_run
     
-    // Get run ID: run_id = last_to_run[rank_x - 1] (0-indexed)
-    size_t run_id = (rank_x > 0 && rank_x <= r_index.last_to_run.size()) 
-        ? r_index.last_to_run[rank_x - 1] : 0;
+    // Get run ID: rank_x is already 0-based index into last_to_run
+    size_t run_id = (rank_x < r_index.last_to_run.size()) 
+        ? r_index.last_to_run[rank_x] : 0;
     
     // Find BWT position ISA[x] at the end of this run
     // Use bwt_end_position_of_run to get the BWT end position of the run
@@ -222,26 +148,6 @@ int main(int argc, char** argv) {
     unordered_map<uint64_t, TagResult> results;
     size_t current_text_pos = text_pos_x;
     size_t current_bwt_pos = bwt_pos_x;
-    
-    // Cache sequence lengths
-    unordered_map<size_t, size_t> seq_length_cache;
-    auto get_seq_length = [&](size_t seq_id) -> size_t {
-        auto it = seq_length_cache.find(seq_id);
-        if (it != seq_length_cache.end()) {
-            return it->second;
-        }
-        auto path_nodes_seq = gbz.index.extract(seq_id);
-        size_t length = 0;
-        for (size_t i = 0; i < path_nodes_seq.size(); ++i) {
-            gbwt::short_type node_short = path_nodes_seq[i];
-            size_t node_id = gbwt::Node::id(node_short);
-            bool is_rev = gbwt::Node::is_reverse(node_short);
-            handle_t handle = gbz.graph.get_handle(node_id, is_rev);
-            length += gbz.graph.get_length(handle);
-        }
-        seq_length_cache[seq_id] = length;
-        return length;
-    };
     
     // Iterate backwards from x down to i
     // Only process positions in [i, j] (x might be > j since it's the successor)
@@ -310,29 +216,6 @@ int main(int argc, char** argv) {
     // Step 3: For each tag, find all occurrences using wt_gmr select queries
     if (debug) cerr << "Enumerating all occurrences for " << results.size() << " tags..." << endl;
     const auto& wm = sampled.values();
-    
-    // Note: seq_length_cache/get_seq_length already defined above
- 
-    // Cache sequences to avoid recomputation
-    unordered_map<size_t, string> seq_cache;
-    auto get_sequence = [&](size_t seq_id) -> const string& {
-        auto it = seq_cache.find(seq_id);
-        if (it != seq_cache.end()) {
-            return it->second;
-        }
-        auto path_nodes_seq = gbz.index.extract(seq_id);
-        string full_seq;
-        for (size_t i = 0; i < path_nodes_seq.size(); ++i) {
-            gbwt::short_type node_short = path_nodes_seq[i];
-            size_t node_id = gbwt::Node::id(node_short);
-            bool is_rev = gbwt::Node::is_reverse(node_short);
-            handle_t handle = gbz.graph.get_handle(node_id, is_rev);
-            string node_seq = gbz.graph.get_sequence(handle);
-            full_seq += node_seq;
-        }
-        seq_cache[seq_id] = full_seq;
-        return seq_cache[seq_id];
-    };
     
     for (auto& kv : results) {
         uint64_t tag_code = kv.first;
@@ -490,13 +373,6 @@ int main(int argc, char** argv) {
     cout << "Query Sequence:" << endl;
     cout << "  Sequence ID: " << seq_id << endl;
     cout << "  Interval: " << seq_start << ".." << seq_end << endl;
-    cout << "  Sequence: " << query_seq << endl;
-    // Compute BWT interval for reporting
-    {
-        auto __range = r_index.count_encoded(query_seq);
-        size_t l = __range.first, r = __range.second;
-        cout << "  BWT interval: [" << l << ", " << r << "]" << endl;
-    }
     cout << "  Number of tags found: " << results.size() << endl;
     cout << endl;
     
@@ -534,9 +410,6 @@ int main(int argc, char** argv) {
             size_t seq_id_found = seq_kv.first;
             const vector<size_t>& offsets = seq_kv.second;
             
-            // Get the full sequence for this seq_id
-            const string& full_seq = get_sequence(seq_id_found);
-            
             cout << "    Sequence ID: " << seq_id_found << " (occurrences: " << offsets.size() << ")" << endl;
             cout << "      Offsets: ";
             for (size_t i = 0; i < offsets.size() && i < 10; ++i) {
@@ -547,25 +420,8 @@ int main(int argc, char** argv) {
                 cout << ", ... (and " << (offsets.size() - 10) << " more)";
             }
             cout << endl;
-            
-        //     // Print sequence snippets for each offset
-        //     cout << "      Sequences: ";
-        //     for (size_t i = 0; i < offsets.size() && i < 10; ++i) {
-        //         if (i > 0) cout << ", ";
-        //         size_t offset = offsets[i];
-        //         if (offset < full_seq.size()) {
-        //             size_t snippet_len = std::min<size_t>(10, full_seq.size() - offset);
-        //             cout << "\"" << full_seq.substr(offset, snippet_len) << "\"";
-        //         } else {
-        //             cout << "\"<out_of_range>\"";
-        //         }
-        //     }
-        //     if (offsets.size() > 10) {
-        //         cout << ", ...";
-        //     }
-        //     cout << endl;
         }
-        // cout << endl;
+        cout << endl;
     }
     
     if (debug) cerr << "Query completed successfully" << endl;

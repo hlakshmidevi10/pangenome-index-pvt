@@ -552,30 +552,32 @@ namespace panindexer {
         }
 
         // Find the first marked position in last at or after pos (successor query)
-        // Returns a pair: (position, rank) where rank is last.rank(position + 1)
+        // Returns a pair: (position, rank) where rank is 0-based index into last_to_run
+        // Note: last_to_run is 0-indexed, so first marked position (rank_1=1) maps to last_to_run[0]
         inline std::pair<size_type, size_type> last_successor(size_type pos) const {
             ensure_last_rank();
             ensure_last_select();
             
             size_type text_pos_x;
-            size_type rank_x;
+            size_type rank_x;  // 0-based index into last_to_run
             
             // Check if pos itself is marked
             if (pos < last.size() && last[pos] == 1) {
                 text_pos_x = pos;
-                rank_x = last_rank_1(pos + 1);
+                // last_rank_1(pos + 1) returns 1-based rank, convert to 0-based
+                rank_x = last_rank_1(pos + 1) - 1;
             } else {
                 // Find the first marked position after pos
-                size_t rank_upto_pos = last_rank_1(pos + 1);
-                size_t sel_k = rank_upto_pos + 1;
+                size_t rank_upto_pos = last_rank_1(pos + 1);  // 1-based rank of positions up to pos
+                size_t sel_k = rank_upto_pos + 1;  // 1-based rank of successor
                 
                 if (sel_k > last_to_run.size()) {
-                    // No marked position after pos, return pos itself
+                    // No marked position after pos, return pos itself with invalid rank
                     text_pos_x = pos;
-                    rank_x = rank_upto_pos;
+                    rank_x = last_to_run.size();  // Invalid index to signal no successor
                 } else {
                     text_pos_x = last_select_1(sel_k);
-                    rank_x = sel_k;  // rank_x is the rank of the successor position
+                    rank_x = sel_k - 1;  // Convert 1-based rank to 0-based index
                 }
             }
             
