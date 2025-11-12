@@ -350,6 +350,10 @@ namespace panindexer {
         mutable std::once_flag last_rank_once;
         mutable std::once_flag last_select_once;
 
+        // Lazy select support for blocks_start_pos (constructed on-demand)
+        mutable sdsl::sd_vector<>::select_1_type blocks_start_select_support;
+        mutable std::once_flag blocks_start_select_once;
+
 
         // variables for FMD-index
         std::array<uint8_t, 256> complement_table{};
@@ -523,6 +527,13 @@ namespace panindexer {
             });
         }
 
+        // Ensure helper for blocks_start_pos select (lazy)
+        inline void ensure_blocks_start_select() const {
+            std::call_once(blocks_start_select_once, [&]() {
+                sdsl::util::init_support(blocks_start_select_support, &blocks_start_pos);
+            });
+        }
+
         // Thin wrappers used by sampled-tag queries
         inline size_type last_rank_1(size_type i) const {
             ensure_last_rank();
@@ -532,6 +543,43 @@ namespace panindexer {
         inline size_type last_select_1(size_type k) const {
             ensure_last_select();
             return last_select_support(k);
+        }
+
+        // Thin wrapper to select the BWT start position of the given block (1-based)
+        inline size_type blocks_start_select_1(size_type k) const {
+            ensure_blocks_start_select();
+            return blocks_start_select_support(k);
+        }
+
+        // Find the first marked position in last at or after pos (successor query)
+        // Returns a pair: (position, rank) where rank is last.rank(position + 1)
+        inline std::pair<size_type, size_type> last_successor(size_type pos) const {
+            ensure_last_rank();
+            ensure_last_select();
+            
+            size_type text_pos_x;
+            size_type rank_x;
+            
+            // Check if pos itself is marked
+            if (pos < last.size() && last[pos] == 1) {
+                text_pos_x = pos;
+                rank_x = last_rank_1(pos + 1);
+            } else {
+                // Find the first marked position after pos
+                size_t rank_upto_pos = last_rank_1(pos + 1);
+                size_t sel_k = rank_upto_pos + 1;
+                
+                if (sel_k > last_to_run.size()) {
+                    // No marked position after pos, return pos itself
+                    text_pos_x = pos;
+                    rank_x = rank_upto_pos;
+                } else {
+                    text_pos_x = last_select_1(sel_k);
+                    rank_x = sel_k;  // rank_x is the rank of the successor position
+                }
+            }
+            
+            return std::make_pair(text_pos_x, rank_x);
         }
 
         gbwt::range_type LF(gbwt::range_type range, size_t sym, bool &starts_with_to, size_t &first_run) const;
@@ -553,8 +601,11 @@ namespace panindexer {
 
         // just the backward navigation
         size_t LF(size_t idx) {
-            return this->psi(idx).second;
-
+            if (this->is_encoded()) {
+                return this->psi_encoded(idx).second;
+            } else {
+                return this->psi(idx).second;
+            }
         }
 
         // This function returns pairs (i, SA[i]) for the end of sequences
@@ -643,6 +694,10 @@ namespace panindexer {
 
         // Helpers to map positions to runs
         void run_id_and_offset_at(size_t pos, size_t &run_id, size_t &offset_of_first) const;
+
+        // Find the BWT end position of a run given its run_id
+        // Returns the BWT position at the end of the run (inclusive)
+        size_type bwt_end_position_of_run(size_type run_id) const;
         size_t last_run_size_global() const;
 
         size_type getSample(size_type run_id) const {

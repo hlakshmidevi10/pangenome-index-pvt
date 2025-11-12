@@ -1242,6 +1242,66 @@ namespace panindexer {
         }
     }
 
+    FastLocate::size_type FastLocate::bwt_end_position_of_run(size_type run_id) const {
+        // Find which block contains this run
+        size_t block_id, run_num;
+        size_t actual_block_size = (this->encoded_block_size != 0) ? this->encoded_block_size : this->block_size;
+        
+        block_id = run_id / actual_block_size;
+        run_num = run_id % actual_block_size;
+        
+        size_t block_start_bwt_pos = 0;
+        size_t cumulative_length = 0;
+        
+        if (!this->blocks.empty()) {
+            // Non-encoded: use blocks vector
+            // Get block_start_bwt_pos from blocks_start_pos via select (1-based)
+            block_start_bwt_pos = this->blocks_start_select_1(block_id + 1);
+            
+            // Now traverse runs in the target block up to run_num
+            const auto& block = this->blocks[block_id];
+            for (size_t i = 0; i <= run_num && i < block.get_run_nums(); ++i) {
+                auto run_info = block.get_run(i);
+                cumulative_length += run_info.second; // run_info.second is the run length
+            }
+            
+            // The end position is block_start + cumulative_length - 1
+            return block_start_bwt_pos + cumulative_length - 1;
+        } else {
+            // Encoded: decode runs from blocks_encoded_stream
+            if (block_id >= this->blocks_encoded_start_bits.size()) {
+                return 0; // Invalid block_id
+            }
+            
+            // Get block_start_bwt_pos from blocks_start_pos via select (1-based)
+            block_start_bwt_pos = this->blocks_start_select_1(block_id + 1);
+            
+            // Now traverse runs in the target block up to run_num
+            gbwt::size_type loc = static_cast<gbwt::size_type>(this->blocks_encoded_start_bits[block_id]);
+            size_t end_pos = (block_id + 1 < this->blocks_encoded_start_bits.size()) 
+                ? this->blocks_encoded_start_bits[block_id + 1] 
+                : this->blocks_encoded_stream.size();
+            
+            EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
+            blk.skip_header(loc);
+            
+            size_t runnum = 0;
+            
+            while (runnum <= run_num && static_cast<size_t>(loc) < end_pos) {
+                gbwt::byte_type header = this->blocks_encoded_stream[loc++];
+                size_t prefix = header & 0x1F;
+                size_t run_length = (prefix < 31) 
+                    ? (prefix + 1) 
+                    : (32 + static_cast<size_t>(gbwt::ByteCode::read(this->blocks_encoded_stream, loc)));
+                
+                cumulative_length += run_length;
+                runnum++;
+            }
+            
+            return block_start_bwt_pos + cumulative_length - 1;
+        }
+    }
+
     size_t FastLocate::last_run_size_global() const {
         if (!this->blocks.empty()) { return this->blocks.back().last_run_size(); }
         // Encoded: scan last block to get last run length

@@ -51,9 +51,20 @@ namespace panindexer {
         inline size_t total_runs() const { return sampled_values.size(); }
 
         // Return run id that contains BWT position pos
+        // Note: rank_1(i) counts 1s in [0, i-1], so rank_1(pos+1) counts 1s in [0, pos]
+        // If rank_1(pos+1) = k, there are k runs that start at or before pos
+        // Position pos belongs to run (k-1) if pos has a 1, or run (k-1) if pos doesn't have a 1
+        // Actually, if k runs start at or before pos, pos belongs to run (k-1) (0-indexed)
         inline size_t run_id_at(size_t pos) const {
             ensure_run_rank();
-            return run_rank_support(pos);
+            size_t rank = run_rank_support(pos + 1);
+            // rank is the count of 1s up to and including pos
+            // If rank = k, then k runs start at or before pos, so pos belongs to run (k-1) (0-indexed)
+            // But we need to handle the case where pos itself is the start of a run
+            if (rank > 0) {
+                return rank - 1;
+            }
+            return 0;
         }
 
         // Return [start,end] BWT span for run_id
