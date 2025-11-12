@@ -538,12 +538,12 @@ namespace panindexer {
     }
 
     std::pair<size_t, size_t> FastLocate::psi_encoded(size_t idx) {
-        std::cerr << "psi_encoded: idx=" << idx << std::endl;
+        // std::cerr << "psi_encoded: idx=" << idx << std::endl;
         size_t symbol = this->bwt_char_at_encoded(idx);
-        std::cerr << "symbol=" << symbol << std::endl;
+        // std::cerr << "symbol=" << symbol << std::endl;
         size_t rid = 0, cur = 0;
         size_t next_pos = this->C[this->sym_map[symbol]] + this->rankAt_encoded(idx, symbol, rid, cur);
-        std::cerr << "next_pos=" << next_pos << std::endl;
+        // std::cerr << "next_pos=" << next_pos << std::endl;
         return {symbol, next_pos};
     }
 

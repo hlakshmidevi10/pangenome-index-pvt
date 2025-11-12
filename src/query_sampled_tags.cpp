@@ -18,6 +18,8 @@ using namespace std;
 using namespace panindexer;
 using namespace gbwtgraph;
 
+static bool debug = false;
+
 struct TagResult {
     vector<size_t> query_offsets; // offsets within the query interval (relative to l)
     unordered_map<size_t, vector<size_t>> sequence_offsets; // seq_id -> list of offsets in that sequence
@@ -88,7 +90,7 @@ int main(int argc, char** argv) {
     // Load GBZ file
     GBZ gbz;
     {
-        cerr << "Loading GBZ file: " << gbz_file << "..." << endl;
+        if (debug) cerr << "Loading GBZ file: " << gbz_file << "..." << endl;
         ifstream gbz_in(gbz_file, ios::binary);
         if (!gbz_in) {
             cerr << "Cannot open GBZ file: " << gbz_file << endl;
@@ -97,7 +99,7 @@ int main(int argc, char** argv) {
         gbz_in.close();
     }
     sdsl::simple_sds::load_from(gbz, gbz_file);
-    cerr << "GBZ file loaded successfully. Total sequences: " << gbz.index.sequences() << endl;
+    if (debug) cerr << "GBZ file loaded successfully. Total sequences: " << gbz.index.sequences() << endl;
     
     // Determine sequence ID
     if (seq_id == numeric_limits<size_t>::max()) {
@@ -118,7 +120,7 @@ int main(int argc, char** argv) {
     // Load r-index
     FastLocate r_index;
     {
-        cerr << "Loading r-index: " << r_index_file << "..." << endl;
+        if (debug) cerr << "Loading r-index: " << r_index_file << "..." << endl;
         ifstream rin(r_index_file, ios::binary);
         if (!rin) { 
             cerr << "Cannot open r-index: " << r_index_file << endl; 
@@ -126,12 +128,12 @@ int main(int argc, char** argv) {
         }
         r_index.load_encoded(rin);
     }
-    cerr << "R-index loaded successfully. BWT size: " << r_index.bwt_size() << endl;
+    if (debug) cerr << "R-index loaded successfully. BWT size: " << r_index.bwt_size() << endl;
     
     // Load sampled tag array
     SampledTagArray sampled;
     {
-        cerr << "Loading sampled tag array: " << sampled_tags_file << "..." << endl;
+        if (debug) cerr << "Loading sampled tag array: " << sampled_tags_file << "..." << endl;
         ifstream sin(sampled_tags_file, ios::binary);
         if (!sin) { 
             cerr << "Cannot open sampled.tags: " << sampled_tags_file << endl; 
@@ -139,23 +141,23 @@ int main(int argc, char** argv) {
         }
         sampled.load(sin);
     }
-    cerr << "Sampled tag array loaded successfully. Total runs: " << sampled.total_runs() << endl;
+    if (debug) cerr << "Sampled tag array loaded successfully. Total runs: " << sampled.total_runs() << endl;
     
     // Extract path sequence from GBWT
-    cerr << "Extracting sequence " << seq_id << " from GBWT..." << endl;
+    if (debug) cerr << "Extracting sequence " << seq_id << " from GBWT..." << endl;
     auto path_nodes = gbz.index.extract(seq_id);
     if (path_nodes.empty()) {
         cerr << "Error: sequence " << seq_id << " is empty" << endl;
         return 1;
     }
-    cerr << "Extracted " << path_nodes.size() << " nodes from sequence " << seq_id << endl;
+    if (debug) cerr << "Extracted " << path_nodes.size() << " nodes from sequence " << seq_id << endl;
     
     // Convert path interval to GBWT sequence interval
     size_t seq_start = interval.first;
     size_t seq_end = interval.second;
     
     // Build full sequence string from path
-    cerr << "Building full sequence from path nodes..." << endl;
+    if (debug) cerr << "Building full sequence from path nodes..." << endl;
     string full_seq;
     for (size_t i = 0; i < path_nodes.size(); ++i) {
         gbwt::short_type node_short = path_nodes[i];
@@ -166,7 +168,7 @@ int main(int argc, char** argv) {
         string node_seq = gbz.graph.get_sequence(handle);
         full_seq += node_seq;
     }
-    cerr << "Full sequence length: " << full_seq.size() << " characters" << endl;
+    if (debug) cerr << "Full sequence length: " << full_seq.size() << " characters" << endl;
     
     if (seq_end >= full_seq.size()) {
         cerr << "Warning: interval end " << seq_end << " exceeds sequence length " << full_seq.size() << ", truncating" << endl;
@@ -180,15 +182,15 @@ int main(int argc, char** argv) {
         cerr << "Error: query sequence is empty" << endl;
         return 1;
     }
-    cerr << "Query sequence length: " << query_seq.size() << " characters (interval " << seq_start << ".." << seq_end << ")" << endl;
+    if (debug) cerr << "Query sequence length: " << query_seq.size() << " characters (interval " << seq_start << ".." << seq_end << ")" << endl;
     
     // Step 1: Convert sequence interval to packed text positions in last space
     // last marks packed text positions (not BWT positions)
-    cerr << "Converting sequence interval to packed text positions..." << endl;
+    if (debug) cerr << "Converting sequence interval to packed text positions..." << endl;
     size_t text_pos_i = r_index.pack(seq_id, seq_start);  // Start of interval in packed text space
     size_t text_pos_j = r_index.pack(seq_id, seq_end);    // End of interval in packed text space
     
-    cerr << "Sequence interval [" << seq_start << ", " << seq_end << "] maps to text positions [" 
+    if (debug) cerr << "Sequence interval [" << seq_start << ", " << seq_end << "] maps to text positions [" 
          << text_pos_i << ", " << text_pos_j << "] in last space" << endl;
     
     // Step 2: Find successor position on last at or after j
@@ -208,12 +210,12 @@ int main(int argc, char** argv) {
     // Use bwt_end_position_of_run to get the BWT end position of the run
     size_t bwt_pos_x = r_index.bwt_end_position_of_run(run_id);
     
-    cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x 
+    if (debug) cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x 
          << ", run_id=" << run_id << ", BWT_pos=" << bwt_pos_x << ")" << endl;
     
     // Step 3: Iterate backwards: (x-1, LF(ISA[x])) until x reaches i
     // Collect tags from TAG[ISA[x]] for each x in [i, j]
-    cerr << "Iterating backwards through text positions [" << text_pos_i << ", " << text_pos_x << "]..." << endl;
+    if (debug) cerr << "Iterating backwards through text positions [" << text_pos_i << ", " << text_pos_x << "]..." << endl;
     sampled.ensure_run_rank();
     sampled.ensure_run_select();
     
@@ -280,7 +282,7 @@ int main(int argc, char** argv) {
                     results[tag_val].query_offsets.push_back(offset_in_query);
                 }
                 
-                cerr << "  Text pos " << current_text_pos << " (seq_id=" << text_seq_id 
+                if (debug) cerr << "  Text pos " << current_text_pos << " (seq_id=" << text_seq_id 
                      << ", offset=" << text_offset << ") -> BWT pos " << current_bwt_pos 
                      << " -> (seq_id=" << seq_id_found << ", offset_from_start=" << offset_from_start 
                      << ") -> tag=" << tag_val << endl;
@@ -298,7 +300,7 @@ int main(int argc, char** argv) {
         }
     }
     
-    cerr << "Found " << results.size() << " unique tags from backward iteration" << endl;
+    if (debug) cerr << "Found " << results.size() << " unique tags from backward iteration" << endl;
     
     if (results.empty()) {
         cout << "seq_id=" << seq_id << "\tinterval=" << seq_start << ".." << seq_end << "\tno_tags" << endl;
@@ -306,7 +308,7 @@ int main(int argc, char** argv) {
     }
     
     // Step 3: For each tag, find all occurrences using wt_gmr select queries
-    cerr << "Enumerating all occurrences for " << results.size() << " tags..." << endl;
+    if (debug) cerr << "Enumerating all occurrences for " << results.size() << " tags..." << endl;
     const auto& wm = sampled.values();
     
     // Note: seq_length_cache/get_seq_length already defined above
@@ -343,11 +345,11 @@ int main(int argc, char** argv) {
         // Get total occurrences of this tag using wt_gmr rank
         size_t total_occ = wm.rank(wm.size(), tag_code);
         if (total_occ == 0) {
-            cerr << "Warning: Tag " << tag_code << " has 0 occurrences in wavelet matrix" << endl;
+            if (debug) cerr << "Warning: Tag " << tag_code << " has 0 occurrences in wavelet matrix" << endl;
             continue;
         }
         
-        cerr << "  Tag " << tag_code << ": Found " << total_occ << " tag runs containing this tag" << endl;
+        if (debug) cerr << "  Tag " << tag_code << ": Found " << total_occ << " tag runs containing this tag" << endl;
         
         // Step 4: For each run containing this tag, locate all (seq_id, offset) pairs
         // Use select queries to find all runs containing this tag
@@ -356,7 +358,7 @@ int main(int argc, char** argv) {
             size_t occ_run = wm.select(j, tag_code);  // This is a TAG run_id, not a BWT run_id
             auto run_span = sampled.run_span(occ_run);
             
-            cerr << "    Tag Run " << j << "/" << total_occ << ": tag_run_id=" << occ_run 
+            if (debug) cerr << "    Tag Run " << j << "/" << total_occ << ": tag_run_id=" << occ_run 
                  << ", BWT interval=[" << run_span.first << ", " << run_span.second 
                  << "] (size=" << (run_span.second - run_span.first + 1) << ")" << endl;
             
@@ -370,7 +372,7 @@ int main(int argc, char** argv) {
             static bool sa_loaded = false;
             static vector<gbwt::size_type> sa;
             if (!sa_loaded) {
-                cerr << "      Loading decompressSA for verification..." << endl;
+                if (debug) cerr << "      Loading decompressSA for verification..." << endl;
                 sa = r_index.decompressSA();
                 sa_loaded = true;
             }
@@ -434,7 +436,7 @@ int main(int argc, char** argv) {
                         
                         if (seq_id_found != sa_seq_id || offset_from_start != sa_offset_from_start) {
                             mismatches++;
-                            cerr << "        ERROR: BWT[" << pos << "] mismatch! Manual: (seq_id=" << seq_id_found 
+                            if (debug) cerr << "        ERROR: BWT[" << pos << "] mismatch! Manual: (seq_id=" << seq_id_found 
                                  << ", offset_from_start=" << offset_from_start 
                                  << "), decompressSA: (seq_id=" << sa_seq_id 
                                  << ", offset_from_start=" << sa_offset_from_start << ")" << endl;
@@ -453,7 +455,7 @@ int main(int argc, char** argv) {
                         unique_sequences_found++;
                         
                         // Print first few conversions for debugging
-                        if (positions_processed < 5) {
+                        if (debug && positions_processed < 5) {
                             cerr << "        BWT[" << pos << "] -> (seq_id=" << seq_id_found 
                                  << ", offset_from_start=" << offset_from_start;
                             if (verified) {
@@ -471,19 +473,19 @@ int main(int argc, char** argv) {
                 current_pos = segment_end + 1;
             }
             
-            if (mismatches > 0) {
+            if (debug && mismatches > 0) {
                 cerr << "      WARNING: Found " << mismatches << " mismatches out of " 
                      << positions_processed << " positions. Used decompressSA values for corrections." << endl;
             }
             
-            cerr << "      Processed " << positions_processed << " BWT positions, found " 
+            if (debug) cerr << "      Processed " << positions_processed << " BWT positions, found " 
                  << unique_sequences_found << " unique (seq_id, offset) pairs" << endl;
         }
     }
     
     // Step 5: Output results
     // For each TAG, show the different sequence IDs that pass through those TAGS
-    cerr << "Writing results..." << endl;
+    if (debug) cerr << "Writing results..." << endl;
     
     cout << "Query Sequence:" << endl;
     cout << "  Sequence ID: " << seq_id << endl;
@@ -498,8 +500,15 @@ int main(int argc, char** argv) {
     cout << "  Number of tags found: " << results.size() << endl;
     cout << endl;
     
+    // Sort tags by tag_code before printing
+    vector<pair<uint64_t, TagResult>> sorted_results(results.begin(), results.end());
+    sort(sorted_results.begin(), sorted_results.end(), 
+         [](const pair<uint64_t, TagResult>& a, const pair<uint64_t, TagResult>& b) {
+             return a.first < b.first;
+         });
+    
     // Print results for each tag
-    for (const auto& kv : results) {
+    for (const auto& kv : sorted_results) {
         uint64_t tag_code = kv.first;
         const TagResult& res = kv.second;
         
@@ -539,27 +548,27 @@ int main(int argc, char** argv) {
             }
             cout << endl;
             
-            // Print sequence snippets for each offset
-            cout << "      Sequences: ";
-            for (size_t i = 0; i < offsets.size() && i < 10; ++i) {
-                if (i > 0) cout << ", ";
-                size_t offset = offsets[i];
-                if (offset < full_seq.size()) {
-                    size_t snippet_len = std::min<size_t>(10, full_seq.size() - offset);
-                    cout << "\"" << full_seq.substr(offset, snippet_len) << "\"";
-                } else {
-                    cout << "\"<out_of_range>\"";
-                }
-            }
-            if (offsets.size() > 10) {
-                cout << ", ...";
-            }
-            cout << endl;
+        //     // Print sequence snippets for each offset
+        //     cout << "      Sequences: ";
+        //     for (size_t i = 0; i < offsets.size() && i < 10; ++i) {
+        //         if (i > 0) cout << ", ";
+        //         size_t offset = offsets[i];
+        //         if (offset < full_seq.size()) {
+        //             size_t snippet_len = std::min<size_t>(10, full_seq.size() - offset);
+        //             cout << "\"" << full_seq.substr(offset, snippet_len) << "\"";
+        //         } else {
+        //             cout << "\"<out_of_range>\"";
+        //         }
+        //     }
+        //     if (offsets.size() > 10) {
+        //         cout << ", ...";
+        //     }
+        //     cout << endl;
         }
-        cout << endl;
+        // cout << endl;
     }
     
-    cerr << "Query completed successfully" << endl;
+    if (debug) cerr << "Query completed successfully" << endl;
     
     return 0;
 }
