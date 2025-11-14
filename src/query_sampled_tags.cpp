@@ -231,6 +231,7 @@ int main(int argc, char** argv) {
     auto start_find_sequences = high_resolution_clock::now();
     if (debug) cerr << "Enumerating all occurrences for " << results.size() << " tags..." << endl;
     const auto& wm = sampled.values();
+
     
     size_t total_tag_runs = 0;
     size_t total_bwt_positions_processed = 0;
@@ -267,17 +268,12 @@ int main(int argc, char** argv) {
                  << "] (size=" << (run_span.second - run_span.first + 1) << ")" << endl;
             
             // Process the entire run to get all sequences with this tag
-            // Note: We can't use locate_encoded() directly because it only returns sequence IDs,
-            // but we need offsets too. However, we use its efficient sequential approach.
             size_t locate_start = run_span.first;
             size_t locate_end = run_span.second;
             
-            unordered_set<unsigned long long> seen;
             size_t positions_processed = 0;
             size_t unique_sequences_found = 0;
-            
-            // Use locate_encoded()'s efficient method to find starting packed position
-            // This matches the approach in locate_encoded() (lines 1395-1417 in r-index.cpp)
+
             size_t packed_pos;
             {
                 size_t rindex_run_id = 0;
@@ -285,35 +281,31 @@ int main(int argc, char** argv) {
                 r_index.run_id_and_offset_at(locate_start, rindex_run_id, run_start_pos);
                 packed_pos = r_index.getSample(rindex_run_id);
                 
-                // Navigate from run start to locate_start (like locate_encoded does)
+                // Navigate from run start to locate_start
                 for (size_t p = run_start_pos; p < locate_start; ++p) {
                     packed_pos = r_index.locateNext(packed_pos);
                 }
             }
             
-            // Process all positions sequentially (like locate_encoded does, lines 1419-1427)
-            // This is more efficient than breaking into run segments
+            // Process all positions sequentially
             for (size_t pos = locate_start; pos <= locate_end; ++pos) {
                 if (pos > locate_start) {
                     packed_pos = r_index.locateNext(packed_pos);
                 }
                 
-                // Unpack to get (seq_id, offset) - this is what locate_encoded doesn't do
+                // Unpack to get (seq_id, offset)
                 auto pr = r_index.unpack(packed_pos);
                 size_t seq_id_found = pr.first;
                 size_t offset_from_start = pr.second; // offset is already distance from START
                 
-                unsigned long long key = (static_cast<unsigned long long>(seq_id_found) << 32) | static_cast<unsigned long long>(offset_from_start);
+                // Each BWT position maps to a unique (seq_id, offset) pair
+                res.sequence_offsets[seq_id_found].push_back(offset_from_start);
+                unique_sequences_found++;
                 
-                if (seen.insert(key).second) {
-                    res.sequence_offsets[seq_id_found].push_back(offset_from_start);
-                    unique_sequences_found++;
-                    
-                    // Print first few conversions for debugging
-                    if (debug && positions_processed < 5) {
-                        cerr << "        BWT[" << pos << "] -> (seq_id=" << seq_id_found 
-                             << ", offset_from_start=" << offset_from_start << ")" << endl;
-                    }
+                // Print first few conversions for debugging
+                if (debug && positions_processed < 5) {
+                    cerr << "        BWT[" << pos << "] -> (seq_id=" << seq_id_found 
+                         << ", offset_from_start=" << offset_from_start << ")" << endl;
                 }
                 positions_processed++;
             }
