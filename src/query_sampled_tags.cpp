@@ -11,11 +11,14 @@
 #include <sstream>
 #include <limits>
 #include <map>
+#include <chrono>
+#include <iomanip>
 
 using namespace std;
 using namespace panindexer;
+using namespace std::chrono;
 
-static bool debug = true;
+static bool debug = false;
 
 struct TagResult {
     vector<size_t> query_offsets; // offsets within the query interval (relative to l)
@@ -80,6 +83,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    // Timing variables
+    auto start_total = high_resolution_clock::now();
+    auto start_load_rindex = high_resolution_clock::now();
+    
     // Load r-index
     FastLocate r_index;
     {
@@ -91,8 +98,11 @@ int main(int argc, char** argv) {
         }
         r_index.load_encoded(rin);
     }
+    auto end_load_rindex = high_resolution_clock::now();
+    auto duration_load_rindex = duration_cast<milliseconds>(end_load_rindex - start_load_rindex);
     if (debug) cerr << "R-index loaded successfully. BWT size: " << r_index.bwt_size() << endl;
     
+    auto start_load_tags = high_resolution_clock::now();
     // Load sampled tag array
     SampledTagArray sampled;
     {
@@ -104,6 +114,8 @@ int main(int argc, char** argv) {
         }
         sampled.load(sin);
     }
+    auto end_load_tags = high_resolution_clock::now();
+    auto duration_load_tags = duration_cast<milliseconds>(end_load_tags - start_load_tags);
     if (debug) cerr << "Sampled tag array loaded successfully. Total runs: " << sampled.total_runs() << endl;
     
     // Convert path interval to sequence interval
@@ -141,6 +153,7 @@ int main(int argc, char** argv) {
     
     // Step 3: Iterate backwards: (x-1, LF(ISA[x])) until x reaches i
     // Collect tags from TAG[ISA[x]] for each x in [i, j]
+    auto start_find_tags = high_resolution_clock::now();
     if (debug) cerr << "Iterating backwards through text positions [" << text_pos_i << ", " << text_pos_x << "]..." << endl;
     sampled.ensure_run_rank();
     sampled.ensure_run_select();
@@ -148,39 +161,27 @@ int main(int argc, char** argv) {
     unordered_map<uint64_t, TagResult> results;
     size_t current_text_pos = text_pos_x;
     size_t current_bwt_pos = bwt_pos_x;
+    size_t positions_checked = 0;
+    size_t positions_with_tags = 0;
     
     // Iterate backwards from x down to i
     // Only process positions in [i, j] (x might be > j since it's the successor)
     while (current_text_pos >= text_pos_i) {
         // Only process positions in our interval [i, j]
         if (current_text_pos <= text_pos_j) {
+            positions_checked++;
             // Get tag for current BWT position
             size_t sampled_run_id = sampled.run_id_at(current_bwt_pos);
             uint64_t tag_val = sampled.run_value(sampled_run_id);
             
 
             // Do nothing if tag_val == 0
-            // If we found a tag, locate the BWT position to get (seq_id, offset)
+            // If we found a tag, unpack current_text_pos to get (seq_id, offset)
             if (tag_val != 0) {
-                // Locate current BWT position
-                size_t rindex_run_id_pos = 0;
-                size_t run_start_pos = 0;
-                r_index.run_id_and_offset_at(current_bwt_pos, rindex_run_id_pos, run_start_pos);
-                size_t packed_pos = r_index.getSample(rindex_run_id_pos);
-                
-                // Navigate from run start to current_bwt_pos
-                for (size_t p = run_start_pos; p < current_bwt_pos; ++p) {
-                    packed_pos = r_index.locateNext(packed_pos);
-                }
-                
-                // Unpack to get (seq_id, offset)
-                auto pr = r_index.unpack(packed_pos);
-                size_t seq_id_found = pr.first;
-                size_t offset_from_start = pr.second; // offset is already distance from START
-                
-                // Unpack current_text_pos to verify it matches
-                size_t text_seq_id = r_index.seqId(current_text_pos);
-                size_t text_offset = r_index.seqOffset(current_text_pos);
+                positions_with_tags++;
+                // Unpack current_text_pos directly (it's already a packed position)
+                size_t seq_id_found = r_index.seqId(current_text_pos);
+                size_t offset_from_start = r_index.seqOffset(current_text_pos);
                 
                 // Calculate offset relative to query start (only for query sequence)
                 if (seq_id_found == seq_id && offset_from_start >= seq_start && offset_from_start <= seq_end) {
@@ -188,10 +189,9 @@ int main(int argc, char** argv) {
                     results[tag_val].query_offsets.push_back(offset_in_query);
                 }
                 
-                if (debug) cerr << "  Text pos " << current_text_pos << " (seq_id=" << text_seq_id 
-                     << ", offset=" << text_offset << ") -> BWT pos " << current_bwt_pos 
-                     << " -> (seq_id=" << seq_id_found << ", offset_from_start=" << offset_from_start 
-                     << ") -> tag=" << tag_val << endl;
+                if (debug) cerr << "  Text pos " << current_text_pos << " (seq_id=" << seq_id_found 
+                     << ", offset=" << offset_from_start << ") -> BWT pos " << current_bwt_pos 
+                     << " -> tag=" << tag_val << endl;
             }
         }
         
@@ -205,17 +205,37 @@ int main(int argc, char** argv) {
             break; // Reached i
         }
     }
-    
+    auto end_find_tags = high_resolution_clock::now();
+    auto duration_find_tags = duration_cast<milliseconds>(end_find_tags - start_find_tags);
     if (debug) cerr << "Found " << results.size() << " unique tags from backward iteration" << endl;
     
     if (results.empty()) {
+        auto end_total = high_resolution_clock::now();
+        auto duration_total = duration_cast<milliseconds>(end_total - start_total);
         cout << "seq_id=" << seq_id << "\tinterval=" << seq_start << ".." << seq_end << "\tno_tags" << endl;
+        cerr << "\n=== Query Statistics ===" << endl;
+        cerr << "  Sequence ID: " << seq_id << endl;
+        cerr << "  Interval: " << seq_start << ".." << seq_end << " (length: " << (seq_end - seq_start + 1) << ")" << endl;
+        cerr << "  Positions checked: " << positions_checked << endl;
+        cerr << "  Positions with tags: " << positions_with_tags << endl;
+        cerr << "  Unique tags found: 0" << endl;
+        cerr << "\n=== Timing Statistics ===" << endl;
+        cerr << "  Load r-index: " << duration_load_rindex.count() << " ms" << endl;
+        cerr << "  Load sampled tags: " << duration_load_tags.count() << " ms" << endl;
+        cerr << "  Find tags in interval: " << duration_find_tags.count() << " ms" << endl;
+        cerr << "  Total time: " << duration_total.count() << " ms" << endl;
         return 0;
     }
     
     // Step 3: For each tag, find all occurrences using wt_gmr select queries
+    auto start_find_sequences = high_resolution_clock::now();
     if (debug) cerr << "Enumerating all occurrences for " << results.size() << " tags..." << endl;
     const auto& wm = sampled.values();
+    
+    size_t total_tag_runs = 0;
+    size_t total_bwt_positions_processed = 0;
+    size_t total_unique_sequences = 0;
+    size_t total_occurrences = 0;
     
     for (auto& kv : results) {
         uint64_t tag_code = kv.first;
@@ -232,6 +252,7 @@ int main(int argc, char** argv) {
             continue;
         }
         
+        total_tag_runs += total_occ;
         if (debug) cerr << "  Tag " << tag_code << ": Found " << total_occ << " tag runs containing this tag" << endl;
         
         // Step 4: For each run containing this tag, locate all (seq_id, offset) pairs
@@ -246,125 +267,67 @@ int main(int argc, char** argv) {
                  << "] (size=" << (run_span.second - run_span.first + 1) << ")" << endl;
             
             // Process the entire run to get all sequences with this tag
-            // Convert from BWT positions to (seq_id, offset) for all positions in the run
+            // Note: We can't use locate_encoded() directly because it only returns sequence IDs,
+            // but we need offsets too. However, we use its efficient sequential approach.
             size_t locate_start = run_span.first;
             size_t locate_end = run_span.second;
             
-            // Use manual locating with verification against decompressSA
-            // Load decompressSA for verification only (not for actual locating)
-            static bool sa_loaded = false;
-            static vector<gbwt::size_type> sa;
-            if (!sa_loaded) {
-                if (debug) cerr << "      Loading decompressSA for verification..." << endl;
-                sa = r_index.decompressSA();
-                sa_loaded = true;
-            }
-            
-            // Process all BWT positions in this tag run interval using manual locating
             unordered_set<unsigned long long> seen;
             size_t positions_processed = 0;
             size_t unique_sequences_found = 0;
-            size_t mismatches = 0;
             
-            // Process positions by r-index runs to optimize
-            size_t current_pos = locate_start;
-            
-            while (current_pos <= locate_end) {
-                // Use run_id_and_offset_at to find the run containing current_pos
-                // This is the same approach used by locate_encoded
+            // Use locate_encoded()'s efficient method to find starting packed position
+            // This matches the approach in locate_encoded() (lines 1395-1417 in r-index.cpp)
+            size_t packed_pos;
+            {
                 size_t rindex_run_id = 0;
                 size_t run_start_pos = 0;
-                r_index.run_id_and_offset_at(current_pos, rindex_run_id, run_start_pos);
+                r_index.run_id_and_offset_at(locate_start, rindex_run_id, run_start_pos);
+                packed_pos = r_index.getSample(rindex_run_id);
                 
-                // Get sample for this run (packed position at run start)
-                size_t packed_pos = r_index.getSample(rindex_run_id);
-                
-                // Find the end position of this run (start of next run, or end of BWT)
-                // We can find this by checking where the next run starts
-                size_t rank_at_pos = r_index.last_rank_1(current_pos + 1);
-                size_t run_end_pos;
-                if (rank_at_pos < r_index.last_to_run.size()) {
-                    run_end_pos = r_index.last_select_1(rank_at_pos + 1);
-                } else {
-                    run_end_pos = r_index.bwt_size() - 1;
+                // Navigate from run start to locate_start (like locate_encoded does)
+                for (size_t p = run_start_pos; p < locate_start; ++p) {
+                    packed_pos = r_index.locateNext(packed_pos);
                 }
-                
-                // Process positions in this run segment
-                size_t segment_start = std::max(current_pos, locate_start);
-                size_t segment_end = std::min(run_end_pos, locate_end);
-                
-                // Navigate from run start to segment_start
-                // packed_pos currently points to run_start_pos, we need to advance to segment_start
-                for (size_t p = run_start_pos; p < segment_start; ++p) {
+            }
+            
+            // Process all positions sequentially (like locate_encoded does, lines 1419-1427)
+            // This is more efficient than breaking into run segments
+            for (size_t pos = locate_start; pos <= locate_end; ++pos) {
+                if (pos > locate_start) {
                     packed_pos = r_index.locateNext(packed_pos);
                 }
                 
-                // Process all positions in this segment
-                for (size_t pos = segment_start; pos <= segment_end; ++pos) {
-                    if (pos > segment_start) {
-                        packed_pos = r_index.locateNext(packed_pos);
-                    }
-                    
-                    auto pr = r_index.unpack(packed_pos);
-                    size_t seq_id_found = pr.first;
-                    size_t offset_from_start = pr.second; // offset is already distance from START
-                    
-                    // Verify against decompressSA
-                    bool verified = false;
-                    if (pos < sa.size()) {
-                        gbwt::size_type sa_packed = sa[pos];
-                        auto sa_pr = r_index.unpack(sa_packed);
-                        size_t sa_seq_id = sa_pr.first;
-                        size_t sa_offset_from_start = sa_pr.second;
-                        
-                        if (seq_id_found != sa_seq_id || offset_from_start != sa_offset_from_start) {
-                            mismatches++;
-                            if (debug) cerr << "        ERROR: BWT[" << pos << "] mismatch! Manual: (seq_id=" << seq_id_found 
-                                 << ", offset_from_start=" << offset_from_start 
-                                 << "), decompressSA: (seq_id=" << sa_seq_id 
-                                 << ", offset_from_start=" << sa_offset_from_start << ")" << endl;
-                            // Use decompressSA values since they're correct
-                            seq_id_found = sa_seq_id;
-                            offset_from_start = sa_offset_from_start;
-                        } else {
-                            verified = true;
-                        }
-                    }
-                    
-                    unsigned long long key = (static_cast<unsigned long long>(seq_id_found) << 32) | static_cast<unsigned long long>(offset_from_start);
-                    
-                    if (seen.insert(key).second) {
-                        res.sequence_offsets[seq_id_found].push_back(offset_from_start);
-                        unique_sequences_found++;
-                        
-                        // Print first few conversions for debugging
-                        if (debug && positions_processed < 5) {
-                            cerr << "        BWT[" << pos << "] -> (seq_id=" << seq_id_found 
-                                 << ", offset_from_start=" << offset_from_start;
-                            if (verified) {
-                                cerr << ", verified)";
-                            } else {
-                                cerr << ", corrected from decompressSA)";
-                            }
-                            cerr << endl;
-                        }
-                    }
-                    positions_processed++;
-                }
+                // Unpack to get (seq_id, offset) - this is what locate_encoded doesn't do
+                auto pr = r_index.unpack(packed_pos);
+                size_t seq_id_found = pr.first;
+                size_t offset_from_start = pr.second; // offset is already distance from START
                 
-                // Move to next run
-                current_pos = segment_end + 1;
+                unsigned long long key = (static_cast<unsigned long long>(seq_id_found) << 32) | static_cast<unsigned long long>(offset_from_start);
+                
+                if (seen.insert(key).second) {
+                    res.sequence_offsets[seq_id_found].push_back(offset_from_start);
+                    unique_sequences_found++;
+                    
+                    // Print first few conversions for debugging
+                    if (debug && positions_processed < 5) {
+                        cerr << "        BWT[" << pos << "] -> (seq_id=" << seq_id_found 
+                             << ", offset_from_start=" << offset_from_start << ")" << endl;
+                    }
+                }
+                positions_processed++;
             }
             
-            if (debug && mismatches > 0) {
-                cerr << "      WARNING: Found " << mismatches << " mismatches out of " 
-                     << positions_processed << " positions. Used decompressSA values for corrections." << endl;
-            }
+            total_bwt_positions_processed += positions_processed;
+            total_unique_sequences += unique_sequences_found;
+            total_occurrences += positions_processed;
             
             if (debug) cerr << "      Processed " << positions_processed << " BWT positions, found " 
                  << unique_sequences_found << " unique (seq_id, offset) pairs" << endl;
         }
     }
+    auto end_find_sequences = high_resolution_clock::now();
+    auto duration_find_sequences = duration_cast<milliseconds>(end_find_sequences - start_find_sequences);
     
     // Step 5: Output results
     // For each TAG, show the different sequence IDs that pass through those TAGS
@@ -423,6 +386,34 @@ int main(int argc, char** argv) {
         }
         cout << endl;
     }
+    
+    auto end_total = high_resolution_clock::now();
+    auto duration_total = duration_cast<milliseconds>(end_total - start_total);
+    
+    // Print statistics
+    cerr << "\n=== Query Statistics ===" << endl;
+    cerr << "  Sequence ID: " << seq_id << endl;
+    cerr << "  Interval: " << seq_start << ".." << seq_end << " (length: " << (seq_end - seq_start + 1) << ")" << endl;
+    cerr << "  Positions checked: " << positions_checked << endl;
+    cerr << "  Positions with tags: " << positions_with_tags << endl;
+    cerr << "  Unique tags found: " << results.size() << endl;
+    cerr << "  Total tag runs: " << total_tag_runs << endl;
+    cerr << "  Total BWT positions processed: " << total_bwt_positions_processed << endl;
+    cerr << "  Total unique sequences: " << total_unique_sequences << endl;
+    cerr << "  Total occurrences: " << total_occurrences << endl;
+    if (results.size() > 0) {
+        cerr << "  Average occurrences per tag: " << fixed << setprecision(2) 
+             << (double)total_occurrences / results.size() << endl;
+        cerr << "  Average sequences per tag: " << fixed << setprecision(2) 
+             << (double)total_unique_sequences / results.size() << endl;
+    }
+    
+    cerr << "\n=== Timing Statistics ===" << endl;
+    cerr << "  Load r-index: " << duration_load_rindex.count() << " ms" << endl;
+    cerr << "  Load sampled tags: " << duration_load_tags.count() << " ms" << endl;
+    cerr << "  Find tags in interval: " << duration_find_tags.count() << " ms" << endl;
+    cerr << "  Find all sequences for tags: " << duration_find_sequences.count() << " ms" << endl;
+    cerr << "  Total time: " << duration_total.count() << " ms" << endl;
     
     if (debug) cerr << "Query completed successfully" << endl;
     
