@@ -38,34 +38,6 @@ int main(int argc, char** argv) {
     std::cerr << "Building sampled tags" << std::endl;
     sampled.build_from_enumerator(enumerator, tags.bwt_size());
     
-    // Print all sampled tags in order (including 0s for gaps)
-    cerr << "\nPrinting all sampled tags in order..." << endl;
-    sampled.ensure_run_select();
-    
-    size_t total_runs = sampled.total_runs();
-    cerr << "Total runs: " << total_runs << endl;
-    
-    for (size_t run_id = 0; run_id < total_runs; ++run_id) {
-        uint64_t tag_val = sampled.run_value(run_id);
-        auto span = sampled.run_span(run_id);
-        
-        if (tag_val == 0) {
-            cerr << "Run " << run_id << ": tag=0 (gap), BWT_pos=[" << span.first << ", " << span.second << "]" << endl;
-        } else {
-            // Decode tag value: tag_val = 1 + ((node_id - 1) << 1) | is_rev
-            uint64_t decoded = tag_val - 1;
-            int64_t node_id = (decoded >> 1) + 1;
-            bool is_rev = (decoded & 1) != 0;
-            
-            cerr << "Run " << run_id << ": tag=" << tag_val 
-                 << ", node_id=" << node_id 
-                 << ", is_rev=" << (is_rev ? "true" : "false")
-                 << ", BWT_pos=[" << span.first << ", " << span.second << "]" << endl;
-        }
-    }
-    
-    cerr << "Printed " << total_runs << " sampled tags" << endl;
-    
     // On macOS, add a small delay to ensure all destructors are called
     // This helps identify if the issue is during destruction
     std::cerr << "About to serialize..." << std::endl;

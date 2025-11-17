@@ -14,9 +14,9 @@ namespace panindexer {
 
     // Helper function to construct wt_gmr from values
     // wt_gmr uses grammar-based compression which is more memory-efficient and stable on macOS
-    static void construct_wt_gmr_from_values(sdsl::wt_gmr<>& target, const std::vector<uint64_t>& values) {
+    static void construct_wt_gmr_from_values(sdsl::wt_gmr<sdsl::int_vector<>, sdsl::inv_multi_perm_support<4, sdsl::int_vector<>>>& target, const std::vector<uint64_t>& values) {
         if (values.empty()) {
-            target = sdsl::wt_gmr<>();
+            target = sdsl::wt_gmr<sdsl::int_vector<>, sdsl::inv_multi_perm_support<4, sdsl::int_vector<>>>();
             return;
         }
         

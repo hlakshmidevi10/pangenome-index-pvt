@@ -31,7 +31,7 @@ namespace panindexer {
         void load(std::istream& in);
 
         // Accessors
-        inline const sdsl::wt_gmr<>& values() const { return sampled_values; }
+        inline const sdsl::wt_gmr<sdsl::int_vector<>, sdsl::inv_multi_perm_support<4, sdsl::int_vector<>>>& values() const { return sampled_values; }
         inline const sdsl::sd_vector<>& run_starts() const { return bwt_intervals; }
 
         // Lazy support initialization for run_starts()
@@ -90,7 +90,7 @@ namespace panindexer {
         }
 
     private:
-        sdsl::wt_gmr<> sampled_values; // one value per run (0 for gap, otherwise encode(node_id,is_rev))
+        sdsl::wt_gmr<sdsl::int_vector<>, sdsl::inv_multi_perm_support<4, sdsl::int_vector<>>> sampled_values; // one value per run (0 for gap, otherwise encode(node_id,is_rev))
         sdsl::sd_vector<> bwt_intervals; // 1 at BWT positions where a run starts
 
         // Lazy supports for run_starts
