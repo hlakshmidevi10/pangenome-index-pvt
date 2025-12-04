@@ -18,7 +18,7 @@ using namespace std;
 using namespace panindexer;
 using namespace std::chrono;
 
-static bool debug = false;
+static bool debug = true;
 
 struct TagResult {
     vector<size_t> query_offsets; // offsets within the query interval (relative to l)
@@ -150,6 +150,30 @@ int main(int argc, char** argv) {
     
     if (debug) cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x 
          << ", run_id=" << run_id << ", BWT_pos=" << bwt_pos_x << ")" << endl;
+    
+    // Check if text_pos_x is after the sequence end, and if so, start from BWT[seq_id]
+    size_t bwt_seq_end = seq_id;  // BWT position of $ at end of sequence seq_id
+    size_t text_pos_seq_end;
+    {
+        size_t rindex_run_id = 0;
+        size_t run_start_pos = 0;
+        r_index.run_id_and_offset_at(bwt_seq_end, rindex_run_id, run_start_pos);
+        text_pos_seq_end = r_index.getSample(rindex_run_id);
+        // Navigate from run start to bwt_seq_end
+        for (size_t p = run_start_pos; p < bwt_seq_end; ++p) {
+            text_pos_seq_end = r_index.locateNext(text_pos_seq_end);
+        }
+    }
+    
+    if (debug) cerr << "Sequence end check: text_pos_x=" << text_pos_x 
+         << ", text_pos_seq_end=" << text_pos_seq_end << " (BWT[" << bwt_seq_end << "])" << endl;
+    
+    // Check if text_pos_x (BWT rank from last array) is greater than sequence end
+    if (text_pos_x > text_pos_seq_end) {
+        cerr << "Error: BWT rank calculated from last array (text_pos_x=" << text_pos_x 
+             << ") is greater than sequence end (text_pos_seq_end=" << text_pos_seq_end << ")" << endl;
+        return 1;
+    }
     
     // Step 3: Iterate backwards: (x-1, LF(ISA[x])) until x reaches i
     // Collect tags from TAG[ISA[x]] for each x in [i, j]

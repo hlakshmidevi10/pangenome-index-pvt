@@ -32,7 +32,7 @@ struct Rotation {
 };
 
 // Function to create BWT from a given string and track the sequence index
-std::pair <std::string, std::vector<unsigned long long>>
+std::pair <std::string, std::vector<panindexer::FastLocate::size_type>>
 createBWTWithSequenceInfo(const std::string &input, const std::vector<int> &seq_indices) {
     int n = input.size();
     std::vector <Rotation> rotations;
@@ -48,7 +48,7 @@ createBWTWithSequenceInfo(const std::string &input, const std::vector<int> &seq_
 
     // Create BWT by taking the last column of sorted rotations
     std::string bwt;
-    std::vector<unsigned long long> result_indices;
+    std::vector<panindexer::FastLocate::size_type> result_indices;
 
     for (const auto &rotation: rotations) {
         bwt += rotation.rotation.back();             // Collect BWT
@@ -143,7 +143,7 @@ TEST(RINDEX_Test, BackwardExtend_Consistency_Encoded) {
 }
 
 // Function to read strings from a file, concatenate them using $_i, and create BWT with sequence index tracking
-std::vector<unsigned long long> readFileAndCreateBWTWithIndices(const std::string &filename) {
+std::vector<panindexer::FastLocate::size_type> readFileAndCreateBWTWithIndices(const std::string &filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error: Could not open the file!" << std::endl;

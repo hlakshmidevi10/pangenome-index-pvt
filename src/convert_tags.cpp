@@ -94,14 +94,20 @@ int main(int argc, char** argv) {
     TagArray tag_array;
     
     // Pass 1: find max node id to determine width bits for int_vector encoding
+    // Skip runs with node_id=0 (endmarkers) since we handle them separately
     uint64_t scan_loc = 0;
     uint64_t max_node_id = 0;
-    if (bwt_offset > 0) { max_node_id = std::max<uint64_t>(max_node_id, 0); }
     while (scan_loc < encoded_bytes.size()) {
         gbwt::size_type decc = gbwt::ByteCode::read(encoded_bytes, scan_loc);
         auto decoded = TagArray::decode_run(decc);
         uint64_t nid = gbwtgraph::id(decoded.first);
-        if (nid > max_node_id) max_node_id = nid;
+        // Skip node_id=0 runs (endmarkers) when computing max_node_id
+        // We handle endmarkers separately via --num-seq, so they shouldn't affect bit width
+        if (nid > 0 && nid > max_node_id) max_node_id = nid;
+    }
+    // If max_node_id is still 0, we need at least 1 bit to represent node_id=0 for endmarkers
+    if (max_node_id == 0 && bwt_offset > 0) {
+        max_node_id = 0; // Keep at 0, compute_bits(0) returns 1 which is correct
     }
     auto compute_bits = [](uint64_t x) -> size_t {
         if (x == 0) return 1;
@@ -131,9 +137,28 @@ int main(int argc, char** argv) {
     }
 
     uint64_t loc = 0;
+    size_t run_count = 0;
     while (loc < encoded_bytes.size()) {
         gbwt::size_type decc = gbwt::ByteCode::read(encoded_bytes, loc);
         auto decoded = TagArray::decode_run(decc);
+        
+        // Skip runs with node_id=0 from input file (endmarkers are handled separately via --num-seq)
+        // The graph shouldn't have node_id=0, so any runs with node_id=0 in input are likely endmarkers
+        // that should be skipped since we prepend them separately
+        uint64_t nid = gbwtgraph::id(decoded.first);
+        if (nid == 0) {
+            // Warn if it's not a pure endmarker (offset=0, is_rev=0)
+            if (gbwtgraph::offset(decoded.first) != 0 || gbwtgraph::is_rev(decoded.first)) {
+                cerr << "WARNING: Skipping run with node_id=0 but non-zero offset/is_rev: "
+                     << "offset=" << gbwtgraph::offset(decoded.first) << ", "
+                     << "is_rev=" << gbwtgraph::is_rev(decoded.first) << ", "
+                     << "length=" << decoded.second << endl;
+            }
+            // Skip all runs with node_id=0 from input
+            continue;
+        }
+        
+        run_count++;
         
         // If current run has the same tag as previous, merge them (like merge_tags does)
         if (has_previous && previous_tag == decoded.first) {
