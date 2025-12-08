@@ -2,6 +2,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <sdsl/sd_vector.hpp>
 
 #include "pangenome_index/tag_arrays.hpp"
 #include "pangenome_index/sampled_tag_array.hpp"
@@ -50,6 +51,36 @@ int main(int argc, char** argv) {
     std::cerr << "Serialize completed, closing file..." << std::endl;
     out.close();
     std::cerr << "File closed successfully" << std::endl;
+    
+    // TEST: Build sd_vector with multiset=true and test predecessor queries
+    std::cerr << "\n=== TEST: sd_vector with multiset=true ===" << std::endl;
+    std::vector<uint64_t> test_positions = {0, 4, 8, 8, 10, 12};
+    size_t universe_size = 13; // Make universe size larger than max position
+    size_t num_ones = test_positions.size(); // 6 positions total
+    
+    // Build sd_vector with multiset=true
+    sdsl::sd_vector_builder builder(universe_size, num_ones, true); // multiset=true
+    for (uint64_t pos : test_positions) {
+        builder.set(pos);
+    }
+    sdsl::sd_vector<> test_sd(builder);
+    
+    std::cerr << "Built sd_vector with positions: ";
+    for (size_t i = 0; i < test_positions.size(); ++i) {
+        std::cerr << test_positions[i];
+        if (i < test_positions.size() - 1) std::cerr << ", ";
+    }
+    std::cerr << std::endl;
+    
+    // Test predecessor queries for positions 0-7
+    std::cerr << "\nPredecessor queries:" << std::endl;
+    for (size_t pos = 0; pos <= 12; ++pos) {
+        auto iter = test_sd.predecessor(pos);
+        std::cerr << "  predecessor(" << pos << ") -> ";
+        std::cerr << "rank=" << iter->first << ", position=" << iter->second << std::endl;
+    }
+    std::cerr << "=== END TEST ===" << std::endl;
+    
     return 0;
 }
 

@@ -61,16 +61,42 @@ namespace panindexer {
             cum += len;
         }
 
-        // Build sd_vector for run starts
-        {
-            sdsl::sd_vector_builder builder(bwt_size + 1, starts.size());
-            for (uint64_t s : starts) builder.set(s);
-            bwt_intervals = sdsl::sd_vector<>(builder);
-            // Builder is destroyed here, but bwt_intervals has its own copy
+        // Determine if first run is gap
+        first_run_is_gap = (values.empty() || values[0] == 0);
+
+        // Build bwt_intervals with zero-length gap runs inserted between adjacent normal tags
+        // Only store non-gap values in wt_gmr
+        std::vector<uint64_t> bwt_starts; // All run starts including gaps
+        std::vector<uint64_t> non_gap_values; // Only non-gap values for wt_gmr
+        
+        for (size_t i = 0; i < values.size(); ++i) {
+            uint64_t val = values[i];
+            uint64_t start = starts[i];
+            
+            // Add start position for this run
+            bwt_starts.push_back(start);
+            
+            // If this is a non-gap value, store it in wt_gmr
+            if (val != 0) {
+                non_gap_values.push_back(val);
+                
+                // Insert zero-length gap run between this and next run if next run is also non-gap
+                if (i + 1 < values.size() && values[i + 1] != 0) {
+                    // Insert gap run at the start position of next run (zero-length gap)
+                    bwt_starts.push_back(starts[i + 1]);
+                }
+            }
         }
 
-        // Build wt_gmr from values using helper function
-        construct_wt_gmr_from_values(sampled_values, values);
+        // Build sd_vector for run starts with multiset=true
+        {
+            sdsl::sd_vector_builder builder(bwt_size + 1, bwt_starts.size(), true); // multiset=true
+            for (uint64_t s : bwt_starts) builder.set(s);
+            bwt_intervals = sdsl::sd_vector<>(builder);
+        }
+
+        // Build wt_gmr from only non-gap values
+        construct_wt_gmr_from_values(sampled_values, non_gap_values);
     }
 
     void SampledTagArray::build_from_enumerator(const std::function<void(const std::function<void(pos_t,uint64_t)>&)>& enumerator,
@@ -93,17 +119,57 @@ namespace panindexer {
         enumerator(sink);
 
         std::cerr << std::endl;
+
+        // print the first 10 values
+        std::cerr << "First 10 values: ";
+        for (size_t i = 0; i < 10; ++i) {
+            std::cerr << values[i] << " ";
+        }
+        std::cerr << std::endl;
+
+        // print the first 10 starts
+        std::cerr << "First 10 starts: ";
+        for (size_t i = 0; i < 10; ++i) {
+            std::cerr << starts[i] << " ";
+        }
+        std::cerr << std::endl;
         
-        // Build sd_vector for run starts
-        {
-            sdsl::sd_vector_builder builder(bwt_size + 1, starts.size());
-            for (uint64_t s : starts) builder.set(s);
-            bwt_intervals = sdsl::sd_vector<>(builder);
-            // Builder is destroyed here, but bwt_intervals has its own copy
+        // Determine if first run is gap
+        first_run_is_gap = values[0] != 0;
+
+        // Build bwt_intervals with zero-length gap runs inserted between adjacent normal tags
+        // Only store non-gap values in wt_gmr
+        std::vector<uint64_t> bwt_starts; // All run starts including gaps
+        std::vector<uint64_t> non_gap_values; // Only non-gap values for wt_gmr
+        
+        for (size_t i = 0; i < values.size(); ++i) {
+            uint64_t val = values[i];
+            uint64_t start = starts[i];
+            
+            // Add start position for this run
+            bwt_starts.push_back(start);
+            
+            // If this is a non-gap value, store it in wt_gmr
+            if (val != 0) {
+                non_gap_values.push_back(val);
+                
+                // Insert zero-length gap run between this and next run if next run is also non-gap
+                if (i + 1 < values.size() && values[i + 1] != 0) {
+                    // Insert gap run at the start position of next run (zero-length gap)
+                    bwt_starts.push_back(starts[i + 1]);
+                }
+            }
         }
         
-        // Build wt_gmr from values using helper function
-        construct_wt_gmr_from_values(sampled_values, values);
+        // Build sd_vector for run starts with multiset=true
+        {
+            sdsl::sd_vector_builder builder(bwt_size + 1, bwt_starts.size(), true); // multiset=true
+            for (uint64_t s : bwt_starts) builder.set(s);
+            bwt_intervals = sdsl::sd_vector<>(builder);
+        }
+        
+        // Build wt_gmr from only non-gap values
+        construct_wt_gmr_from_values(sampled_values, non_gap_values);
         
         std::cerr << "Finished building sampled_tag_array" << std::endl;
     }
@@ -113,11 +179,13 @@ namespace panindexer {
         // Serialize the structures directly without accessing lazy supports
         sdsl::serialize(sampled_values, out);
         sdsl::serialize(bwt_intervals, out);
+        sdsl::write_member(first_run_is_gap, out);
     }
 
     void SampledTagArray::load(std::istream& in) {
         sampled_values.load(in);
         bwt_intervals.load(in);
+        sdsl::read_member(first_run_is_gap, in);
     }
 
 }

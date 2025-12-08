@@ -283,11 +283,17 @@ int main(int argc, char** argv) {
         // Step 4: For each run containing this tag, locate all (seq_id, offset) pairs
         // Use select queries to find all runs containing this tag
         // We want ALL sequences that have this tag, not just those in the query interval
+        bool first_run_is_gap = sampled.is_first_run_gap();
         for (size_t j = 1; j <= total_occ; ++j) {
-            size_t occ_run = wm.select(j, tag_code);  // This is a TAG run_id, not a BWT run_id
-            auto run_span = sampled.run_span(occ_run);
+            size_t tag_run_id = wm.select(j, tag_code);  // This is a TAG run_id (0-indexed into wt_gmr, non-gap only)
+            // Convert TAG run_id to BWT run_id (which includes gaps)
+            // If first_run_is_gap=false: BWT run_id = 2 * TAG run_id (even = normal tags)
+            // If first_run_is_gap=true: BWT run_id = 2 * TAG run_id + 1 (odd = normal tags)
+            size_t bwt_run_id = 2 * tag_run_id + 1 - static_cast<size_t>(first_run_is_gap);
+            auto run_span = sampled.run_span(bwt_run_id);
             
-            if (debug) cerr << "    Tag Run " << j << "/" << total_occ << ": tag_run_id=" << occ_run 
+            if (debug) cerr << "    Tag Run " << j << "/" << total_occ << ": tag_run_id=" << tag_run_id 
+                 << ", bwt_run_id=" << bwt_run_id
                  << ", BWT interval=[" << run_span.first << ", " << run_span.second 
                  << "] (size=" << (run_span.second - run_span.first + 1) << ")" << endl;
             
