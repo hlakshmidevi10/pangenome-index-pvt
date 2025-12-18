@@ -446,7 +446,7 @@ namespace panindexer {
 
             number_of_runs--;
             unique_positions.insert(
-                    gbwtgraph::Position::encode(decoded.first).value);
+                    gbwtgraph::Position(decoded.first).value);
         }
 
     }
@@ -838,7 +838,7 @@ namespace panindexer {
 //            cerr << "Decoded node ID: " << decoded_node_id << endl;
 
             run_nums--;
-            unique_positions.push_back(gbwtgraph::Position::encode(decoded.first).value);
+            unique_positions.push_back(gbwtgraph::Position(decoded.first).value);
 //            unique_positions.insert(
 //                    gbwtgraph::Position::encode(pos_t(decoded_node_id, decoded_offset, decoded_flag)).value);
         }
@@ -880,7 +880,7 @@ namespace panindexer {
             gbwt::size_type enc_val = this->encoded_runs_iv[item_index++];
             pos_t decoded_pos = decode_run_length_compact(enc_val);
             run_nums--;
-            unique_positions.push_back(gbwtgraph::Position::encode(decoded_pos).value);
+            unique_positions.push_back(gbwtgraph::Position(decoded_pos).value);
             // also print the decoded nodes
             std::cout << gbwtgraph::id(decoded_pos) << ", " << gbwtgraph::offset(decoded_pos) << ", " << gbwtgraph::is_rev(decoded_pos) << std::endl;
         }

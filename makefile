@@ -19,7 +19,7 @@ CXX_FLAGS += -Iinclude -I$(INC_DIR) -Ideps/vg -Ideps/grlBWT/include -UNDEBUG
 PARALLEL_FLAGS = -fopenmp -pthread
 
 # Libraries
-LIBS = -L$(LIB_DIR) -Ldeps/grlBWT/build -lgbwtgraph -lgbwt -lhandlegraph -lsdsl -lgrlbwt
+LIBS = -L$(LIB_DIR) -Ldeps/grlBWT/build -lgbwtgraph -lgbwt -lhandlegraph -lsdsl -lgrlbwt -lcrypto
 
 # macOS-specific OpenMP & compiler handling
 ifeq ($(shell uname -s), Darwin)
@@ -48,6 +48,10 @@ ifeq ($(shell uname -s), Darwin)
 
         LIBS += -lomp
     endif
+
+    # OpenSSL (keg-only on Homebrew)
+    LIBS += -L$(HOMEBREW_PREFIX)/opt/openssl/lib
+    CXX_FLAGS += -I$(HOMEBREW_PREFIX)/opt/openssl/include
 
     CXX_FLAGS += -I$(HOMEBREW_PREFIX)/include
 endif
