@@ -117,25 +117,9 @@ namespace panindexer {
         };
 
         enumerator(sink);
-
-        std::cerr << std::endl;
-
-        // print the first 10 values
-        std::cerr << "First 10 values: ";
-        for (size_t i = 0; i < 10; ++i) {
-            std::cerr << values[i] << " ";
-        }
-        std::cerr << std::endl;
-
-        // print the first 10 starts
-        std::cerr << "First 10 starts: ";
-        for (size_t i = 0; i < 10; ++i) {
-            std::cerr << starts[i] << " ";
-        }
-        std::cerr << std::endl;
         
-        // Determine if first run is gap
-        first_run_is_gap = values[0] != 0;
+        // Determine if first run is gap (with bounds check for empty input)
+        first_run_is_gap = (!values.empty() && values[0] != 0);
 
         // Build bwt_intervals with zero-length gap runs inserted between adjacent normal tags
         // Only store non-gap values in wt_gmr
