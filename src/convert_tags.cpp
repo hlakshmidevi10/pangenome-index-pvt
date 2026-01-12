@@ -130,9 +130,15 @@ int main(int argc, char** argv) {
     bool has_previous = false;
     
     // Prepend endmarkers if requested
+    // Handle overflow: if bwt_offset > 65535, emit multiple runs of 65535 each
     if (bwt_offset > 0) {
         previous_tag = pos_t{0, 0, 0};
-        previous_length = static_cast<uint16_t>(bwt_offset);
+        size_t remaining = bwt_offset;
+        while (remaining > 65535) {
+            tag_array.append_compact_run_streamed(previous_tag, 65535, encoded_starts_out, bwt_intervals_out);
+            remaining -= 65535;
+        }
+        previous_length = static_cast<uint16_t>(remaining);
         has_previous = true;
     }
 
