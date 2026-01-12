@@ -437,7 +437,7 @@ int main(int argc, char **argv) {
 #endif
 
 
-    int threads = 32;
+    int threads = 8;
     omp_set_num_threads(threads);
 
     std::string gbz_graph = std::string(argv[1]);

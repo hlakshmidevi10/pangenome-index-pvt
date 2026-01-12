@@ -171,7 +171,7 @@ namespace panindexer {
                     std::exit(EXIT_FAILURE);
                 }
                 // Use thread-local cache to reduce contention on the shared index
-                cache[thread_id].emplace_back(kmer.key.get_key(), gbwtgraph::Position::encode(pos));
+                cache[thread_id].emplace_back(kmer.key.get_key(), gbwtgraph::Position(pos));
 
 
 
@@ -269,7 +269,7 @@ namespace panindexer {
                     std::exit(EXIT_FAILURE);
                 }
                 // Use thread-local cache to reduce contention on the shared index
-                cache[thread_id].emplace_back(kmer.key.get_key(), gbwtgraph::Position::encode(pos));
+                cache[thread_id].emplace_back(kmer.key.get_key(), gbwtgraph::Position(pos));
 
                 // Flush the cache if it reaches the size limit
                 if (cache[thread_id].size() >= KMER_CACHE_SIZE) {

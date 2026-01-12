@@ -8,6 +8,7 @@
 #include "pangenome_index/tag_arrays.hpp"
 #include <sdsl/util.hpp>
 #include <gbwt/utils.h>
+#include <gbwtgraph/utils.h>
 
 using namespace std;
 using namespace panindexer;
@@ -115,7 +116,7 @@ int main(int argc, char** argv){
     print_human_size("TOTAL r-index (approx)", bytes_rindex_total, r_runs);
     cout << "\n";
 
-    // // Decode compact blocks: cumulative ranks (skip N if globally absent) followed by runs
+    // Decode compact blocks: cumulative ranks (skip N if globally absent) followed by runs
     // cout << "=== Encoded blocks (header + runs) ===\n";
     // if (r_index.blocks_encoded_start_bits.size() == 0) {
     //     cout << "No encoded blocks present.\n\n";
@@ -182,6 +183,37 @@ int main(int argc, char** argv){
     print_human_size("encoded_runs_starts (sd_vector)", bytes_starts_sd, t_runs);
     print_human_size("bwt_intervals (sd_vector)", bytes_bwt_int, t_runs);
     print_human_size("TOTAL tag arrays (compressed)", bytes_tags_total, t_runs);
+    cout << "\n";
+
+    // Print cumulative lengths for runs in specified BWT range
+    const size_t bwt_start = 0;
+    const size_t bwt_end = 2000;
+    cout << "=== Tag runs in BWT range [" << bwt_start << ", " << bwt_end << "] ===\n";
+    cout << "Format: run_id node_id offset is_rev run_length bwt_start bwt_end cumulative_length\n";
+    
+    uint64_t cumulative_length = 0;
+    size_t run_id = 0;
+    size_t runs_in_range = 0;
+    
+    tag_array.for_each_run_compact_with_bwt([&](handlegraph::pos_t pos, uint64_t run_length, size_t run_bwt_start, size_t run_bwt_end) {
+        // Check if run overlaps with the specified range
+        if (run_bwt_start <= bwt_end && run_bwt_end >= bwt_start) {
+            cumulative_length += run_length;
+            cout << run_id << "\t"
+                 << gbwtgraph::id(pos) << "\t"
+                 << gbwtgraph::offset(pos) << "\t"
+                 << (gbwtgraph::is_rev(pos) ? 1 : 0) << "\t"
+                 << run_length << "\t"
+                 << run_bwt_start << "\t"
+                 << run_bwt_end << "\t"
+                 << cumulative_length << "\n";
+            runs_in_range++;
+        }
+        run_id++;
+    });
+    
+    cout << "\nTotal runs in range: " << runs_in_range << "\n";
+    cout << "Cumulative length: " << cumulative_length << "\n";
 
     return 0;
 }

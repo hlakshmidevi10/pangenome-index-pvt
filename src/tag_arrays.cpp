@@ -446,7 +446,7 @@ namespace panindexer {
 
             number_of_runs--;
             unique_positions.insert(
-                    gbwtgraph::Position::encode(decoded.first).value);
+                    gbwtgraph::Position(decoded.first).value);
         }
 
     }
@@ -838,7 +838,7 @@ namespace panindexer {
 //            cerr << "Decoded node ID: " << decoded_node_id << endl;
 
             run_nums--;
-            unique_positions.push_back(gbwtgraph::Position::encode(decoded.first).value);
+            unique_positions.push_back(gbwtgraph::Position(decoded.first).value);
 //            unique_positions.insert(
 //                    gbwtgraph::Position::encode(pos_t(decoded_node_id, decoded_offset, decoded_flag)).value);
         }
@@ -847,15 +847,20 @@ namespace panindexer {
 
         std::cout << "Number of unique positions: " << unique_positions.size() << std::endl;
         // print the unique positions
-       for (auto pos : unique_positions) {
-           std::cout << pos << ", ";
-       }
-       std::cout << std::endl;
+    //    for (auto pos : unique_positions) {
+    //        std::cout << pos << ", ";
+    //    }
+    //    std::cout << std::endl;
     }
 
     void TagArray::query_compressed_compact(size_t start, size_t end, size_t &number_of_runs) {
-        size_t first_bit_index = this->bwt_intervals_rank(start + 1);
-        size_t end_bit_index = this->bwt_intervals_rank(end + 1);
+
+        size_t first_bit_index = this->bwt_intervals_rank(start + 1) - 1;
+
+
+
+        size_t end_bit_index = this->bwt_intervals_rank(end + 1) - 1;
+
         auto run_nums = end_bit_index - first_bit_index + 1;
         number_of_runs = run_nums;
 
@@ -867,26 +872,29 @@ namespace panindexer {
 
         // Starting item index in the int_vector (not a bit location)
         size_t item_index = this->encoded_runs_sd_starts_select(current_tag_run_index / this->encoded_start_every_k_run + 1);
-
-        while (move_tags > 1){
+        while (move_tags > 0){
             (void) this->encoded_runs_iv[item_index++];
             move_tags--;
         }
-
         while (run_nums > 0) {
             gbwt::size_type enc_val = this->encoded_runs_iv[item_index++];
             pos_t decoded_pos = decode_run_length_compact(enc_val);
             run_nums--;
-            unique_positions.push_back(gbwtgraph::Position::encode(decoded_pos).value);
+            unique_positions.push_back(gbwtgraph::Position(decoded_pos).value);
+            // also print the decoded nodes
+            std::cout << gbwtgraph::id(decoded_pos) << ", " << gbwtgraph::offset(decoded_pos) << ", " << gbwtgraph::is_rev(decoded_pos) << std::endl;
         }
         std::sort(unique_positions.begin(), unique_positions.end());
         unique_positions.erase(std::unique(unique_positions.begin(), unique_positions.end()), unique_positions.end());
 
-        std::cout << "Number of unique positions: " << unique_positions.size() << std::endl;
-        for (auto pos : unique_positions) {
-            std::cout << pos << ", ";
-        }
-        std::cout << std::endl;
+        // std::cout << "Number of unique positions: " << unique_positions.size() << std::endl;
+        // for (auto pos : unique_positions) {
+        //     std::cout << pos << ", ";
+        // }
+        // std::cout << std::endl;
+
+        
+        
     }
 
     void TagArray::compressed_serialize_compact(std::ostream &main_out, std::ostream &encoded_starts_file, std::ostream &bwt_intervals_file, std::vector<std::pair<pos_t, uint16_t>> &tag_runs){
@@ -970,6 +978,60 @@ namespace panindexer {
             this->append_encoded_run_sdsl(encoded);
             this->encoded_runs_items_written++;
             this->remaining_run_to_write_start++;
+        }
+    }
+
+
+    // Iterate over all compact runs: use bwt_intervals rank to get run count, then scan encoded_runs_iv
+    void TagArray::for_each_run_compact(const std::function<void(pos_t, uint64_t)>& fn) const {
+        if (this->encoded_runs_iv.empty()) {
+            throw std::runtime_error("encoded_runs_iv is empty; load compact tags first");
+        }
+        // Build rank over bwt_intervals locally (const method; member type already constructed in loaders)
+        sdsl::sd_vector<>::rank_1_type rank_tmp(&this->bwt_intervals);
+        size_t run_count = rank_tmp(this->bwt_intervals.size());
+        if (run_count == 0) return;
+
+        // We need lengths. In compact mode, lengths are implicit: distance between consecutive 1s in bwt_intervals.
+        // We'll iterate 1-positions using select. Build select locally to avoid reliance on mutable members.
+        sdsl::sd_vector<>::select_1_type select_tmp(&this->bwt_intervals);
+
+        // Iterate encoded_runs_iv items in order; each corresponds to a run start with a length defined by BWT interval width.
+        // The item count should equal run_count.
+        size_t item_index = 0;
+        for (size_t r = 1; r <= run_count; ++r) {
+            gbwt::size_type enc_val = this->encoded_runs_iv[item_index++];
+            pos_t decoded_pos = decode_run_length_compact(enc_val);
+            size_t start_pos = select_tmp(r);
+            size_t end_pos = (r == run_count) ? this->bwt_intervals.size() : select_tmp(r + 1);
+            uint64_t run_len = end_pos - start_pos; // length in BWT positions
+            fn(decoded_pos, run_len);
+        }
+    }
+
+    void TagArray::for_each_run_compact_with_bwt(const std::function<void(pos_t, uint64_t, size_t, size_t)>& fn) const {
+        if (this->encoded_runs_iv.empty()) {
+            throw std::runtime_error("encoded_runs_iv is empty; load compact tags first");
+        }
+        // Build rank over bwt_intervals locally (const method; member type already constructed in loaders)
+        sdsl::sd_vector<>::rank_1_type rank_tmp(&this->bwt_intervals);
+        size_t run_count = rank_tmp(this->bwt_intervals.size());
+        if (run_count == 0) return;
+
+        // We need lengths. In compact mode, lengths are implicit: distance between consecutive 1s in bwt_intervals.
+        // We'll iterate 1-positions using select. Build select locally to avoid reliance on mutable members.
+        sdsl::sd_vector<>::select_1_type select_tmp(&this->bwt_intervals);
+
+        // Iterate encoded_runs_iv items in order; each corresponds to a run start with a length defined by BWT interval width.
+        // The item count should equal run_count.
+        size_t item_index = 0;
+        for (size_t r = 1; r <= run_count; ++r) {
+            gbwt::size_type enc_val = this->encoded_runs_iv[item_index++];
+            pos_t decoded_pos = decode_run_length_compact(enc_val);
+            size_t start_pos = select_tmp(r);
+            size_t end_pos = (r == run_count) ? this->bwt_intervals.size() : select_tmp(r + 1);
+            uint64_t run_len = end_pos - start_pos; // length in BWT positions
+            fn(decoded_pos, run_len, start_pos, end_pos);
         }
     }
 

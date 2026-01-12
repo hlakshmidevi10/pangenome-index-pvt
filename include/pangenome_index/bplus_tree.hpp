@@ -56,7 +56,7 @@ namespace panindexer {
         Run &operator=(int zero) {
             if (zero == 0) {  // Ensures it only responds to 0
                 start_position = 0;
-                graph_position = gbwtgraph::Position::no_value();
+                graph_position = gbwtgraph::Position::no_pos();
             }
             return *this;
         }
@@ -430,7 +430,7 @@ namespace panindexer {
 
 
         T create_gap(size_t gap_start_position) {
-            T gap = {gap_start_position, 0};
+            T gap = {gap_start_position, gbwtgraph::Position::no_pos()};
             return gap;
         }
 
@@ -1245,14 +1245,14 @@ namespace panindexer {
         }
 
         T search(size_t position) {
-            T data = {position, 0};
+            T data = {position, gbwtgraph::Position::no_pos()};
             bpNode<T> *current = leaf_search(root, data);
             size_t index = current->search(data);
             if (index == 0) {
                 if (current->get_prev() != nullptr) {
                     return current->get_prev()->get_item(current->get_prev()->get_size() - 1);
                 } else {
-                    return {0, 0};
+                    return {0, gbwtgraph::Position::no_pos()};
                 }
 
             }

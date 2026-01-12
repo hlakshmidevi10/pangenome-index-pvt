@@ -32,7 +32,7 @@ struct Rotation {
 };
 
 // Function to create BWT from a given string and track the sequence index
-std::pair <std::string, std::vector<unsigned long long>>
+std::pair <std::string, std::vector<panindexer::FastLocate::size_type>>
 createBWTWithSequenceInfo(const std::string &input, const std::vector<int> &seq_indices) {
     int n = input.size();
     std::vector <Rotation> rotations;
@@ -48,7 +48,7 @@ createBWTWithSequenceInfo(const std::string &input, const std::vector<int> &seq_
 
     // Create BWT by taking the last column of sorted rotations
     std::string bwt;
-    std::vector<unsigned long long> result_indices;
+    std::vector<panindexer::FastLocate::size_type> result_indices;
 
     for (const auto &rotation: rotations) {
         bwt += rotation.rotation.back();             // Collect BWT
@@ -59,8 +59,91 @@ createBWTWithSequenceInfo(const std::string &input, const std::vector<int> &seq_
     return {bwt, result_indices};
 }
 
+// ======================= Additional encoded consistency tests =======================
+
+TEST(RINDEX_Test, Count_Consistency_Encoded) {
+    std::string text_file = "../test_data/big_test/merged_info";
+    std::string rlbwt_file = "../test_data/big_test/merged_info.rl_bwt";
+
+    FastLocate legacy(rlbwt_file);
+    FastLocate encoded;
+    {
+        std::string enc_path = "./tmp_big_test.ri";
+        std::ofstream out(enc_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.good());
+        legacy.serialize_encoded(out);
+        out.close();
+        std::ifstream in(enc_path, std::ios::binary);
+        ASSERT_TRUE(in.good());
+        encoded.load_encoded(in);
+    }
+
+    std::ifstream in_txt(text_file);
+    ASSERT_TRUE(in_txt.is_open()) << "Could not open input text file";
+    std::string full_text, line;
+    while (std::getline(in_txt, line)) { if (!line.empty()) full_text += line; }
+    ASSERT_GE(full_text.size(), 100) << "Input text too short";
+
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<size_t> dist_pos(0, full_text.size() - 21);
+    std::uniform_int_distribution<size_t> dist_len(5, 20);
+
+    for (size_t i = 0; i < 100; ++i) {
+        size_t pos = dist_pos(rng);
+        size_t len = dist_len(rng);
+        std::string pat = full_text.substr(pos, len);
+        auto r1 = legacy.count(pat);
+        auto r2 = encoded.count_encoded(pat);
+        ASSERT_EQ(r1.first, r2.first) << "Mismatch in range start for pattern '" << pat << "'";
+        ASSERT_EQ(r1.second, r2.second) << "Mismatch in range end for pattern '" << pat << "'";
+    }
+}
+
+TEST(RINDEX_Test, BackwardExtend_Consistency_Encoded) {
+    std::string rlbwt_file = "../test_data/big_test/merged_info.rl_bwt";
+    FastLocate legacy(rlbwt_file);
+    FastLocate encoded;
+    {
+        std::string enc_path = "./tmp_big_test.ri";
+        std::ofstream out(enc_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.good());
+        legacy.serialize_encoded(out);
+        out.close();
+        std::ifstream in(enc_path, std::ios::binary);
+        ASSERT_TRUE(in.good());
+        encoded.load_encoded(in);
+    }
+
+    std::ifstream in_txt("../test_data/big_test/merged_info");
+    ASSERT_TRUE(in_txt.is_open()) << "Could not open input text file";
+    std::string full_text, line;
+    while (std::getline(in_txt, line)) { if (!line.empty()) full_text += line; }
+    ASSERT_GE(full_text.size(), 50) << "Input text too short";
+
+    std::mt19937 rng(6789);
+    std::uniform_int_distribution<size_t> dist_pos(0, full_text.size() - 21);
+    const size_t k = 20;
+
+    for (size_t i = 0; i < 50; ++i) {
+        size_t pos = dist_pos(rng);
+        std::string kmer = full_text.substr(pos, k);
+
+        panindexer::FastLocate::bi_interval b1 = {0, 0, legacy.bwt_size()};
+        panindexer::FastLocate::bi_interval b2 = {0, 0, encoded.bwt_size()};
+        for (int j = static_cast<int>(kmer.size()) - 1; j >= 0; --j) {
+            b1 = legacy.backward_extend(b1, kmer[j]);
+            b2 = encoded.backward_extend_encoded(b2, kmer[j]);
+            ASSERT_EQ(b1.size, b2.size) << "Step mismatch at j=" << j << " for kmer '" << kmer << "'";
+            if (b1.size == 0) break;
+            ASSERT_EQ(b1.forward, b2.forward) << "Forward start mismatch at j=" << j;
+        }
+    }
+}
+
+}
+
 // Function to read strings from a file, concatenate them using $_i, and create BWT with sequence index tracking
-std::vector<unsigned long long> readFileAndCreateBWTWithIndices(const std::string &filename) {
+std::vector<panindexer::FastLocate::size_type> readFileAndCreateBWTWithIndices(const std::string &filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error: Could not open the file!" << std::endl;
@@ -485,6 +568,95 @@ TEST(FMDINDEX_Test, CompareSampledKmersWithReverseComplementsBIGTEST_Encoded) {
     }
 }
 
+TEST(FMDINDEX_Test, CompareSampledKmersNoN_Bidirectional) {
+    std::string rlbwt_file = "../test_data/bidirectional_test/contigs_xy.rl_bwt";
+    std::string text_file = "../test_data/bidirectional_test/contigs_xy";
 
+    FastLocate r_index(rlbwt_file);
+    r_index.initialize_complement_table();
 
+    std::ifstream in(text_file);
+    ASSERT_TRUE(in.is_open()) << "Could not open input text file";
+
+    std::string full_text;
+    std::string line;
+    while (std::getline(in, line)) { if (!line.empty()) full_text += line; }
+
+    ASSERT_GE(full_text.size(), 20) << "Input text is too short to sample from";
+
+    const size_t k = 12;
+    const size_t num_samples = 100;
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<size_t> dist(0, full_text.size() - k);
+
+    for (size_t i = 0; i < num_samples; ++i) {
+        size_t pos = dist(rng);
+        std::string kmer = full_text.substr(pos, k);
+        // Ensure no 'N' in sampled kmer
+        if (kmer.find('N') != std::string::npos) { i--; continue; }
+
+        std::string revcomp = kmer;
+        std::reverse(revcomp.begin(), revcomp.end());
+        for (char& c : revcomp) { c = r_index.complement(c); }
+
+        panindexer::FastLocate::bi_interval int_kmer = {0, 0, r_index.bwt_size()};
+        for (int j = kmer.size() - 1; j >= 0; --j) { int_kmer = r_index.backward_extend(int_kmer, kmer[j]); }
+
+        panindexer::FastLocate::bi_interval int_rc = {0, 0, r_index.bwt_size()};
+        for (int j = revcomp.size() - 1; j >= 0; --j) { int_rc = r_index.backward_extend(int_rc, revcomp[j]); }
+
+        ASSERT_EQ(int_kmer.forward, int_rc.reverse) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
+        ASSERT_EQ(int_kmer.reverse, int_rc.forward) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
+        ASSERT_EQ(int_kmer.size, int_rc.size) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
+    }
 }
+
+TEST(FMDINDEX_Test, CompareSampledKmersNoN_Bidirectional_Encoded) {
+    std::string rlbwt_file = "../test_data/bidirectional_test/contigs_xy.rl_bwt";
+    FastLocate built(rlbwt_file);
+    std::string enc_path = "./tmp_bidirectional.ri";
+    {
+        std::ofstream out(enc_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.good());
+        built.serialize_encoded(out);
+    }
+    FastLocate r_index;
+    {
+        std::ifstream in(enc_path, std::ios::binary);
+        ASSERT_TRUE(in.good());
+        r_index.load_encoded(in);
+    }
+    r_index.initialize_complement_table();
+
+    std::ifstream in_txt("../test_data/bidirectional_test/contigs_xy");
+    ASSERT_TRUE(in_txt.is_open()) << "Could not open input text file";
+    std::string full_text, line;
+    while (std::getline(in_txt, line)) { if (!line.empty()) full_text += line; }
+    ASSERT_GE(full_text.size(), 20) << "Input text is too short to sample from";
+
+    const size_t k = 12;
+    const size_t num_samples = 100;
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<size_t> dist(0, full_text.size() - k);
+
+    for (size_t i = 0; i < num_samples; ++i) {
+        size_t pos = dist(rng);
+        std::string kmer = full_text.substr(pos, k);
+        if (kmer.find('N') != std::string::npos) { i--; continue; }
+
+        std::string revcomp = kmer;
+        std::reverse(revcomp.begin(), revcomp.end());
+        for (char& c : revcomp) { c = r_index.complement(c); }
+
+        panindexer::FastLocate::bi_interval int_kmer = {0, 0, r_index.bwt_size()};
+        for (int j = kmer.size() - 1; j >= 0; --j) { int_kmer = r_index.backward_extend_encoded(int_kmer, kmer[j]); }
+
+        panindexer::FastLocate::bi_interval int_rc = {0, 0, r_index.bwt_size()};
+        for (int j = revcomp.size() - 1; j >= 0; --j) { int_rc = r_index.backward_extend_encoded(int_rc, revcomp[j]); }
+
+        ASSERT_EQ(int_kmer.forward, int_rc.reverse) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
+        ASSERT_EQ(int_kmer.reverse, int_rc.forward) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
+        ASSERT_EQ(int_kmer.size, int_rc.size) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
+    }
+}
+

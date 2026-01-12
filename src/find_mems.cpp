@@ -76,7 +76,17 @@ int main(int argc, char **argv) {
     cerr << "Reading the tag array index" << endl;
     TagArray tag_array;
     std::ifstream in_ds(tag_array_index, std::ios::binary);
-    tag_array.load_compressed_tags_compact(in_ds);
+    if (!in_ds) {
+        std::cerr << "Cannot open tag array file: " << tag_array_index << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    try {
+        tag_array.load_compressed_tags_compact(in_ds);
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to load compact tags: " << e.what() << std::endl;
+        std::cerr << "Hint: Ensure the file is in compact layout [encoded_runs_iv][encoded_starts_sd][bwt_intervals].\n";
+        std::exit(EXIT_FAILURE);
+    }
 
 #if TIME
     auto time3 = chrono::high_resolution_clock::now();
@@ -113,6 +123,7 @@ int main(int argc, char **argv) {
 
         // Print results for this read
         std::cout << "Seq: " << i << std::endl;
+        std::cout << "read : " << read << std::endl;
         for (const auto& mem : mems) {
             // std::cout << "MEM START: " << mem.start << ", MEM END: " << mem.end + 1 << " OCC " << mem.bi_interval.size << std::endl;
             std::cout << "MEM START: " << mem.start << ", MEM END: " << mem.end << " BWT START: " << mem.bwt_start << " SIZE: " << mem.size << std::endl;

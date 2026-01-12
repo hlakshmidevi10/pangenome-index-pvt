@@ -19,7 +19,7 @@ CXX_FLAGS += -Iinclude -I$(INC_DIR) -Ideps/vg -Ideps/grlBWT/include -UNDEBUG
 PARALLEL_FLAGS = -fopenmp -pthread
 
 # Libraries
-LIBS = -L$(LIB_DIR) -Ldeps/grlBWT/build -lgbwtgraph -lgbwt -lhandlegraph -lsdsl -lgrlbwt
+LIBS = -L$(LIB_DIR) -Ldeps/grlBWT/build -lgbwtgraph -lgbwt -lhandlegraph -lsdsl -lgrlbwt -lcrypto
 
 # macOS-specific OpenMP & compiler handling
 ifeq ($(shell uname -s), Darwin)
@@ -49,15 +49,19 @@ ifeq ($(shell uname -s), Darwin)
         LIBS += -lomp
     endif
 
+    # OpenSSL (keg-only on Homebrew)
+    LIBS += -L$(HOMEBREW_PREFIX)/opt/openssl/lib
+    CXX_FLAGS += -I$(HOMEBREW_PREFIX)/opt/openssl/include
+
     CXX_FLAGS += -I$(HOMEBREW_PREFIX)/include
 endif
 
 # Headers and objects
 HEADERS = $(wildcard include/pangenome_index/*.hpp)
-LIBOBJS = $(addprefix $(BUILD_OBJ)/,r-index.o tag_arrays.o)
+LIBOBJS = $(addprefix $(BUILD_OBJ)/,r-index.o tag_arrays.o sampled_tag_array.o)
 LIBRARY = $(BUILD_LIB)/libpanindexer.a
 
-PROGRAMS = $(addprefix $(BUILD_BIN)/,build_tags merge_tags build_rindex query_tags tags_check find_mems convert_tags print_stats)
+PROGRAMS = $(addprefix $(BUILD_BIN)/,build_tags merge_tags build_rindex query_tags tags_check find_mems convert_tags print_stats build_sampled_tags query_sampled_tags)
 
 # Targets
 .PHONY: all clean directories grlbwt test

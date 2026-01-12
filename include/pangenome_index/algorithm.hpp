@@ -288,7 +288,7 @@ extend_kmers_bfs_parallel(GBWTGraph &graph, FastLocate &idx, BplusTree <Run> &bp
                     auto new_range = idx.LF(current_interval, prev_base);
 
                     if (new_range.first <= new_range.second) {
-                        Run temp_run = {new_range.first, gbwtgraph::Position::encode(prev_graph_pos)};
+                        Run temp_run = {new_range.first, gbwtgraph::Position(prev_graph_pos)};
                         batches[thread_num].push_back(make_pair(temp_run, new_range.second - new_range.first + 1));
 
                         if (batches[thread_num].size() >= batch_size) {
@@ -333,7 +333,7 @@ extend_kmers_bfs_parallel(GBWTGraph &graph, FastLocate &idx, BplusTree <Run> &bp
                             
                             auto new_range = idx.LF(current_interval, prev_base);
                             if (new_range.first <= new_range.second) {
-                                Run new_run = {new_range.first, gbwtgraph::Position::encode(prev_graph_pos)};
+                                Run new_run = {new_range.first, gbwtgraph::Position(prev_graph_pos)};
                                 batches[thread_num].push_back({new_run, new_range.second - new_range.first + 1});
 
                                 if (batches[thread_num].size() >= batch_size) {
@@ -432,7 +432,7 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
                             in_node_index + 1
                     };
 
-                    Run current_run = {bwt_index, gbwtgraph::Position::encode(current_pos)};
+                    Run current_run = {bwt_index, gbwtgraph::Position(current_pos)};
                     local_tmp1.push_back(current_run);
 
                 } else {
@@ -443,7 +443,7 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
                     };
                     // cerr << "current_pos id" << gbz.graph.get_id(current_node) << " current pos is_rev " << gbz.graph.get_is_reverse(current_node) << " current pos offset " << in_node_index + 1 << " bptree_search.graph_position.value " << bptree_search.graph_position.value << endl;
                     
-                    auto encoded_current_pos = gbwtgraph::Position::encode(current_pos).value;
+                    auto encoded_current_pos = gbwtgraph::Position(current_pos).value;
                     if (encoded_current_pos != bptree_search.graph_position.value) {
                         cerr << "ASSERTION FAILED: Position mismatch!" << endl;
                         cerr << "  Encoded current_pos.value: " << encoded_current_pos << endl;

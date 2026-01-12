@@ -442,7 +442,7 @@ bool bpNode<T>::is_gap(T run) {
 
 template<typename T>
 T bpNode<T>::create_gap(size_t gap_start_position) {
-    T gap = {gap_start_position, 0};
+    T gap = {gap_start_position, gbwtgraph::Position::no_pos()};
     return gap;
 }
 
@@ -1269,7 +1269,7 @@ size_t *BplusTree<T>::search_index(T data) {
 
 template<typename T>
 T BplusTree<T>::search(size_t position) {
-    T data = {position, 0};
+    T data = {position, gbwtgraph::Position::no_pos()};
     bpNode <T> *current = leaf_search(root, data);
     size_t index = current->search(data);
 //        cout << "index " << index << endl;
@@ -1277,7 +1277,7 @@ T BplusTree<T>::search(size_t position) {
         if (current->get_prev() != nullptr) {
             return current->get_prev()->get_item(current->get_prev()->get_size() - 1);
         } else {
-            return {0, 0};
+            return {0, gbwtgraph::Position::no_pos()};
         }
 
     }

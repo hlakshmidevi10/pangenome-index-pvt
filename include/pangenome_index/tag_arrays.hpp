@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include "bplus_tree.hpp"
 #include <gbwtgraph/utils.h>
+#include <functional>
 //#include <vg/io/vpkg.hpp>
 
 
@@ -74,6 +75,9 @@ namespace panindexer {
         // Merge sidecar files with main file (sdsl layout: [int_vector][encoded_starts_sd][bwt_intervals])
         void merge_compressed_files_sdsl(const std::string filename, const std::string encoded_starts_file, const std::string bwt_intervals_file);
 
+        // Set initial BWT offset before writing runs (e.g., number of endmarker positions)
+        inline void set_initial_bwt_offset(size_t offset) { this->cumulative_run_bwt_position = offset; }
+
         // Statistics helpers for compressed format
         size_t number_of_runs_compressed() const;
         size_t bytes_encoded_runs() const;
@@ -87,6 +91,17 @@ namespace panindexer {
         void end_encoded_runs_sdsl();
         void load_encoded_runs_sdsl(std::istream& in);
         void serialize_encoded_runs_sdsl(std::ostream& out) const;
+
+        // Iterate over all runs in compact (int_vector) format, yielding (pos_t, run_length)
+        // Requires that load_compressed_tags_compact() has been used to populate encoded_runs_iv and bwt_intervals.
+        void for_each_run_compact(const std::function<void(pos_t, uint64_t)>& fn) const;
+        
+        // Iterate over all runs with BWT positions: (pos_t, run_length, bwt_start, bwt_end)
+        // Requires that load_compressed_tags_compact() has been used to populate encoded_runs_iv and bwt_intervals.
+        void for_each_run_compact_with_bwt(const std::function<void(pos_t, uint64_t, size_t, size_t)>& fn) const;
+
+        // Returns the logical BWT size used for building bwt_intervals (sd_vector size)
+        inline size_t bwt_size() const { return this->bwt_intervals.size(); }
 
     private:
 
