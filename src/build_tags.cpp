@@ -27,20 +27,54 @@ using namespace std;
 using namespace panindexer;
 
 
+void usage(const char* program_name) {
+    std::cerr << "Usage: " << program_name << " [OPTIONS] <graph_file> <rlbwt_file> <output_file>" << std::endl;
+    std::cerr << "Options:" << std::endl;
+    std::cerr << "  -k <size>     K-mer size (default: 31)" << std::endl;
+    std::cerr << "  -h            Print this help message" << std::endl;
+}
+
 int main(int argc, char **argv) {
-//    if (argc != 3) {
-//        std::cout << "usage: ... " << std::endl;
-//        exit(0);
-//    }
-    std::string graph_file = std::string(argv[1]);
-//    std::string index_file = std::string(argv[2]);
-    std::string rlbwt_file = std::string(argv[2]);
-    std::string output_file = std::string(argv[3]);
-
-
+    size_t k = 31;  // Default k-mer size
     int threads = 8;
+    
+    // Parse optional arguments
+    int opt;
+    while ((opt = getopt(argc, argv, "k:h")) != -1) {
+        switch (opt) {
+            case 'k':
+                k = std::stoul(optarg);
+                if (k == 0) {
+                    std::cerr << "Error: k-mer size must be greater than 0" << std::endl;
+                    return 1;
+                }
+                break;
+            case 'h':
+                usage(argv[0]);
+                return 0;
+            default:
+                usage(argv[0]);
+                return 1;
+        }
+    }
+    
+    // Check remaining positional arguments
+    if (optind + 3 > argc) {
+        std::cerr << "Error: Missing required arguments" << std::endl;
+        usage(argv[0]);
+        return 1;
+    }
+    
+    std::string graph_file = std::string(argv[optind]);
+    std::string rlbwt_file = std::string(argv[optind + 1]);
+    std::string output_file = std::string(argv[optind + 2]);
+    
+    if (k == 0) {
+        std::cerr << "Error: k-mer size must be greater than 0" << std::endl;
+        return 1;
+    }
+    
 //    omp_set_num_threads(threads);
-    size_t k = 31;
 
 
 

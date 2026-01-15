@@ -301,6 +301,22 @@ int main(int argc, char** argv) {
             size_t locate_start = run_span.first;
             size_t locate_end = run_span.second;
             
+            // IMPORTANT: Handle BWT size mismatch between SampledTagArray and r-index
+            // SampledTagArray includes endmarkers, but r-index.bwt_size() doesn't
+            // Skip entire run if it's completely out of bounds
+            if (locate_start >= r_index.bwt_size()) {
+                if (debug) cerr << "      Skipping entire run: locate_start=" << locate_start 
+                     << " >= r_index.bwt_size()=" << r_index.bwt_size() << endl;
+                continue;
+            }
+            
+            // Clamp locate_end to valid BWT range
+            if (locate_end >= r_index.bwt_size()) {
+                if (debug) cerr << "      Clamping locate_end from " << locate_end 
+                     << " to " << (r_index.bwt_size() - 1) << endl;
+                locate_end = r_index.bwt_size() - 1;
+            }
+            
             size_t positions_processed = 0;
             size_t unique_sequences_found = 0;
 
