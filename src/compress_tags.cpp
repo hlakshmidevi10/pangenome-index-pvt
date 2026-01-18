@@ -89,6 +89,8 @@ void compress_tags_file(const std::string& r_index_file, const std::string& inpu
     //    tag_array.serialize_run_by_run(out, endmarkers);
 
 
+    cerr << "Num Endmarkers: " << num_endmarkers << endl;
+    size_t bwt_index = 0;
 
     std::cerr << "Processing tags in batches of " << batch_size << std::endl;
 
@@ -102,6 +104,16 @@ void compress_tags_file(const std::string& r_index_file, const std::string& inpu
             auto tag_block = panindexer::TagArray::decode_run(
                 gbwt::ByteCode::read(in, file_position)
             );
+
+            // // Print decoded position and iteration count
+            // cerr << "BWT index: " << bwt_index << ": "
+            //      << "pos_t{node=" << gbwtgraph::id(tag_block.first)
+            //      << ", offset=" << gbwtgraph::offset(tag_block.first)
+            //      << ", is_rev=" << gbwtgraph::is_rev(tag_block.first)
+            //      << "}, run_len=" << tag_block.second << endl;
+
+            bwt_index += tag_block.second;
+
             tag_batch.push_back(tag_block);
             batch_count++;
         }

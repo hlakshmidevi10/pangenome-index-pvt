@@ -85,6 +85,7 @@ namespace panindexer {
 
         sdsl::bit_vector::select_1_type encoded_runs_starts_select;
         sdsl::sd_vector<>::rank_1_type bwt_intervals_rank;
+        sdsl::sd_vector<>::select_1_type bwt_intervals_select;
 
         vector<pair<pos_t, uint16_t>> tag_runs;
 

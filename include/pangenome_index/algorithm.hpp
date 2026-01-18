@@ -727,7 +727,7 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         // Step 1: initial interval from P[x + min_len - 1]
         FastLocate::bi_interval bint = {0, 0, fmd_index.bwt_size()};
         // bint = fmd_index.backward_extend(bint, pattern[x + min_len - 1]);
-         std::cerr << "here" << std::endl;
+         // std::cerr << "here" << std::endl;
         for (j = x + min_len - 1; j >= x; --j) {
             bint = fmd_index.backward_extend(bint, pattern[j]);
 //            std::cerr << j << " " << (char) pattern[j] << " " << bint.forward << " " << bint.reverse << " " << bint.size << std::endl;
