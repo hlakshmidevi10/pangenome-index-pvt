@@ -197,7 +197,10 @@ int main(int argc, char** argv) {
             // Get tag for current BWT position
             size_t sampled_run_id = sampled.run_id_at(current_bwt_pos);
             uint64_t tag_val = sampled.run_value(sampled_run_id);
-            
+
+
+            if (debug) cerr << "  Text pos " << current_text_pos << " -> BWT pos " << current_bwt_pos 
+                     << " -> tag=" << tag_val << endl;
 
             // Do nothing if tag_val == 0
             // If we found a tag, unpack current_text_pos to get (seq_id, offset)

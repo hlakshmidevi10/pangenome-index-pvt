@@ -115,6 +115,37 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
         ? r_index.last_to_run[rank_x] : 0;
     size_t bwt_pos_x = r_index.bwt_end_position_of_run(run_id);
     
+    if (debug) {
+        cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x 
+             << ", run_id=" << run_id << ", BWT_pos=" << bwt_pos_x << ")" << endl;
+    }
+    
+    // Check if text_pos_x is after the sequence end
+    size_t bwt_seq_end = source_seq_id;  // BWT position of $ at end of sequence source_seq_id
+    size_t text_pos_seq_end;
+    {
+        size_t rindex_run_id = 0;
+        size_t run_start_pos = 0;
+        r_index.run_id_and_offset_at(bwt_seq_end, rindex_run_id, run_start_pos);
+        text_pos_seq_end = r_index.getSample(rindex_run_id);
+        // Navigate from run start to bwt_seq_end
+        for (size_t p = run_start_pos; p < bwt_seq_end; ++p) {
+            text_pos_seq_end = r_index.locateNext(text_pos_seq_end);
+        }
+    }
+    
+    if (debug) {
+        cerr << "Sequence end check: text_pos_x=" << text_pos_x 
+             << ", text_pos_seq_end=" << text_pos_seq_end << " (BWT[" << bwt_seq_end << "])" << endl;
+    }
+    
+    // Check if text_pos_x (BWT rank from last array) is greater than sequence end
+    if (text_pos_x > text_pos_seq_end) {
+        cerr << "Error: BWT rank calculated from last array (text_pos_x=" << text_pos_x 
+             << ") is greater than sequence end (text_pos_seq_end=" << text_pos_seq_end << ")" << endl;
+        return tags;  // Return empty tags vector
+    }
+    
     // Iterate backwards through the interval
     sampled.ensure_run_rank();
     sampled.ensure_run_select();
@@ -127,6 +158,11 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
             // Get tag for current BWT position
             size_t sampled_run_id = sampled.run_id_at(current_bwt_pos);
             uint64_t tag_val = sampled.run_value(sampled_run_id);
+
+            if (debug) {
+                cerr << "  Text pos " << current_text_pos << " -> BWT pos " << current_bwt_pos 
+                     << " -> tag=" << tag_val << endl;
+            }
             
             if (tag_val != 0) {
                 // Unpack to get offset
@@ -170,6 +206,19 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     
     if (debug) {
         cerr << "Found " << tags.size() << " unique tags in source interval" << endl;
+    }
+    // print all the tags
+    if (debug) {
+        cerr << "Tags found in source interval:" << endl;
+        for (const auto& tag : tags) {
+            cerr << "Tag code: " << tag.tag_code << endl;
+            cerr << "Source offsets: [";
+            for (size_t i = 0; i < tag.source_offsets.size(); i++) {
+                if (i > 0) cerr << ", ";
+                cerr << tag.source_offsets[i];
+            }
+            cerr << "]" << endl;
+        }
     }
     
     return tags;
@@ -310,11 +359,11 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
                     cerr << "        Checking if packed_pos is valid (< bwt_size=" << r_index.bwt_size() << ")..." << endl;
                 }
                 
-                if (packed_pos >= r_index.bwt_size()) {
-                    cerr << "ERROR: packed_pos=" << packed_pos << " is >= bwt_size=" << r_index.bwt_size() << endl;
-                    cerr << "  This should not happen! packed_pos should be < bwt_size" << endl;
-                    return visits;  // Return what we have so far
-                }
+                // if (packed_pos >= r_index.bwt_size()) {
+                //     cerr << "ERROR: packed_pos=" << packed_pos << " is >= bwt_size=" << r_index.bwt_size() << endl;
+                //     cerr << "  This should not happen! packed_pos should be < bwt_size" << endl;
+                //     return visits;  // Return what we have so far
+                // }
                 
                 packed_pos = r_index.locateNext(packed_pos);
                 
@@ -724,10 +773,8 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
     vector<TagInfo> sorted_tags = source_tags;
     sort(sorted_tags.begin(), sorted_tags.end(), 
          [](const TagInfo& a, const TagInfo& b) {
-             // Sort by first source offset (base position in source haplotype)
-             size_t a_offset = a.source_offsets.empty() ? 0 : a.source_offsets[0];
-             size_t b_offset = b.source_offsets.empty() ? 0 : b.source_offsets[0];
-             return a_offset < b_offset;
+             // Sort by tag_code (ascending order)
+             return a.tag_code < b.tag_code;
          });
     
     if (debug) {
