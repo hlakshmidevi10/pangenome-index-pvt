@@ -1,6 +1,8 @@
 #include "pangenome_index/r-index.hpp"
 #include "pangenome_index/sampled_tag_array.hpp"
 #include <sdsl/wavelet_trees.hpp>
+#include <gbwtgraph/gbz.h>
+#include <gbwt/metadata.h>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -17,6 +19,7 @@
 using namespace std;
 using namespace panindexer;
 using namespace std::chrono;
+using namespace gbwtgraph;
 
 static bool debug = true;
 
@@ -39,8 +42,183 @@ static pair<size_t, size_t> parse_interval(const string& interval_str) {
     return {start, end};
 }
 
+// Find sequence ID by direct path name (for generic paths like "x", "y", "chr1")
+// Returns numeric_limits<size_t>::max() if not found
+static size_t find_sequence_id_by_path_name(const gbwt::GBWT& gbwt_index,
+                                             const string& path_name_str,
+                                             bool debug_output = false) {
+    if (!gbwt_index.hasMetadata()) {
+        cerr << "Error: GBWT index does not have metadata" << endl;
+        return numeric_limits<size_t>::max();
+    }
+    
+    const gbwt::Metadata& metadata = gbwt_index.metadata;
+    
+    if (debug_output) {
+        cerr << "Searching for path by name: '" << path_name_str << "'" << endl;
+        cerr << "GBWT has " << metadata.paths() << " paths" << endl;
+    }
+    
+    // For generic paths, the path name is typically stored as the contig name
+    // First try to find a contig that matches the path name
+    size_t contig_id = metadata.contig(path_name_str);
+    
+    if (contig_id < metadata.contigs()) {
+        // Found a matching contig, now find paths with this contig
+        if (debug_output) {
+            cerr << "Found contig_id=" << contig_id << " for path name '" << path_name_str << "'" << endl;
+        }
+        
+        vector<size_t> matching_paths;
+        for (size_t path_id = 0; path_id < metadata.paths(); ++path_id) {
+            gbwt::PathName pn = metadata.path(path_id);
+            if (pn.contig == contig_id) {
+                matching_paths.push_back(path_id);
+                if (debug_output) {
+                    cerr << "Found matching path: path_id=" << path_id 
+                         << " (sample=" << pn.sample
+                         << ", contig=" << pn.contig
+                         << ", phase=" << pn.phase
+                         << ", count=" << pn.count << ")" << endl;
+                }
+            }
+        }
+        
+        if (!matching_paths.empty()) {
+            if (matching_paths.size() > 1) {
+                cerr << "Warning: Multiple paths (" << matching_paths.size() 
+                     << ") found for contig '" << path_name_str << "'. Using first match (path_id=" 
+                     << matching_paths[0] << ")" << endl;
+            }
+            
+            if (debug_output) {
+                cerr << "Resolved path name '" << path_name_str << "' to sequence ID: " << matching_paths[0] << endl;
+            }
+            return matching_paths[0];
+        }
+    }
+    
+    // If contig lookup failed, list available paths
+    cerr << "Error: Path '" << path_name_str << "' not found" << endl;
+    cerr << "Available contigs:" << endl;
+    for (size_t i = 0; i < metadata.contigs(); ++i) {
+        cerr << "  " << metadata.contig(i) << endl;
+    }
+    
+    return numeric_limits<size_t>::max();
+}
+
+// Find sequence ID from path metadata (sample, contig, haplotype)
+// Returns numeric_limits<size_t>::max() if not found
+static size_t find_sequence_id_from_metadata(const gbwt::GBWT& gbwt_index,
+                                              const string& sample_name,
+                                              const string& contig_name,
+                                              size_t haplotype,
+                                              bool debug_output = false) {
+    if (!gbwt_index.hasMetadata()) {
+        cerr << "Error: GBWT index does not have metadata" << endl;
+        return numeric_limits<size_t>::max();
+    }
+    
+    const gbwt::Metadata& metadata = gbwt_index.metadata;
+    
+    if (debug_output) {
+        cerr << "Searching for path: sample='" << sample_name 
+             << "', contig='" << contig_name 
+             << "', haplotype=" << haplotype << endl;
+        cerr << "GBWT has " << metadata.paths() << " paths, "
+             << metadata.samples() << " samples, "
+             << metadata.contigs() << " contigs" << endl;
+    }
+    
+    // Find sample ID from sample name
+    size_t sample_id = metadata.sample(sample_name);
+    if (sample_id >= metadata.samples()) {
+        cerr << "Error: Sample '" << sample_name << "' not found in metadata" << endl;
+        cerr << "Available samples:" << endl;
+        for (size_t i = 0; i < metadata.samples(); ++i) {
+            cerr << "  " << i << ": " << metadata.sample(i) << endl;
+        }
+        return numeric_limits<size_t>::max();
+    }
+    
+    // Find contig ID from contig name
+    size_t contig_id = metadata.contig(contig_name);
+    if (contig_id >= metadata.contigs()) {
+        cerr << "Error: Contig '" << contig_name << "' not found in metadata" << endl;
+        cerr << "Available contigs:" << endl;
+        for (size_t i = 0; i < metadata.contigs(); ++i) {
+            cerr << "  " << i << ": " << metadata.contig(i) << endl;
+        }
+        return numeric_limits<size_t>::max();
+    }
+    
+    if (debug_output) {
+        cerr << "Found sample_id=" << sample_id << " for '" << sample_name << "'" << endl;
+        cerr << "Found contig_id=" << contig_id << " for '" << contig_name << "'" << endl;
+    }
+    
+    // Search through all paths to find matching one
+    vector<size_t> matching_paths;
+    for (size_t path_id = 0; path_id < metadata.paths(); ++path_id) {
+        gbwt::PathName path_name = metadata.path(path_id);
+        
+        if (path_name.sample == sample_id && 
+            path_name.contig == contig_id &&
+            path_name.phase == haplotype) {
+            matching_paths.push_back(path_id);
+            if (debug_output) {
+                cerr << "Found matching path: path_id=" << path_id 
+                     << " (sample=" << path_name.sample
+                     << ", contig=" << path_name.contig
+                     << ", phase=" << path_name.phase
+                     << ", count=" << path_name.count << ")" << endl;
+            }
+        }
+    }
+    
+    if (matching_paths.empty()) {
+        cerr << "Error: No path found matching sample='" << sample_name 
+             << "', contig='" << contig_name 
+             << "', haplotype=" << haplotype << endl;
+        return numeric_limits<size_t>::max();
+    }
+    
+    if (matching_paths.size() > 1) {
+        cerr << "Warning: Multiple paths (" << matching_paths.size() 
+             << ") found matching the criteria. Using first match (path_id=" 
+             << matching_paths[0] << ")" << endl;
+    }
+    
+    // The path_id in GBWT metadata corresponds to the sequence ID
+    // In GBWT, paths are stored as bidirectional paths, so we need to get the correct sequence ID
+    // The sequence ID is typically 2 * path_id for forward orientation
+    size_t seq_id = matching_paths[0];
+    
+    if (debug_output) {
+        cerr << "Resolved to sequence ID: " << seq_id << endl;
+    }
+    
+    return seq_id;
+}
+
 static void usage(const char* prog) {
-    cerr << "Usage: " << prog << " <r_index.ri> <sampled.tags> --seq-id ID --interval START..END" << endl;
+    cerr << "Usage: " << prog << " <r_index.ri> <sampled.tags> [options]" << endl;
+    cerr << endl;
+    cerr << "Path specification (choose one):" << endl;
+    cerr << "  --seq-id ID                  Direct sequence ID" << endl;
+    cerr << "  --gbz FILE --path-name NAME  Specify path by name (for generic paths like 'x', 'chr1')" << endl;
+    cerr << "  --gbz FILE --sample NAME --contig NAME [--haplotype N]" << endl;
+    cerr << "                               Specify path by metadata (for haplotype paths)" << endl;
+    cerr << endl;
+    cerr << "Required:" << endl;
+    cerr << "  --interval START..END        Query interval on the path" << endl;
+    cerr << endl;
+    cerr << "Examples:" << endl;
+    cerr << "  " << prog << " index.ri tags.stags --seq-id 0 --interval 1000..2000" << endl;
+    cerr << "  " << prog << " index.ri tags.stags --gbz graph.gbz --path-name x --interval 1000..2000" << endl;
+    cerr << "  " << prog << " index.ri tags.stags --gbz graph.gbz --sample GRCh38 --contig chr1 --interval 1000..2000" << endl;
+    cerr << "  " << prog << " index.ri tags.stags --gbz graph.gbz --sample HG002 --contig chr1 --haplotype 1 --interval 1000..2000" << endl;
 }
 
 int main(int argc, char** argv) {
@@ -57,6 +235,17 @@ int main(int argc, char** argv) {
     pair<size_t, size_t> interval = {0, 0};
     bool has_interval = false;
     
+    // Path metadata options (alternative to --seq-id)
+    string gbz_file;
+    string path_name;     // For generic paths like "x", "y", "chr1"
+    string sample_name;   // For haplotype paths
+    string contig_name;   // For haplotype paths
+    size_t haplotype = 0;
+    bool has_path_name = false;
+    bool has_sample = false;
+    bool has_contig = false;
+    bool has_haplotype = false;
+    
     for (int i = 3; i < argc; i++) {
         string arg = argv[i];
         if (arg == "--interval" && i + 1 < argc) {
@@ -64,6 +253,23 @@ int main(int argc, char** argv) {
             has_interval = true;
         } else if (arg == "--seq-id" && i + 1 < argc) {
             seq_id = stoull(argv[++i]);
+        } else if (arg == "--gbz" && i + 1 < argc) {
+            gbz_file = argv[++i];
+        } else if (arg == "--path-name" && i + 1 < argc) {
+            path_name = argv[++i];
+            has_path_name = true;
+        } else if (arg == "--sample" && i + 1 < argc) {
+            sample_name = argv[++i];
+            has_sample = true;
+        } else if (arg == "--contig" && i + 1 < argc) {
+            contig_name = argv[++i];
+            has_contig = true;
+        } else if (arg == "--haplotype" && i + 1 < argc) {
+            haplotype = stoull(argv[++i]);
+            has_haplotype = true;
+        } else if (arg == "--help" || arg == "-h") {
+            usage(argv[0]);
+            return 0;
         } else {
             cerr << "Unknown argument: " << arg << endl;
             usage(argv[0]);
@@ -71,8 +277,45 @@ int main(int argc, char** argv) {
         }
     }
     
-    if (seq_id == numeric_limits<size_t>::max()) {
-        cerr << "Error: --seq-id is required" << endl;
+    // Validate arguments: need either --seq-id OR (--gbz + --path-name) OR (--gbz + --sample + --contig)
+    bool use_path_name = has_path_name;
+    bool use_metadata = has_sample || has_contig;
+    bool use_seq_id = (seq_id != numeric_limits<size_t>::max());
+    
+    if ((use_seq_id && use_path_name) || (use_seq_id && use_metadata) || (use_path_name && use_metadata)) {
+        cerr << "Error: Cannot mix --seq-id, --path-name, and --sample/--contig options" << endl;
+        usage(argv[0]);
+        return 1;
+    }
+    
+    if (use_path_name) {
+        if (gbz_file.empty()) {
+            cerr << "Error: --gbz is required when using --path-name" << endl;
+            usage(argv[0]);
+            return 1;
+        }
+    }
+    
+    if (use_metadata) {
+        if (gbz_file.empty()) {
+            cerr << "Error: --gbz is required when using --sample/--contig" << endl;
+            usage(argv[0]);
+            return 1;
+        }
+        if (!has_sample) {
+            cerr << "Error: --sample is required when using --contig" << endl;
+            usage(argv[0]);
+            return 1;
+        }
+        if (!has_contig) {
+            cerr << "Error: --contig is required when using --sample" << endl;
+            usage(argv[0]);
+            return 1;
+        }
+    }
+    
+    if (!use_metadata && !use_seq_id && !use_path_name) {
+        cerr << "Error: Must specify either --seq-id, --path-name, or (--sample + --contig)" << endl;
         usage(argv[0]);
         return 1;
     }
@@ -81,6 +324,51 @@ int main(int argc, char** argv) {
         cerr << "Error: --interval is required" << endl;
         usage(argv[0]);
         return 1;
+    }
+    
+    // If using path-name or metadata, load GBZ and resolve sequence ID
+    if (use_path_name || use_metadata) {
+        if (debug) cerr << "Loading GBZ file for path lookup: " << gbz_file << "..." << endl;
+        
+        GBZ gbz;
+        try {
+            sdsl::simple_sds::load_from(gbz, gbz_file);
+        } catch (const exception& e) {
+            cerr << "Error loading GBZ file: " << e.what() << endl;
+            return 1;
+        }
+        
+        if (debug) cerr << "GBZ loaded. Resolving path..." << endl;
+        
+        if (use_path_name) {
+            // Direct path name lookup (for generic paths like "x", "y", "chr1")
+            seq_id = find_sequence_id_by_path_name(gbz.index, path_name, debug);
+            
+            if (seq_id == numeric_limits<size_t>::max()) {
+                cerr << "Error: Could not find path '" << path_name << "'" << endl;
+                return 1;
+            }
+            
+            if (debug) {
+                cerr << "Resolved path name '" << path_name 
+                     << "' to sequence ID: " << seq_id << endl;
+            }
+        } else {
+            // Structured metadata lookup (for haplotype paths)
+            seq_id = find_sequence_id_from_metadata(gbz.index, sample_name, contig_name, haplotype, debug);
+            
+            if (seq_id == numeric_limits<size_t>::max()) {
+                cerr << "Error: Could not resolve path from metadata" << endl;
+                return 1;
+            }
+            
+            if (debug) {
+                cerr << "Resolved path (sample='" << sample_name 
+                     << "', contig='" << contig_name 
+                     << "', haplotype=" << haplotype 
+                     << ") to sequence ID: " << seq_id << endl;
+            }
+        }
     }
     
     // Timing variables
@@ -242,6 +530,11 @@ int main(int argc, char** argv) {
         cout << "seq_id=" << seq_id << "\tinterval=" << seq_start << ".." << seq_end << "\tno_tags" << endl;
         cerr << "\n=== Query Statistics ===" << endl;
         cerr << "  Sequence ID: " << seq_id << endl;
+        if (use_metadata) {
+            cerr << "  Sample: " << sample_name << endl;
+            cerr << "  Contig: " << contig_name << endl;
+            cerr << "  Haplotype: " << haplotype << endl;
+        }
         cerr << "  Interval: " << seq_start << ".." << seq_end << " (length: " << (seq_end - seq_start + 1) << ")" << endl;
         cerr << "  Positions checked: " << positions_checked << endl;
         cerr << "  Positions with tags: " << positions_with_tags << endl;
@@ -376,6 +669,11 @@ int main(int argc, char** argv) {
     
     cout << "Query Sequence:" << endl;
     cout << "  Sequence ID: " << seq_id << endl;
+    if (use_metadata) {
+        cout << "  Sample: " << sample_name << endl;
+        cout << "  Contig: " << contig_name << endl;
+        cout << "  Haplotype: " << haplotype << endl;
+    }
     cout << "  Interval: " << seq_start << ".." << seq_end << endl;
     cout << "  Number of tags found: " << results.size() << endl;
     cout << endl;
@@ -434,6 +732,11 @@ int main(int argc, char** argv) {
     // Print statistics
     cerr << "\n=== Query Statistics ===" << endl;
     cerr << "  Sequence ID: " << seq_id << endl;
+    if (use_metadata) {
+        cerr << "  Sample: " << sample_name << endl;
+        cerr << "  Contig: " << contig_name << endl;
+        cerr << "  Haplotype: " << haplotype << endl;
+    }
     cerr << "  Interval: " << seq_start << ".." << seq_end << " (length: " << (seq_end - seq_start + 1) << ")" << endl;
     cerr << "  Positions checked: " << positions_checked << endl;
     cerr << "  Positions with tags: " << positions_with_tags << endl;
