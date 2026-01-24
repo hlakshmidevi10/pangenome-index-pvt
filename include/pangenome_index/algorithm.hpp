@@ -165,7 +165,11 @@ void parallel_kmers_to_bplustree(FastLocate &idx, BplusTree <Run> &bptree,
                                  hash_map <gbwtgraph::Key64::value_type, gbwtgraph::Position> &index, size_t k,
                                  gbwt::range_type interval) {
 
-    int threads = omp_get_max_threads();
+    size_t bwt_size = idx.bwt_size();
+    // Limit threads to the BWT size to avoid empty partitions and underflow
+    int threads = std::min((size_t)omp_get_max_threads(), bwt_size);
+    if (threads == 0) threads = 1;
+    
     // Thread-safe queue to collect results
 //    ThreadSafeQueue <std::pair<Run, size_t>> queue;
     std::vector<std::vector<std::pair<Run, size_t>>> batches(threads);
@@ -174,8 +178,8 @@ void parallel_kmers_to_bplustree(FastLocate &idx, BplusTree <Run> &bptree,
 
     // splitting the starting range (0, idx.bwt_size() - 1) into parts and call the kmers_to_bplustree_worker function
     // for each part
-    size_t part_size = idx.bwt_size();
-    part_size = (part_size - 1) / threads;
+    size_t part_size = (bwt_size + threads - 1) / threads;  // Round up to ensure coverage
+    if (part_size == 0) part_size = 1;
 
     std::cerr << "running each part " << part_size << " using threads " << threads << std::endl;
 
@@ -183,12 +187,10 @@ void parallel_kmers_to_bplustree(FastLocate &idx, BplusTree <Run> &bptree,
 #pragma omp parallel for
     for (int i = 0; i < threads; i++) {
         size_t start = i * part_size;
-        size_t end = (i + 1) * part_size - 1;
-        if (i == threads - 1) {
-            end = idx.bwt_size() - 1;
-        }
+        if (start >= bwt_size) continue;  // Skip empty partitions
+        size_t end = std::min((size_t)(i + 1) * part_size, bwt_size) - 1;
 
-        batches[i].reserve(end - start);
+        batches[i].reserve(end - start + 1);
         kmers_to_bplustree_worker(idx, batches[i], index, k, {start, end}, "");
 //        kmers_to_bplustree_worker(idx, queue, index, k, interval, starting_kmers[i]);
     }
