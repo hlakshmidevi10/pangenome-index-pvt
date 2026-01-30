@@ -443,6 +443,17 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     size_t current_text_pos = text_pos_x;
     size_t current_bwt_pos = bwt_pos_x;
     
+    // Skip positions after the interval end (we only want tags within and before the interval)
+    while (current_text_pos > text_pos_j) {
+        current_text_pos--;
+        current_bwt_pos = r_index.LF(current_bwt_pos);
+    }
+    
+    if (debug) {
+        cerr << "    is_first_run_gap=" << sampled.is_first_run_gap() << endl;
+    }
+    
+    // Now process the interval itself
     while (current_text_pos >= text_pos_i) {
         if (current_text_pos <= text_pos_j) {
             // Get tag for current BWT position
@@ -451,7 +462,7 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
 
             if (debug) {
                 cerr << "  Text pos " << current_text_pos << " -> BWT pos " << current_bwt_pos 
-                     << " -> tag=" << tag_val << endl;
+                     << " -> tag=" << tag_val << " -> run_id=" << sampled_run_id << endl;
             }
             
             if (tag_val != 0) {
@@ -481,6 +492,68 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
         } else {
             break;
         }
+    }
+    
+    // Continue backward past the interval start to find one more non-empty tag
+    // This helps find a common node when the interval starts with empty tags
+    size_t text_pos_haplotype_start = r_index.pack(source_seq_id, 0);
+    bool found_tag_before_interval = false;
+    
+    if (debug) {
+        cerr << "Looking for first tag before interval start (text_pos_i=" << text_pos_i 
+             << ", haplotype_start=" << text_pos_haplotype_start << ")" << endl;
+    }
+    
+    // Move one step back from interval start to begin searching before the interval
+    if (current_text_pos > text_pos_haplotype_start) {
+        current_text_pos--;
+        current_bwt_pos = r_index.LF(current_bwt_pos);
+        
+        while (current_text_pos >= text_pos_haplotype_start && !found_tag_before_interval) {
+            // Get tag for current BWT position
+            size_t sampled_run_id = sampled.run_id_at(current_bwt_pos);
+            uint64_t tag_val = sampled.run_value(sampled_run_id);
+            
+            if (debug) {
+                cerr << "  [before interval] Text pos " << current_text_pos << " -> BWT pos " 
+                     << current_bwt_pos << " -> tag=" << tag_val << endl;
+            }
+            
+            if (tag_val != 0) {
+                // Found a non-empty tag before the interval
+                size_t seq_id_found = r_index.seqId(current_text_pos);
+                size_t offset_from_start = r_index.seqOffset(current_text_pos);
+                
+                if (seq_id_found == source_seq_id) {
+                    if (tag_map.find(tag_val) == tag_map.end()) {
+                        tag_map[tag_val] = TagInfo{tag_val, {}, {}, {}};
+                    }
+                    
+                    tag_map[tag_val].source_offsets.push_back(offset_from_start);
+                    tag_map[tag_val].source_bwt_positions.push_back(current_bwt_pos);
+                    tag_map[tag_val].source_packed_positions.push_back(current_text_pos);
+                    
+                    found_tag_before_interval = true;
+                    
+                    if (debug) {
+                        cerr << "  Found tag before interval: tag_code=" << tag_val 
+                             << " at offset=" << offset_from_start << endl;
+                    }
+                }
+            }
+            
+            // Move to previous text position
+            if (current_text_pos > text_pos_haplotype_start && !found_tag_before_interval) {
+                current_text_pos--;
+                current_bwt_pos = r_index.LF(current_bwt_pos);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    if (debug && !found_tag_before_interval) {
+        cerr << "  No tag found before interval (reached haplotype start)" << endl;
     }
     
     // Convert map to vector and sort by first source offset (earliest in interval)
@@ -552,7 +625,7 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
             cerr << "    tag_run_id=" << tag_run_id << endl;
         }
         
-        size_t bwt_run_id = 2 * tag_run_id + 1 - static_cast<size_t>(first_run_is_gap);
+        size_t bwt_run_id = 2 * tag_run_id + static_cast<size_t>(first_run_is_gap);
         if (debug) {
             cerr << "    bwt_run_id=" << bwt_run_id << endl;
         }
@@ -1063,8 +1136,10 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
     vector<TagInfo> sorted_tags = source_tags;
     sort(sorted_tags.begin(), sorted_tags.end(), 
          [](const TagInfo& a, const TagInfo& b) {
-             // Sort by tag_code (ascending order)
-             return a.tag_code < b.tag_code;
+             // Sort by first source_offset (base offset), smallest to largest
+             if (a.source_offsets.empty()) return false;
+             if (b.source_offsets.empty()) return true;
+             return a.source_offsets[0] < b.source_offsets[0];
          });
     
     if (debug) {
@@ -1173,6 +1248,8 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
 // Trace paths using GBWT LF mapping (one node at a time)
 // Uses GBWT's efficient forward traversal to map positions between source and target haplotypes
 // FastLocate is used to find initial positions, then GBWT index LF() is used for traversal
+// Each path (source and target) is traversed independently until it reaches its respective
+// last common node at the correct base offset.
 unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
     const gbwt::GBWT& gbwt_index,
     const gbwt::FastLocate& gbwt_fast_locate,
@@ -1180,7 +1257,9 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
     size_t source_seq_id, size_t source_start, size_t source_end,
     size_t target_seq_id, size_t anchor_source_offset, size_t anchor_target_offset,
     size_t anchor_source_base, size_t anchor_target_base,
-    uint64_t anchor_tag_code, size_t last_common_source_offset, uint64_t last_common_tag_code) {
+    uint64_t anchor_tag_code, 
+    size_t last_common_source_base, size_t last_common_target_base,
+    uint64_t last_common_tag_code) {
     
     unordered_map<size_t, vector<size_t>> offset_map;
     
@@ -1188,6 +1267,8 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         cerr << "Building offset mapping using GBWT LF mapping:" << endl;
         cerr << "  Anchor source node offset: " << anchor_source_offset << endl;
         cerr << "  Anchor target node offset: " << anchor_target_offset << endl;
+        cerr << "  Last common source base: " << last_common_source_base << endl;
+        cerr << "  Last common target base: " << last_common_target_base << endl;
     }
     
     // Decode anchor node and encode as GBWT node
@@ -1216,21 +1297,35 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         gbwt::size_type seq_id = gbwt_fast_locate.seqId(sa_values[i]);
         gbwt::size_type seq_offset = gbwt_fast_locate.seqOffset(sa_values[i]);
         
-        if (seq_id == source_seq_id && seq_offset == anchor_source_offset) {
-            source_offset_in_node = i;
+        // Print all indexes where source sequence visits this node
+        if (seq_id == source_seq_id) {
             if (debug) {
-                cerr << "  Found source at index " << i << " in node's SA" << endl;
+                cerr << "  Source seq " << source_seq_id << " visits node at index " << i 
+                     << ", seq_offset=" << seq_offset << endl;
+            }
+            if (seq_offset == anchor_source_offset) {
+                source_offset_in_node = i;
+                if (debug) {
+                    cerr << "    ^ This is the anchor (matches anchor_source_offset=" << anchor_source_offset << ")" << endl;
+                }
             }
         }
-        if (seq_id == target_seq_id && seq_offset == anchor_target_offset) {
-            target_offset_in_node = i;
+        
+        // Print all indexes where target sequence visits this node
+        if (seq_id == target_seq_id) {
             if (debug) {
-                cerr << "  Found target at index " << i << " in node's SA" << endl;
+                cerr << "  Target seq " << target_seq_id << " visits node at index " << i 
+                     << ", seq_offset=" << seq_offset << endl;
+            }
+            if (seq_offset == anchor_target_offset) {
+                target_offset_in_node = i;
+                if (debug) {
+                    cerr << "    ^ This is the anchor (matches anchor_target_offset=" << anchor_target_offset << ")" << endl;
+                }
             }
         }
     }
     
-    // TODO: Handle case where multiple paths from same sequence pass through anchor node
     // For now, we assume only one occurrence per sequence at this node
     if (source_offset_in_node == gbwt::invalid_offset()) {
         cerr << "Warning: Source sequence " << source_seq_id 
@@ -1309,8 +1404,15 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
     if (debug) {
         cerr << "  Starting independent path traversal..." << endl;
         cerr << "  Anchor node: tag_code=" << anchor_tag_code << endl;
+        cerr << "    Decoded: node_id=" << anchor_node_id << ", is_rev=" << anchor_is_rev << endl;
+        cerr << "    GBWT node (encoded): " << anchor_node << endl;
+        gbwtgraph::handle_t anchor_handle = graph.get_handle(anchor_node_id, anchor_is_rev);
+        cerr << "    Anchor node sequence: " << graph.get_sequence(anchor_handle) << endl;
+        cerr << "    Anchor node length: " << graph.get_length(anchor_handle) << endl;
         cerr << "    Source: node_offset=" << anchor_source_offset << ", base_offset=" << anchor_source_base << endl;
         cerr << "    Target: node_offset=" << anchor_target_offset << ", base_offset=" << anchor_target_base << endl;
+        cerr << "    Source edge_type: (node=" << source_pos.first << ", offset=" << source_pos.second << ")" << endl;
+        cerr << "    Target edge_type: (node=" << target_pos.first << ", offset=" << target_pos.second << ")" << endl;
     }
     
     // ========== Traverse source path independently ==========
@@ -1340,8 +1442,12 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         src_node_offset++;
         
         if (debug) {
+            cerr << "    Left GBWT node: " << src_pos.first 
+                 << " (id=" << gbwt::Node::id(src_pos.first) 
+                 << ", rev=" << gbwt::Node::is_reverse(src_pos.first) << ")" << endl;
             cerr << "    Moved forward: added node_len=" << node_len 
                  << ", new src_base_offset=" << src_base_offset << endl;
+            cerr << "    Left node sequence: " << graph.get_sequence(curr_src_handle) << endl;
         }
         
         // Get tag code for next node
@@ -1351,28 +1457,7 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         uint64_t src_decoded = ((static_cast<uint64_t>(next_src_node_id) - 1) << 1) | (next_src_is_rev ? 1 : 0);
         uint64_t next_src_tag_code = src_decoded + 1;
         
-        // Check stop conditions
-        if (next_src_tag_code > last_common_tag_code) {
-            if (debug) {
-                cerr << "    Source path stopped: tag_code=" << next_src_tag_code 
-                     << " > last_common_tag_code=" << last_common_tag_code 
-                     << " after " << source_path.size() << " nodes" << endl;
-            }
-            break;
-        }
-        
-        // Stop if we've gone past the source interval
-        // base_offset is the START of the node, so stop if start > source_end
-        if (src_base_offset > source_end) {
-            if (debug) {
-                cerr << "    Source path stopped: src_base_offset=" << src_base_offset 
-                     << " > source_end=" << source_end 
-                     << " after " << source_path.size() << " nodes" << endl;
-            }
-            break;
-        }
-        
-        // Store this node (only if within reasonable bounds)
+        // Store this node first (we need it even if it's the last one)
         PathNode src_node;
         src_node.tag_code = next_src_tag_code;
         src_node.node = next_src_node;
@@ -1382,9 +1467,36 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         source_path.push_back(src_node);
         
         if (debug) {
+            gbwtgraph::handle_t next_src_handle = graph.get_handle(
+                gbwt::Node::id(next_src_node), gbwt::Node::is_reverse(next_src_node));
+            cerr << "    Next GBWT node: " << next_src_node 
+                 << " (id=" << next_src_node_id 
+                 << ", rev=" << next_src_is_rev << ")" << endl;
             cerr << "    Added source node: tag_code=" << next_src_tag_code 
                  << ", node_offset=" << src_node_offset 
                  << ", base_offset=" << src_base_offset << endl;
+            cerr << "    Added node sequence: " << graph.get_sequence(next_src_handle) << endl;
+        }
+        
+        // Check stop condition: stop when we've reached or passed the last common node's base offset
+        // We store the node first, then check if we should stop
+        if (src_base_offset >= last_common_source_base) {
+            if (debug) {
+                cerr << "    Source path stopped: reached last common base offset " 
+                     << last_common_source_base << " (current: " << src_base_offset << ")"
+                     << " after " << source_path.size() << " nodes" << endl;
+            }
+            break;
+        }
+        
+        // Also stop if we've gone past the source interval
+        if (src_base_offset > source_end) {
+            if (debug) {
+                cerr << "    Source path stopped: src_base_offset=" << src_base_offset 
+                     << " > source_end=" << source_end 
+                     << " after " << source_path.size() << " nodes" << endl;
+            }
+            break;
         }
         
         src_pos = next_src_pos;
@@ -1417,8 +1529,12 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         tgt_node_offset++;
         
         if (debug) {
+            cerr << "    Left GBWT node: " << tgt_pos.first 
+                 << " (id=" << gbwt::Node::id(tgt_pos.first) 
+                 << ", rev=" << gbwt::Node::is_reverse(tgt_pos.first) << ")" << endl;
             cerr << "    Moved forward: added node_len=" << node_len 
                  << ", new tgt_base_offset=" << tgt_base_offset << endl;
+            cerr << "    Left node sequence: " << graph.get_sequence(curr_tgt_handle) << endl;
         }
         
         // Get tag code for next node
@@ -1428,17 +1544,7 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         uint64_t tgt_decoded = ((static_cast<uint64_t>(next_tgt_node_id) - 1) << 1) | (next_tgt_is_rev ? 1 : 0);
         uint64_t next_tgt_tag_code = tgt_decoded + 1;
         
-        // Check stop condition
-        if (next_tgt_tag_code > last_common_tag_code) {
-            if (debug) {
-                cerr << "    Target path stopped: tag_code=" << next_tgt_tag_code 
-                     << " > last_common_tag_code=" << last_common_tag_code 
-                     << " after " << target_path.size() << " nodes" << endl;
-            }
-            break;
-        }
-        
-        // Store this node
+        // Store this node first (we need it even if it's the last one)
         PathNode tgt_node;
         tgt_node.tag_code = next_tgt_tag_code;
         tgt_node.node = next_tgt_node;
@@ -1448,9 +1554,25 @@ unordered_map<size_t, vector<size_t>> build_offset_mapping_with_gbwt_lf(
         target_path.push_back(tgt_node);
         
         if (debug) {
+            gbwtgraph::handle_t next_tgt_handle = graph.get_handle(
+                gbwt::Node::id(next_tgt_node), gbwt::Node::is_reverse(next_tgt_node));
+            cerr << "    Next GBWT node: " << next_tgt_node 
+                 << " (id=" << next_tgt_node_id 
+                 << ", rev=" << next_tgt_is_rev << ")" << endl;
             cerr << "    Added target node: tag_code=" << next_tgt_tag_code 
                  << ", node_offset=" << tgt_node_offset 
                  << ", base_offset=" << tgt_base_offset << endl;
+            cerr << "    Added node sequence: " << graph.get_sequence(next_tgt_handle) << endl;
+        }
+        
+        // Check stop condition: stop when we've reached or passed the last common node's base offset
+        if (tgt_base_offset >= last_common_target_base) {
+            if (debug) {
+                cerr << "    Target path stopped: reached last common base offset " 
+                     << last_common_target_base << " (current: " << tgt_base_offset << ")"
+                     << " after " << target_path.size() << " nodes" << endl;
+            }
+            break;
         }
         
         tgt_pos = next_tgt_pos;
@@ -1540,7 +1662,9 @@ vector<TranslationResult> trace_coordinates_gbwt(
     size_t source_seq_id, size_t source_start, size_t source_end,
     size_t target_seq_id, size_t anchor_source_offset, size_t anchor_target_offset,
     size_t anchor_source_base, size_t anchor_target_base,
-    uint64_t anchor_tag_code, size_t last_common_source_offset, uint64_t last_common_tag_code) {
+    uint64_t anchor_tag_code, 
+    size_t last_common_source_base, size_t last_common_target_base,
+    uint64_t last_common_tag_code) {
     
     vector<TranslationResult> translations;
     
@@ -1548,6 +1672,8 @@ vector<TranslationResult> trace_coordinates_gbwt(
         cerr << "Tracing coordinates from anchor using GBWT LF mapping:" << endl;
         cerr << "  Anchor source offset: " << anchor_source_offset << endl;
         cerr << "  Anchor target offset: " << anchor_target_offset << endl;
+        cerr << "  Last common source base: " << last_common_source_base << endl;
+        cerr << "  Last common target base: " << last_common_target_base << endl;
     }
     
     // Build offset mapping using GBWT LF-based tracing
@@ -1555,7 +1681,7 @@ vector<TranslationResult> trace_coordinates_gbwt(
         gbwt_index, gbwt_fast_locate, graph, source_seq_id, source_start, source_end,
         target_seq_id, anchor_source_offset, anchor_target_offset,
         anchor_source_base, anchor_target_base,
-        anchor_tag_code, last_common_source_offset, last_common_tag_code);
+        anchor_tag_code, last_common_source_base, last_common_target_base, last_common_tag_code);
     
     if (debug) {
         cerr << "\n=== Final Offset Mapping ===" << endl;
@@ -1966,6 +2092,9 @@ int main(int argc, char** argv) {
     size_t anchor_target_base = common_nodes.first_target_base;
     uint64_t anchor_tag_code = common_nodes.first_tag_code;
     size_t last_common_source_offset = common_nodes.last_source_offset;
+    size_t last_common_target_offset = common_nodes.last_target_offset;
+    size_t last_common_source_base = common_nodes.last_source_base;
+    size_t last_common_target_base = common_nodes.last_target_base;
     uint64_t last_common_tag_code = common_nodes.last_tag_code;
     
     // Step 3: Trace coordinates using GBWT LF mapping
@@ -1975,12 +2104,12 @@ int main(int argc, char** argv) {
     if (gbwt_index_ptr && gbwt_rindex_ptr) {
         // Use GBWT LF mapping for forward path traversal
         // FastLocate finds initial positions, GBWT index LF() does the traversal
-        // Traversal stops when reaching the last common node
+        // Each path is traversed until it reaches its last common node at the correct base offset
         translations = trace_coordinates_gbwt(
             *gbwt_index_ptr, *gbwt_rindex_ptr, graph, source_seq_id, seq_start, seq_end,
             target_seq_id, anchor_source_offset, anchor_target_offset,
             anchor_source_base, anchor_target_base, anchor_tag_code,
-            last_common_source_offset, last_common_tag_code);
+            last_common_source_base, last_common_target_base, last_common_tag_code);
     } else {
         cerr << "Error: Both GBWT index and GBWT r-index are required" << endl;
         return 1;
@@ -2021,17 +2150,32 @@ int main(int argc, char** argv) {
          << ", base_offset=" << anchor_target_base << endl;
     cout << "Last common node (stop): tag_code=" << last_common_tag_code << endl;
     cout << "  Source: node_offset=" << last_common_source_offset 
-         << ", base_offset=" << common_nodes.last_source_base << endl;
+         << ", base_offset=" << last_common_source_base << endl;
+    cout << "  Target: node_offset=" << last_common_target_offset 
+         << ", base_offset=" << last_common_target_base << endl;
     cout << endl;
     
     // Check for fragments
-    auto all_anchors = find_all_common_nodes(rlbwt_rindex, sampled, source_tags, target_seq_id);
+    // auto all_anchors = find_all_common_nodes(rlbwt_rindex, sampled, source_tags, target_seq_id);
+    
+    // Calculate the actual interval covered by the translation
+    // (from anchor_source_base to last_common_source_base, which may be larger than the input interval)
+    size_t actual_start = anchor_source_base;
+    size_t actual_end = last_common_source_base;
+    if (actual_start > actual_end) {
+        std::swap(actual_start, actual_end);
+    }
+    
+    cout << "Actual translated interval: " << actual_start << ".." << actual_end << endl;
+    cout << endl;
     
     cout << "Translations:" << endl;
     cout << "Source_Offset\tTarget_Seq_ID\tTarget_Offset" << endl;
     for (const auto& trans : translations) {
-        cout << trans.source_offset << "\t" << trans.target_seq_id << "\t" 
-             << trans.target_offset << endl;
+        if (trans.target_offset != 0) {
+            cout << trans.source_offset << "\t" << trans.target_seq_id << "\t" 
+                 << trans.target_offset << endl;
+        }
     }
     
     auto end_total = high_resolution_clock::now();

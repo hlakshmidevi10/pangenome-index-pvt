@@ -82,7 +82,7 @@ namespace panindexer {
         // Otherwise maps run_id to correct index in wt_gmr based on gap flag
         inline uint64_t run_value(size_t run_id) const {
             // Check if this run_id is a gap run
-            if ((run_id + static_cast<size_t>(!first_run_is_gap)) % 2 == 1) {
+            if ((run_id + static_cast<size_t>(first_run_is_gap)) % 2 == 1) {
                 // This run_id is a gap; return 0
                 return 0;
             } else {
@@ -100,7 +100,7 @@ namespace panindexer {
     private:
         sdsl::wt_gmr<sdsl::int_vector<>, sdsl::inv_multi_perm_support<4, sdsl::int_vector<>>> sampled_values; // only non-gap values (gaps not stored)
         sdsl::sd_vector<> bwt_intervals; // 1 at BWT positions where a run starts (including zero-length gap runs)
-        bool first_run_is_gap = false; // 0 if first run is gap, 1 if first run is normal tag
+        bool first_run_is_gap = true; // 1 if first run is gap, 0 if first run is normal tag
 
         // Lazy supports for run_starts
         mutable sdsl::sd_vector<>::rank_1_type run_rank_support;
