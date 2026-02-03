@@ -335,12 +335,16 @@ void extract_tags_batch(const FastLocate &r_index, FileReader &reader, size_t th
     if (index == last_run_index){
 
         std::cerr << "hit last run" << std::endl;
-        int last_run_size = r_index.last_run_size_global();
-
+        // Compute last run length from BWT size so it's correct even when last run spans blocks
+        // (last_run_size_global() only returns the last run in the last block, which can undercount)
+        size_t last_run_start_bwt = 0;
+        size_t last_run_id_dummy = 0;
+        r_index.run_id_and_offset_at(r_index.get_sequence_size() - 1, last_run_id_dummy, last_run_start_bwt);
+        size_t last_run_size = r_index.get_sequence_size() - last_run_start_bwt;
 
             // have to just traverse the last run
             std::cerr << "LAST RUN size " << last_run_size << std::endl;
-            for (int i = 0; i < last_run_size; i++){
+            for (size_t i = 0; i < last_run_size; i++){
                 std::cerr << "last run _ index " << index << std::endl;
                 auto seq_id = r_index.seqId(index);
                 // want to get the file number that is associated with the seq id

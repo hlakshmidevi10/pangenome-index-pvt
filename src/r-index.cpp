@@ -1037,9 +1037,9 @@ namespace panindexer {
 
         std::cerr << "endmarker runs size " << endmarker_runs.size() << std::endl;
 //        // printing the endmarker runs
-//        for (size_t i = 0; i < endmarker_runs.size(); i++) {
-//            std::cerr << endmarker_runs[i] << " ";
-//        }
+       for (size_t i = 0; i < endmarker_runs.size(); i++) {
+           std::cerr << endmarker_runs[i] << " ";
+       }
 
 
         // Extract the samples from each sequence.

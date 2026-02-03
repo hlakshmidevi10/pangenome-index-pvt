@@ -148,20 +148,12 @@ int main(int argc, char** argv) {
         gbwt::size_type decc = gbwt::ByteCode::read(encoded_bytes, loc);
         auto decoded = TagArray::decode_run(decc);
         
-        // Skip runs with node_id=0 from input file (endmarkers are handled separately via --num-seq)
-        // The graph shouldn't have node_id=0, so any runs with node_id=0 in input are likely endmarkers
-        // that should be skipped since we prepend them separately
+        // Skip only pure endmarker runs (node_id=0, offset=0, is_rev=0); they are handled via --num-seq.
+        // Runs with node_id=0 but non-zero offset/is_rev are kept as normal runs (e.g. gaps or special encoding).
         uint64_t nid = gbwtgraph::id(decoded.first);
         if (nid == 0) {
-            // Warn if it's not a pure endmarker (offset=0, is_rev=0)
-            if (gbwtgraph::offset(decoded.first) != 0 || gbwtgraph::is_rev(decoded.first)) {
-                cerr << "WARNING: Skipping run with node_id=0 but non-zero offset/is_rev: "
-                     << "offset=" << gbwtgraph::offset(decoded.first) << ", "
-                     << "is_rev=" << gbwtgraph::is_rev(decoded.first) << ", "
-                     << "length=" << decoded.second << endl;
-            }
-            // Skip all runs with node_id=0 from input
-            continue;
+            std::cerr << "Skipping pure endmarker run: " << decoded.first << " " << decoded.second << std::endl;
+            continue;  // pure endmarker, skip (we prepend endmarkers via --num-seq)
         }
         
         run_count++;
@@ -291,35 +283,69 @@ int main(int argc, char** argv) {
                 matches = false;
             }
 
-            // Compare actual run data using for_each_run_compact
-            if (matches) {
-                std::vector<std::pair<pos_t, uint64_t>> converted_runs, merge_runs;
-                converted_array.for_each_run_compact([&](pos_t p, uint64_t len) {
-                    converted_runs.push_back({p, len});
-                });
-                merge_array.for_each_run_compact([&](pos_t p, uint64_t len) {
-                    merge_runs.push_back({p, len});
-                });
+            // Compare actual run data using for_each_run_compact (always collect and compare)
+            std::vector<std::pair<pos_t, uint64_t>> converted_runs, merge_runs;
+            converted_array.for_each_run_compact([&](pos_t p, uint64_t len) {
+                converted_runs.push_back({p, len});
+            });
+            merge_array.for_each_run_compact([&](pos_t p, uint64_t len) {
+                merge_runs.push_back({p, len});
+            });
 
-                if (converted_runs.size() != merge_runs.size()) {
-                    cerr << "✗ MISMATCH: Run count from iteration differs: " 
-                         << converted_runs.size() << " vs " << merge_runs.size() << endl;
+            if (converted_runs.size() != merge_runs.size()) {
+                cerr << "✗ MISMATCH: Run count from iteration differs: "
+                     << converted_runs.size() << " vs " << merge_runs.size() << endl;
+                matches = false;
+            }
+
+            // Compare runs at each index (up to min size) and print differing runs
+            const size_t max_print = 100;
+            size_t diff_count = 0;
+            size_t compare_len = (converted_runs.size() < merge_runs.size())
+                ? converted_runs.size() : merge_runs.size();
+            for (size_t i = 0; i < compare_len; ++i) {
+                const auto& conv = converted_runs[i];
+                const auto& merg = merge_runs[i];
+                if (conv.first != merg.first || conv.second != merg.second) {
                     matches = false;
-                } else {
-                    size_t diff_count = 0;
-                    for (size_t i = 0; i < converted_runs.size() && diff_count < 10; ++i) {
-                        if (converted_runs[i].first != merge_runs[i].first || 
-                            converted_runs[i].second != merge_runs[i].second) {
-                            cerr << "✗ MISMATCH: Run " << i << " differs: " 
-                                 << "pos=" << converted_runs[i].first << " len=" << converted_runs[i].second
-                                 << " vs pos=" << merge_runs[i].first << " len=" << merge_runs[i].second << endl;
-                            matches = false;
-                            diff_count++;
-                        }
+                    diff_count++;
+                    if (diff_count <= max_print) {
+                        cerr << "✗ Run " << i << " differs:\n"
+                             << "    converted: node_id=" << gbwtgraph::id(conv.first)
+                             << " is_rev=" << gbwtgraph::is_rev(conv.first)
+                             << " offset=" << gbwtgraph::offset(conv.first)
+                             << " len=" << conv.second << "\n"
+                             << "    merge:     node_id=" << gbwtgraph::id(merg.first)
+                             << " is_rev=" << gbwtgraph::is_rev(merg.first)
+                             << " offset=" << gbwtgraph::offset(merg.first)
+                             << " len=" << merg.second << endl;
                     }
-                    if (diff_count >= 10) {
-                        cerr << "  (stopped after 10 differences)" << endl;
-                    }
+                }
+            }
+            if (diff_count > 0) {
+                cerr << "  Total differing runs (in comparable range): " << diff_count;
+                if (diff_count > max_print) {
+                    cerr << " (printed first " << max_print << ")";
+                }
+                cerr << endl;
+            }
+            if (converted_runs.size() != merge_runs.size()) {
+                size_t extra = (converted_runs.size() > merge_runs.size())
+                    ? (converted_runs.size() - merge_runs.size()) : (merge_runs.size() - converted_runs.size());
+                size_t end_idx = (converted_runs.size() > merge_runs.size() ? converted_runs.size() : merge_runs.size()) - 1;
+                cerr << "  " << (converted_runs.size() > merge_runs.size() ? "Converted" : "Merge")
+                     << " has " << extra << " extra run(s) (indices " << compare_len << ".." << end_idx << ")" << endl;
+                // Print first few extra runs
+                size_t from = compare_len;
+                size_t to = (converted_runs.size() > merge_runs.size()) ? converted_runs.size() : merge_runs.size();
+                for (size_t i = from; i < to && (i - from) < 5; ++i) {
+                    const auto& r = (converted_runs.size() > merge_runs.size()) ? converted_runs[i] : merge_runs[i];
+                    cerr << "    run[" << i << "]: node_id=" << gbwtgraph::id(r.first)
+                         << " is_rev=" << gbwtgraph::is_rev(r.first)
+                         << " offset=" << gbwtgraph::offset(r.first) << " len=" << r.second << endl;
+                }
+                if (to - from > 5) {
+                    cerr << "    ... and " << (to - from - 5) << " more" << endl;
                 }
             }
 

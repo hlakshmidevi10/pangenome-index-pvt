@@ -2,12 +2,16 @@
 // Created by seeskand on 3/4/25.
 //
 
-
 #include "pangenome_index/r-index.hpp"
 #include "pangenome_index/algorithm.hpp"
 #include "pangenome_index/tag_arrays.hpp"
+#include "pangenome_index/sampled_tag_array.hpp"
 #include <gbwtgraph/utils.h>
+#include <gbwt/gbwt.h>
+#include <gbwtgraph/gbwtgraph.h>
+#include <gbwtgraph/gbz.h>
 #include <iostream>
+#include <fstream>
 #include <filesystem>
 #include <omp.h>
 #include <mutex>
@@ -15,6 +19,8 @@
 #include <thread>
 #include <utility>
 #include <stdexcept>
+#include <string>
+#include <cstring>
 
 
 #ifndef TIME
@@ -305,7 +311,258 @@ std::vector <std::string> get_files_in_dir(const std::string &directoryPath) {
     return files;
 }
 
+// --- Verify sampled tag array against GBWT path ---
+// Decode tag code to (node_id, is_rev) using same convention as SampledTagArray::encode_value
+static std::pair<int64_t, bool> decode_tag(uint64_t tag_code) {
+    uint64_t decoded = tag_code - 1;
+    int64_t node_id = (decoded >> 1) + 1;
+    bool is_rev = (decoded & 1) != 0;
+    return {node_id, is_rev};
+}
+
+// Recover packed text position at a given BWT position using r-index (locate).
+static size_t recover_text_pos_from_bwt(panindexer::FastLocate& r_index, size_t bwt_pos) {
+    size_t run_id = 0, bwt_run_start = 0;
+    r_index.run_id_and_offset_at(bwt_pos, run_id, bwt_run_start);
+    size_t packed = r_index.getSample(run_id);
+    for (size_t k = bwt_run_start; k < bwt_pos; ++k) {
+        packed = r_index.locateNext(packed);
+    }
+    return packed;
+}
+
+// Get BWT position for a given packed text position using last_successor + LF backwards
+static bool text_pos_to_bwt_pos(panindexer::FastLocate& r_index, size_t text_pos,
+                                size_t seq_end_text_pos, size_t& out_bwt_pos) {
+    r_index.ensure_last_rank();
+    r_index.ensure_last_select();
+    auto successor_result = r_index.last_successor(text_pos);
+    size_t text_pos_x = successor_result.first;
+    size_t rank_x = successor_result.second;
+    if (rank_x >= r_index.last_to_run.size()) {
+        return false;
+    }
+    if (text_pos_x > seq_end_text_pos) {
+        return false;  // beyond sequence end
+    }
+    size_t run_id = r_index.last_to_run[rank_x];
+    size_t current_bwt_pos = r_index.bwt_end_position_of_run(run_id);
+    size_t current_text_pos = text_pos_x;
+    while (current_text_pos > text_pos) {
+        current_text_pos--;
+        current_bwt_pos = r_index.LF(current_bwt_pos);
+    }
+    out_bwt_pos = current_bwt_pos;
+    return true;
+}
+
+// Verify sampled tag array by traversing a GBWT path from the start and comparing
+// the tag at each (seq_id, base_offset) with the node on the path at that offset.
+static int verify_sampled_against_gbwt(const std::string& r_index_file,
+                                       const std::string& sampled_tags_file,
+                                       const std::string& gbwt_index_file,
+                                       const std::string& gbz_file,
+                                       size_t path_id,
+                                       size_t sample_every) {
+    using namespace panindexer;
+    std::cerr << "Loading RLBWT r-index: " << r_index_file << std::endl;
+    FastLocate r_index;
+    {
+        std::ifstream rin(r_index_file, std::ios::binary);
+        if (!rin) {
+            std::cerr << "Cannot open r-index file: " << r_index_file << std::endl;
+            return 1;
+        }
+        r_index.load_encoded(rin);
+    }
+    std::cerr << "Loading sampled tag array: " << sampled_tags_file << std::endl;
+    SampledTagArray sampled;
+    {
+        std::ifstream sin(sampled_tags_file, std::ios::binary);
+        if (!sin) {
+            std::cerr << "Cannot open sampled tags file: " << sampled_tags_file << std::endl;
+            return 1;
+        }
+        sampled.load(sin);
+    }
+    size_t rindex_bwt_size = r_index.bwt_size();
+    size_t sampled_bwt_size = (sampled.run_starts().size() > 0) ? (sampled.run_starts().size() - 1) : 0;
+    if (rindex_bwt_size != sampled_bwt_size) {
+        std::cerr << "WARNING: RLBWT BWT size (" << rindex_bwt_size
+                  << ") != sampled tag array BWT size (" << sampled_bwt_size
+                  << "). Verification may be wrong." << std::endl;
+    }
+    std::cerr << "Loading GBWT index: " << gbwt_index_file << std::endl;
+    gbwt::GBWT gbwt_index;
+    {
+        std::ifstream gin(gbwt_index_file, std::ios::binary);
+        if (!gin) {
+            std::cerr << "Cannot open GBWT index: " << gbwt_index_file << std::endl;
+            return 1;
+        }
+        sdsl::load_from_file(gbwt_index, gbwt_index_file);
+    }
+    std::cerr << "Loading GBZ (graph): " << gbz_file << std::endl;
+    gbwtgraph::GBZ gbz;
+    sdsl::simple_sds::load_from(gbz, gbz_file);
+    const gbwtgraph::GBWTGraph& graph = gbz.graph;
+
+    gbwt::vector_type path = gbwt_index.extract(gbwt::Path::encode(path_id, false));
+    if (path.empty()) {
+        std::cerr << "Path " << path_id << " not found in GBWT." << std::endl;
+        return 1;
+    }
+    size_t path_length_bases = 0;
+    for (gbwt::node_type node : path) {
+        if (node == gbwt::ENDMARKER) break;
+        path_length_bases += graph.get_length(
+            graph.get_handle(gbwt::Node::id(node), gbwt::Node::is_reverse(node)));
+    }
+    std::cerr << "Path " << path_id << " has " << path.size() << " nodes, "
+              << path_length_bases << " bases." << std::endl;
+
+    // Sequence in RLBWT: assume path_id in GBWT corresponds to seq_id in RLBWT
+    size_t seq_id = path_id;
+    size_t seq_end_text_pos = r_index.pack(seq_id, path_length_bases);
+    if (seq_end_text_pos > r_index.bwt_size()) {
+        std::cerr << "Path length exceeds RLBWT sequence length; is seq_id correct?" << std::endl;
+    }
+    sampled.ensure_run_rank();
+    sampled.ensure_run_select();
+    const auto& wm = sampled.values();
+    bool first_run_is_gap = sampled.is_first_run_gap();
+
+    size_t cumulative_bases = 0;
+    size_t node_index = 0;
+    size_t checked = 0;
+    size_t mismatches = 0;
+    for (gbwt::node_type node : path) {
+        if (node == gbwt::ENDMARKER) break;
+        int64_t node_id = gbwt::Node::id(node);
+        bool node_rev = gbwt::Node::is_reverse(node);
+        gbwtgraph::handle_t handle = graph.get_handle(node_id, node_rev);
+        size_t node_len = graph.get_length(handle);
+        uint64_t expected_tag = SampledTagArray::encode_value(node_id, node_rev);
+
+        // For this GBWT node, find all runs in the sampled tag array with this tag
+        {
+            size_t total_occ = wm.rank(wm.size(), expected_tag);
+            std::cerr << "  [node_index=" << node_index << " node_id=" << node_id << " rev=" << node_rev
+                      << " tag=" << expected_tag << "] In sampled tag array: " << total_occ << " run(s) with this tag:";
+            if (total_occ == 0) {
+                std::cerr << " (none)" << std::endl;
+            } else {
+                std::cerr << std::endl;
+                for (size_t j = 1; j <= total_occ; ++j) {
+                    size_t tag_run_id = wm.select(j, expected_tag);  // 0-based index in non-gap runs
+                    size_t bwt_run_id = 2 * tag_run_id + 1 - static_cast<size_t>(first_run_is_gap);
+                    auto span = sampled.run_span(bwt_run_id);
+                    std::cerr << "      run " << j << "/" << total_occ << ": bwt_run_id=" << bwt_run_id
+                              << "  BWT [" << span.first << ", " << span.second << "]"
+                              << " (length " << (span.second - span.first + 1) << ")";
+                    // Locate BWT start and end to get text positions (seq_id, offset)
+                    if (span.first < r_index.bwt_size()) {
+                        size_t packed_start = recover_text_pos_from_bwt(r_index, span.first);
+                        auto [seq_start, offset_start] = r_index.unpack(packed_start);
+                        std::cerr << "  text@start: packed=" << packed_start << " seq_id=" << seq_start << " offset=" << offset_start;
+                        if (span.second < r_index.bwt_size() && span.second != span.first) {
+                            size_t packed_end = recover_text_pos_from_bwt(r_index, span.second);
+                            auto [seq_end, offset_end] = r_index.unpack(packed_end);
+                            std::cerr << "  text@end: packed=" << packed_end << " seq_id=" << seq_end << " offset=" << offset_end;
+                        }
+                    }
+                    std::cerr << std::endl;
+                }
+            }
+        }
+
+        for (size_t off_in_node = 0; off_in_node < node_len; off_in_node += sample_every) {
+            size_t base_offset = cumulative_bases + off_in_node;
+            size_t text_pos = r_index.pack(seq_id, base_offset);
+            size_t bwt_pos = 0;
+            if (!text_pos_to_bwt_pos(r_index, text_pos, seq_end_text_pos, bwt_pos)) {
+                std::cerr << "  Skip base_offset=" << base_offset << " (could not get BWT position)" << std::endl;
+                continue;
+            }
+            size_t run_id = sampled.run_id_at(bwt_pos);
+            uint64_t tag_val = sampled.run_value(run_id);
+            checked++;
+            bool match = (tag_val == expected_tag);
+            if (!match) mismatches++;
+
+            // Print only at the beginning of each node (first base of the node)
+            if (off_in_node == 0) {
+                size_t packed_at = recover_text_pos_from_bwt(r_index, bwt_pos);
+                auto [seq_id_at, offset_at] = r_index.unpack(packed_at);
+                std::cerr << "  base_offset=" << base_offset
+                          << " bwt_pos=" << bwt_pos
+                          << " text: packed=" << packed_at << " seq_id=" << seq_id_at << " offset=" << offset_at;
+                if (seq_id_at != path_id || offset_at != base_offset) {
+                    std::cerr << " [expected seq_id=" << path_id << " offset=" << base_offset << "]";
+                }
+                std::cerr << "  node_index=" << node_index
+                          << " expected: node_id=" << node_id << " rev=" << node_rev << " tag=" << expected_tag;
+                if (tag_val == 0) {
+                    std::cerr << "  sampled: gap (tag=0)";
+                } else {
+                    auto [got_id, got_rev] = decode_tag(tag_val);
+                    std::cerr << "  sampled: tag=" << tag_val << " node_id=" << got_id << " rev=" << got_rev;
+                }
+                std::cerr << "  " << (match ? "OK" : "MISMATCH") << std::endl;
+            }
+        }
+        cumulative_bases += node_len;
+        node_index++;
+    }
+    std::cerr << "Verification done: " << checked << " positions checked, "
+              << mismatches << " mismatches." << std::endl;
+    return mismatches > 0 ? 1 : 0;
+}
+
+static void usage_verify(const char* prog) {
+    std::cerr << "Usage: " << prog << " --verify-sampled <r_index.ri> <sampled.tags> --gbwt-index <graph.gbwt> --gbz <graph.gbz> [options]\n"
+              << "  Verify that the sampled tag array matches the GBWT path by traversing from the start.\n"
+              << "Options:\n"
+              << "  --path-id N       GBWT path/sequence ID to traverse (default: 0)\n"
+              << "  --sample-every N  Check every N bases along the path (default: 1)\n" << std::endl;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && std::strcmp(argv[1], "--verify-sampled") == 0) {
+        std::string r_index_file;
+        std::string sampled_tags_file;
+        std::string gbwt_index_file;
+        std::string gbz_file;
+        size_t path_id = 0;
+        size_t sample_every = 1;
+        for (int i = 2; i < argc; i++) {
+            if (std::strcmp(argv[i], "--gbwt-index") == 0 && i + 1 < argc) {
+                gbwt_index_file = argv[++i];
+            } else if (std::strcmp(argv[i], "--gbz") == 0 && i + 1 < argc) {
+                gbz_file = argv[++i];
+            } else if (std::strcmp(argv[i], "--path-id") == 0 && i + 1 < argc) {
+                path_id = static_cast<size_t>(std::stoull(argv[++i]));
+            } else if (std::strcmp(argv[i], "--sample-every") == 0 && i + 1 < argc) {
+                sample_every = static_cast<size_t>(std::stoull(argv[++i]));
+                if (sample_every == 0) sample_every = 1;
+            } else if (argv[i][0] != '-') {
+                if (r_index_file.empty()) r_index_file = argv[i];
+                else if (sampled_tags_file.empty()) sampled_tags_file = argv[i];
+            }
+        }
+        if (r_index_file.empty() || sampled_tags_file.empty() || gbwt_index_file.empty() || gbz_file.empty()) {
+            usage_verify(argv[0]);
+            return 1;
+        }
+        return verify_sampled_against_gbwt(r_index_file, sampled_tags_file,
+                                          gbwt_index_file, gbz_file, path_id, sample_every);
+    }
+
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " <gbz_graph> <r_index.ri> <tag_array_index_dir>\n"
+                  << "   Or: " << argv[0] << " --verify-sampled <r_index.ri> <sampled.tags> --gbwt-index <graph.gbwt> --gbz <graph.gbz> [--path-id N] [--sample-every N]" << std::endl;
+        return 1;
+    }
 
     std::string gbz_graph = std::string(argv[1]);
     std::string r_index_file = std::string(argv[2]);
