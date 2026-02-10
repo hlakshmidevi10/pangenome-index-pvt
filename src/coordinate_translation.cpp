@@ -18,6 +18,7 @@
 #include <map>
 #include <chrono>
 #include <iomanip>
+#include <random>
 
 using namespace std;
 using namespace std::chrono;
@@ -355,27 +356,40 @@ static void usage(const char* prog) {
     cerr << "  Use --source-reverse or --target-reverse to select reverse complement strand" << endl;
     cerr << endl;
     cerr << "Required options:" << endl;
-    cerr << "  --interval START..END   Interval on source haplotype (base offsets)" << endl;
-    cerr << "  --gbwt-index FILE       GBWT index file (.gbwt) for LF mapping" << endl;
-    cerr << "  --gbz FILE              GBZ file (.gbz) for GBWTGraph (node lengths)" << endl;
+    cerr << "  --interval START..END   Interval on source haplotype (base offsets; not required if --benchmark)" << endl;
+    cerr << "  --gbz FILE              GBZ file (.gbz); contains GBWT index + GBWTGraph (required)" << endl;
     cerr << endl;
     cerr << "Other options:" << endl;
+    cerr << "  --benchmark             Run benchmark: translate seq 0->2 at gene/megabase scales (excludes load time)" << endl;
+    cerr << "  --benchmark-intervals L1,L2,...  Comma-separated interval lengths (default: 5000,10000,1000000)" << endl;
     cerr << "  --debug                 Enable debug output" << endl;
     cerr << "  --no-debug              Disable debug output" << endl;
     cerr << endl;
     cerr << "Examples:" << endl;
     cerr << "  # Using direct RLBWT sequence IDs" << endl;
-    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-id 0 --target-id 2 --interval 1000..2000 --gbwt-index graph.gbwt --gbz graph.gbz" << endl;
+    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-id 0 --target-id 2 --interval 1000..2000 --gbz graph.gbz" << endl;
     cerr << endl;
     cerr << "  # Using path names (forward strand)" << endl;
-    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-path-name x --target-path-name y --interval 1000..2000 --gbwt-index graph.gbwt --gbz graph.gbz" << endl;
+    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-path-name x --target-path-name y --interval 1000..2000 --gbz graph.gbz" << endl;
     cerr << endl;
     cerr << "  # Using path names with reverse complement strand for target" << endl;
-    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-path-name x --target-path-name y --target-reverse --interval 1000..2000 --gbwt-index graph.gbwt --gbz graph.gbz" << endl;
+    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-path-name x --target-path-name y --target-reverse --interval 1000..2000 --gbz graph.gbz" << endl;
     cerr << endl;
     cerr << "  # Using metadata" << endl;
     cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-sample HG002 --source-contig chr1 --source-haplotype 1 \\" << endl;
-    cerr << "       --target-sample GRCh38 --target-contig chr1 --interval 1000..2000 --gbwt-index graph.gbwt --gbz graph.gbz" << endl;
+    cerr << "       --target-sample GRCh38 --target-contig chr1 --interval 1000..2000 --gbz graph.gbz" << endl;
+}
+
+// Recover packed text position (SA value) at a given BWT position using r-index.
+// Used to verify that (text_pos, bwt_pos) pairs maintained during LF iteration are correct.
+static size_t recover_text_pos_from_bwt(FastLocate& r_index, size_t bwt_pos) {
+    size_t run_id = 0, bwt_run_start = 0;
+    r_index.run_id_and_offset_at(bwt_pos, run_id, bwt_run_start);
+    size_t packed = r_index.getSample(run_id);
+    for (size_t k = bwt_run_start; k < bwt_pos; ++k) {
+        packed = r_index.locateNext(packed);
+    }
+    return packed;
 }
 
 // Find all tags (nodes) visited by the source haplotype in the given interval
@@ -393,20 +407,35 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
              << "] (text positions [" << text_pos_i << ", " << text_pos_j << "])" << endl;
     }
     
-    // Find successor position on last at or after j
-    r_index.ensure_last_rank();
-    r_index.ensure_last_select();
     
     auto successor_result = r_index.last_successor(text_pos_j);
     size_t text_pos_x = successor_result.first;
     size_t rank_x = successor_result.second;
     
-    size_t run_id = (rank_x < r_index.last_to_run.size()) 
-        ? r_index.last_to_run[rank_x] : 0;
-    size_t bwt_pos_x = r_index.bwt_end_position_of_run(run_id);
-    
+
     if (debug) {
-        cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x 
+        cerr << "rank_x=" << rank_x << ", last_to_run.size()=" << r_index.last_to_run.size() << endl;
+    }
+
+    size_t tot_runs = r_index.tot_runs();
+    size_t run_id = 0;
+    if (rank_x < r_index.last_to_run.size()) {
+        run_id = r_index.last_to_run[rank_x];
+        // last_to_run is int_vector with width = bits for (tot_runs-1); reading into size_t can sign-extend
+        // if the stored value had the high bit set (e.g. corrupt or wrong type during build).
+        if (r_index.last_to_run.width() < 64 && (run_id >> r_index.last_to_run.width()) != 0) {
+            run_id &= (1ULL << r_index.last_to_run.width()) - 1;
+        }
+        if (run_id >= tot_runs) {
+            cerr << "Error: last_to_run[" << rank_x << "]=" << r_index.last_to_run[rank_x]
+                 << " is invalid (tot_runs=" << tot_runs << "). Index may be corrupt or built with a bug." << endl;
+            return tags;
+        }
+    }
+    size_t bwt_pos_x = r_index.bwt_end_position_of_run(run_id);
+
+    if (debug) {
+        cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x
              << ", run_id=" << run_id << ", BWT_pos=" << bwt_pos_x << ")" << endl;
     }
     
@@ -437,9 +466,6 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     }
     
     // Iterate backwards through the interval
-    sampled.ensure_run_rank();
-    sampled.ensure_run_select();
-    
     size_t current_text_pos = text_pos_x;
     size_t current_bwt_pos = bwt_pos_x;
     
@@ -453,6 +479,18 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
         cerr << "    is_first_run_gap=" << sampled.is_first_run_gap() << endl;
     }
     
+    // When debug: pick a few text positions in [text_pos_i, text_pos_j] to verify (text_pos, bwt_pos) correctness
+    unordered_set<size_t> verify_text_positions;
+    if (debug && text_pos_j >= text_pos_i) {
+        const size_t num_verify = 10;
+        for (size_t v = 0; v < num_verify; ++v) {
+            size_t t = text_pos_i + (text_pos_j - text_pos_i) * v / (num_verify > 1 ? num_verify - 1 : 1);
+            if (t >= text_pos_i && t <= text_pos_j) verify_text_positions.insert(t);
+        }
+        cerr << "    BWT<->Text verification: will check " << verify_text_positions.size() 
+             << " positions (recover text_pos from bwt_pos via r-index)" << endl;
+    }
+    
     // Now process the interval itself
     while (current_text_pos >= text_pos_i) {
         if (current_text_pos <= text_pos_j) {
@@ -463,6 +501,14 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
             if (debug) {
                 cerr << "  Text pos " << current_text_pos << " -> BWT pos " << current_bwt_pos 
                      << " -> tag=" << tag_val << " -> run_id=" << sampled_run_id << endl;
+            }
+            
+            // Verify (text_pos, bwt_pos) for a few sample positions: recover text pos from BWT pos
+            if (debug && verify_text_positions.count(current_text_pos)) {
+                size_t recovered = recover_text_pos_from_bwt(r_index, current_bwt_pos);
+                bool ok = (recovered == current_text_pos);
+                cerr << "    [VERIFY] text_pos=" << current_text_pos << " bwt_pos=" << current_bwt_pos
+                     << " -> recovered_text_pos=" << recovered << (ok ? " OK" : " MISMATCH") << endl;
             }
             
             if (tag_val != 0) {
@@ -1081,6 +1127,7 @@ bool check_common_node(
     }
     
     if (source_base_offsets.empty() || target_base_offsets.empty()) {
+        cerr << "  No common nodes found in RLBWT But in GBWT we found both source and target visits" << endl;
         return false;  // Not common to both
     }
     
@@ -1094,11 +1141,27 @@ bool check_common_node(
         // Select largest RLBWT base offset (latest in sequence)
         source_base = source_base_offsets.back();
         target_base = target_base_offsets.back();
+        
+        // Verify: the largest source offset from find_sequences_for_tag should match
+        // the largest offset in tag_info.source_offsets (which came from find_tags_in_interval)
+        if (!tag_info.source_offsets.empty()) {
+            size_t expected_source_base = *max_element(tag_info.source_offsets.begin(), tag_info.source_offsets.end());
+            assert(source_base == expected_source_base && 
+                   "source_base from find_sequences_for_tag doesn't match expected from TagInfo");
+        }
     } else {
         // use_largest_offset = false: FIRST common node
         // Select smallest RLBWT base offset (earliest in sequence)
         source_base = source_base_offsets[0];
         target_base = target_base_offsets[0];
+        
+        // Verify: the smallest source offset from find_sequences_for_tag should match
+        // the smallest offset in tag_info.source_offsets (which came from find_tags_in_interval)
+        if (!tag_info.source_offsets.empty()) {
+            size_t expected_source_base = *min_element(tag_info.source_offsets.begin(), tag_info.source_offsets.end());
+            assert(source_base == expected_source_base && 
+                   "source_base from find_sequences_for_tag doesn't match expected from TagInfo");
+        }
     }
 
     if (debug) {
@@ -1131,25 +1194,17 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
     CommonNodes result;
     result.found = false;
     
-    // Sort tags by their position in the source path (by first base offset, smallest to largest)
-    // This ensures "first" means earliest in the path and "last" means latest in the path
-    vector<TagInfo> sorted_tags = source_tags;
-    sort(sorted_tags.begin(), sorted_tags.end(), 
-         [](const TagInfo& a, const TagInfo& b) {
-             // Sort by first source_offset (base offset), smallest to largest
-             if (a.source_offsets.empty()) return false;
-             if (b.source_offsets.empty()) return true;
-             return a.source_offsets[0] < b.source_offsets[0];
-         });
+    // source_tags is already sorted by source_offsets[0] ascending (earliest in path first)
+    // from find_tags_in_interval, so no need to sort again.
     
     if (debug) {
         cerr << "Finding first and last common nodes (optimized search):" << endl;
-        cerr << "  Total tags: " << sorted_tags.size() << endl;
-        cerr << "  Tags sorted by source base offset:" << endl;
-        for (size_t i = 0; i < sorted_tags.size(); i++) {
-            auto [node_id, is_rev] = decode_tag(sorted_tags[i].tag_code);
-            size_t offset = sorted_tags[i].source_offsets.empty() ? 0 : sorted_tags[i].source_offsets[0];
-            cerr << "    [" << i << "] tag_code=" << sorted_tags[i].tag_code 
+        cerr << "  Total tags: " << source_tags.size() << endl;
+        cerr << "  Tags (already by source base offset):" << endl;
+        for (size_t i = 0; i < source_tags.size(); i++) {
+            auto [node_id, is_rev] = decode_tag(source_tags[i].tag_code);
+            size_t offset = source_tags[i].source_offsets.empty() ? 0 : source_tags[i].source_offsets[0];
+            cerr << "    [" << i << "] tag_code=" << source_tags[i].tag_code 
                  << " (node_id=" << node_id << "), base_offset=" << offset << endl;
         }
     }
@@ -1159,8 +1214,8 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
         cerr << "  Searching for FIRST common node (earliest in path)..." << endl;
     }
     
-    for (size_t i = 0; i < sorted_tags.size(); i++) {
-        const auto& tag_info = sorted_tags[i];
+    for (size_t i = 0; i < source_tags.size(); i++) {
+        const auto& tag_info = source_tags[i];
         size_t source_offset, target_offset, source_base, target_base;
         
         // For first common node: smallest RLBWT offset + largest GBWT offset (both = earliest)
@@ -1200,8 +1255,8 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
         cerr << "  Searching for LAST common node (latest in path)..." << endl;
     }
     
-    for (size_t i = sorted_tags.size(); i > 0; i--) {
-        const auto& tag_info = sorted_tags[i - 1];
+    for (size_t i = source_tags.size(); i > 0; i--) {
+        const auto& tag_info = source_tags[i - 1];
         size_t source_offset, target_offset, source_base, target_base;
         
         // For last common node: largest RLBWT offset + smallest GBWT offset (both = latest)
@@ -1791,8 +1846,9 @@ int main(int argc, char** argv) {
     PathSpec target_spec;
     pair<size_t, size_t> interval = {0, 0};
     bool has_interval = false;
-    string gbwt_index_file = "";
     string gbz_file = "";
+    bool benchmark_mode = false;
+    string benchmark_interval_lengths_str = "";  // e.g. "5000,10000,1000000"
     
     for (int i = 4; i < argc; i++) {
         string arg = argv[i];
@@ -1839,10 +1895,12 @@ int main(int argc, char** argv) {
             source_spec.reverse_strand = true;
         }
         // Other options
-        else if (arg == "--gbwt-index" && i + 1 < argc) {
-            gbwt_index_file = argv[++i];
-        } else if (arg == "--gbz" && i + 1 < argc) {
+        else if (arg == "--gbz" && i + 1 < argc) {
             gbz_file = argv[++i];
+        } else if (arg == "--benchmark") {
+            benchmark_mode = true;
+        } else if (arg == "--benchmark-intervals" && i + 1 < argc) {
+            benchmark_interval_lengths_str = argv[++i];
         } else if (arg == "--debug") {
             debug = true;
         } else if (arg == "--no-debug") {
@@ -1855,6 +1913,11 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+    
+    if (benchmark_mode) {
+        source_spec.seq_id = 0;
+        target_spec.seq_id = 2;
     }
     
     // Validate source specification
@@ -1879,20 +1942,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    if (!has_interval) {
-        cerr << "Error: --interval is required" << endl;
-        usage(argv[0]);
-        return 1;
-    }
-    
-    if (gbwt_index_file.empty()) {
-        cerr << "Error: --gbwt-index is required" << endl;
+    if (!has_interval && !benchmark_mode) {
+        cerr << "Error: --interval is required (unless --benchmark)" << endl;
         usage(argv[0]);
         return 1;
     }
     
     if (gbz_file.empty()) {
-        cerr << "Error: --gbz is required for GBWTGraph (needed for node lengths)" << endl;
+        cerr << "Error: --gbz is required (contains GBWT index + GBWTGraph)" << endl;
         usage(argv[0]);
         return 1;
     }
@@ -1901,6 +1958,7 @@ int main(int argc, char** argv) {
     size_t seq_end = interval.second;
     
     auto start_total = high_resolution_clock::now();
+    (void)start_total;  // used for total-including-load in debug; after load we use start_after_load
     
     // Load RLBWT r-index
     FastLocate rlbwt_rindex;
@@ -1912,27 +1970,24 @@ int main(int argc, char** argv) {
             return 1; 
         }
         rlbwt_rindex.load_encoded(rin);
+        rlbwt_rindex.ensure_last_rank();
+        rlbwt_rindex.ensure_last_select();
     }
     
-    // Load GBWT index - required for LF mapping
-    // Note: FastLocate needs the GBWT index it was built from for LF operations
-    if (debug) cerr << "Loading GBWT index: " << gbwt_index_file << "..." << endl;
-    std::unique_ptr<gbwt::GBWT> gbwt_index_ptr;
+    // Load GBZ (contains GBWT index + GBWTGraph) - required for LF mapping and node lengths
+    if (debug) cerr << "Loading GBZ (GBWT + graph): " << gbz_file << "..." << endl;
+    gbwtgraph::GBZ gbz;
     {
-        ifstream gin_idx(gbwt_index_file, ios::binary);
-        if (!gin_idx) {
-            cerr << "Error: Cannot open GBWT index file: " << gbwt_index_file << endl;
-            return 1;
-        }
         try {
-            gbwt_index_ptr = std::make_unique<gbwt::GBWT>();
-            sdsl::load_from_file(*gbwt_index_ptr, gbwt_index_file);
-            if (debug) cerr << "  GBWT index loaded. Sequences: " << gbwt_index_ptr->sequences() << endl;
+            sdsl::simple_sds::load_from(gbz, gbz_file);
+            if (debug) cerr << "  GBZ loaded. GBWT sequences: " << gbz.index.sequences() << endl;
         } catch (const std::exception& e) {
-            cerr << "Error loading GBWT index: " << e.what() << endl;
+            cerr << "Error loading GBZ file: " << e.what() << endl;
             return 1;
         }
     }
+    const gbwt::GBWT* gbwt_index_ptr = &gbz.index;
+    const gbwtgraph::GBWTGraph& graph = gbz.graph;
     
     // Load GBWT FastLocate (r-index) from .ri file
     if (debug) cerr << "Loading GBWT r-index (FastLocate): " << gbwt_rindex_file << "..." << endl;
@@ -1971,7 +2026,7 @@ int main(int argc, char** argv) {
     // Associate FastLocate with the GBWT index (required for decompressSA and other operations)
     // FastLocate stores a pointer to the GBWT index, which must be set after loading from file
     if (gbwt_index_ptr && gbwt_rindex_ptr) {
-        gbwt_rindex_ptr->setGBWT(*gbwt_index_ptr);
+        gbwt_rindex_ptr->setGBWT(gbz.index);
         if (debug) cerr << "  FastLocate associated with GBWT index" << endl;
     }
     
@@ -1994,6 +2049,10 @@ int main(int argc, char** argv) {
     
     size_t source_seq_id = source_spec.seq_id;
     size_t target_seq_id = target_spec.seq_id;
+    if (benchmark_mode) {
+        source_seq_id = 0;
+        target_seq_id = 2;
+    }
     
     if (debug) {
         cerr << "Resolved sequence IDs:" << endl;
@@ -2018,20 +2077,6 @@ int main(int argc, char** argv) {
         cerr << endl;
     }
     
-    // Load GBWTGraph from GBZ file (required for node lengths to convert base/node offsets)
-    if (debug) cerr << "Loading GBWTGraph from GBZ: " << gbz_file << "..." << endl;
-    gbwtgraph::GBZ gbz;
-    {
-        try {
-            sdsl::simple_sds::load_from(gbz, gbz_file);
-            if (debug) cerr << "  GBWTGraph loaded successfully" << endl;
-        } catch (const std::exception& e) {
-            cerr << "Error loading GBZ file: " << e.what() << endl;
-            return 1;
-        }
-    }
-    const gbwtgraph::GBWTGraph& graph = gbz.graph;
-    
     // Load sampled tag array
     SampledTagArray sampled;
     {
@@ -2042,6 +2087,8 @@ int main(int argc, char** argv) {
             return 1; 
         }
         sampled.load(sin);
+        sampled.ensure_run_rank();
+        sampled.ensure_run_select();
     }
     
     if (debug) {
@@ -2055,6 +2102,66 @@ int main(int argc, char** argv) {
         cerr << "=====================================\n" << endl;
     }
     
+    auto start_after_load = high_resolution_clock::now();
+    
+    // Benchmark mode: run translation at gene and megabase scales (excluding load time)
+    if (benchmark_mode) {
+        vector<size_t> lengths;
+        if (!benchmark_interval_lengths_str.empty()) {
+            string s = benchmark_interval_lengths_str;
+            for (size_t i = 0; i < s.size(); ) {
+                size_t j = s.find(',', i);
+                if (j == string::npos) j = s.size();
+                string part = s.substr(i, j - i);
+                if (!part.empty()) lengths.push_back(stoull(part));
+                i = j + (j < s.size() ? 1 : 0);
+            }
+        }
+        if (lengths.empty()) {
+            lengths = { 5000, 10000, 1000000 };  // gene scale (5kb, 10kb), megabase (1Mb)
+        }
+        const int num_runs_per_interval = 5;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<size_t> dist(100000, 100000000);
+        cout << "scale\tinterval_len\trun\tnum_tags\tfind_tags_ms\tfind_common_ms\ttrace_gbwt_ms\ttotal_ms" << endl;
+        for (size_t L : lengths) {
+            for (int run_id = 0; run_id < num_runs_per_interval; run_id++) {
+                size_t run_start = dist(gen);
+                size_t run_end = run_start + L;
+                auto t0 = high_resolution_clock::now();
+                vector<TagInfo> run_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, run_start, run_end);
+                auto t1 = high_resolution_clock::now();
+                if (run_tags.empty()) {
+                    cerr << "Benchmark: no tags in interval [" << run_start << "," << run_end << "), skipping" << endl;
+                    continue;
+                }
+                CommonNodes run_common;
+                if (gbwt_index_ptr && gbwt_rindex_ptr) {
+                    run_common = find_first_and_last_common_nodes_gbwt(*gbwt_rindex_ptr, rlbwt_rindex, sampled, run_tags, source_seq_id, target_seq_id);
+                }
+                auto t2 = high_resolution_clock::now();
+                vector<TranslationResult> run_translations;
+                if (run_common.found && gbwt_index_ptr && gbwt_rindex_ptr) {
+                    run_translations = trace_coordinates_gbwt(
+                        *gbwt_index_ptr, *gbwt_rindex_ptr, graph, source_seq_id, run_start, run_end,
+                        target_seq_id, run_common.first_source_offset, run_common.first_target_offset,
+                        run_common.first_source_base, run_common.first_target_base, run_common.first_tag_code,
+                        run_common.last_source_base, run_common.last_target_base, run_common.last_tag_code);
+                }
+                auto t3 = high_resolution_clock::now();
+                auto d_find = duration_cast<milliseconds>(t1 - t0).count();
+                auto d_common = duration_cast<milliseconds>(t2 - t1).count();
+                auto d_trace = duration_cast<milliseconds>(t3 - t2).count();
+                auto d_total = duration_cast<milliseconds>(t3 - t0).count();
+                string scale = (L >= 1000000) ? "megabase" : "gene";
+                cout << scale << "\t" << L << "\t" << (run_id + 1) << "\t" << run_tags.size() << "\t"
+                     << d_find << "\t" << d_common << "\t" << d_trace << "\t" << d_total << endl;
+            }
+        }
+        return 0;
+    }
+    
     // Step 1: Find all tags in source interval (using RLBWT r-index)
     auto start_find_tags = high_resolution_clock::now();
     vector<TagInfo> source_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, seq_start, seq_end);
@@ -2064,6 +2171,41 @@ int main(int argc, char** argv) {
     if (source_tags.empty()) {
         cerr << "No tags found in source interval" << endl;
         return 1;
+    }
+    
+    // Verification: traverse main GBWT index on source sequence to find nodes in the interval
+    if (debug && gbwt_index_ptr) {
+        cerr << "\n========== Verification: nodes in source interval (from GBWT traversal) ==========" << endl;
+        cerr << "Source path seq_id=" << source_seq_id << ", interval [" << seq_start << ", " << seq_end << ")" << endl;
+        gbwt::vector_type path = gbwt_index_ptr->extract(gbwt::Path::encode(source_seq_id, false));
+        if (path.empty()) {
+            cerr << "  Warning: Source path not found in GBWT" << endl;
+        } else {
+            size_t cumulative_bases = 0;
+            size_t node_offset = 0;
+            for (gbwt::node_type node : path) {
+                if (node == gbwt::ENDMARKER) break;
+                int64_t node_id = gbwt::Node::id(node);
+                bool node_rev = gbwt::Node::is_reverse(node);
+                gbwtgraph::handle_t handle = graph.get_handle(node_id, node_rev);
+                size_t node_len = graph.get_length(handle);
+                size_t node_base_start = cumulative_bases;
+                size_t node_base_end = cumulative_bases + node_len;
+                // Node overlaps [seq_start, seq_end) iff [node_base_start, node_base_end) overlaps
+                bool in_interval = (node_base_start < seq_end && node_base_end > seq_start);
+                if (in_interval) {
+                    cerr << "  node_offset=" << node_offset
+                         << " node_id=" << node_id
+                         << " rev=" << node_rev
+                         << " base_range=[" << node_base_start << "," << node_base_end << ")"
+                         << endl;
+                }
+                cumulative_bases += node_len;
+                node_offset++;
+            }
+            cerr << "  (end of path traversal)" << endl;
+        }
+        cerr << "==================================================================================" << endl << endl;
     }
     
     // Step 2: Find first and last common nodes with target haplotype using GBWT FastLocate
@@ -2096,6 +2238,339 @@ int main(int argc, char** argv) {
     size_t last_common_source_base = common_nodes.last_source_base;
     size_t last_common_target_base = common_nodes.last_target_base;
     uint64_t last_common_tag_code = common_nodes.last_tag_code;
+    
+    // ========== DEBUG: Verify anchor positions by traversing from start ==========
+    // NOTE: GBWT seqOffset is counted from the END of the path (distance to end),
+    // not from the start. We traverse from start and then convert.
+    if (debug && gbwt_index_ptr) {
+        cerr << "\n========== VERIFICATION: Traversing paths from start ==========" << endl;
+        cerr << "NOTE: GBWT seqOffset = distance from END (larger = closer to start)" << endl;
+        
+        // Decode anchor tag to get node_id
+        auto [anchor_node_id, anchor_is_rev] = decode_tag(anchor_tag_code);
+        gbwt::node_type anchor_gbwt_node = gbwt::Node::encode(anchor_node_id, anchor_is_rev);
+        
+        auto [last_node_id, last_is_rev] = decode_tag(last_common_tag_code);
+        gbwt::node_type last_gbwt_node = gbwt::Node::encode(last_node_id, last_is_rev);
+        
+        cerr << "First common node (anchor): tag_code=" << anchor_tag_code 
+             << " (node_id=" << anchor_node_id << ", is_rev=" << anchor_is_rev << ")" << endl;
+        cerr << "  Expected source: node_offset_from_end=" << anchor_source_offset << ", base_offset=" << anchor_source_base << endl;
+        cerr << "  Expected target: node_offset_from_end=" << anchor_target_offset << ", base_offset=" << anchor_target_base << endl;
+        
+        cerr << "Last common node: tag_code=" << last_common_tag_code 
+             << " (node_id=" << last_node_id << ", is_rev=" << last_is_rev << ")" << endl;
+        cerr << "  Expected source: node_offset_from_end=" << last_common_source_offset << ", base_offset=" << last_common_source_base << endl;
+        cerr << "  Expected target: node_offset_from_end=" << last_common_target_offset << ", base_offset=" << last_common_target_base << endl;
+        
+        // Traverse SOURCE path from start
+        cerr << "\n--- Traversing SOURCE path (seq_id=" << source_seq_id << ") from start ---" << endl;
+        gbwt::edge_type src_pos = gbwt_index_ptr->start(source_seq_id);
+        size_t src_node_idx = 0;
+        size_t src_base_offset_calc = 0;
+        bool found_anchor_in_source = false;
+        bool found_last_in_source = false;
+        size_t anchor_src_node_idx_calc = 0;
+        size_t anchor_src_base_calc = 0;
+        size_t last_src_node_idx_calc = 0;
+        size_t last_src_base_calc = 0;
+        
+        while (src_pos.first != gbwt::ENDMARKER) {
+            gbwt::node_type curr_node = src_pos.first;
+            int64_t curr_id = gbwt::Node::id(curr_node);
+            bool curr_rev = gbwt::Node::is_reverse(curr_node);
+            
+            gbwtgraph::handle_t curr_handle = graph.get_handle(curr_id, curr_rev);
+            size_t curr_len = graph.get_length(curr_handle);
+            
+            // Check if this is the anchor node
+            if (curr_node == anchor_gbwt_node && !found_anchor_in_source) {
+                found_anchor_in_source = true;
+                anchor_src_node_idx_calc = src_node_idx;
+                anchor_src_base_calc = src_base_offset_calc;
+                cerr << "  FOUND ANCHOR at node_idx=" << src_node_idx 
+                     << ", base_offset=" << src_base_offset_calc 
+                     << " (node_id=" << curr_id << ", len=" << curr_len << ")" << endl;
+            }
+            
+            // Check if this is the last common node
+            if (curr_node == last_gbwt_node) {
+                found_last_in_source = true;
+                last_src_node_idx_calc = src_node_idx;
+                last_src_base_calc = src_base_offset_calc;
+                cerr << "  FOUND LAST at node_idx=" << src_node_idx 
+                     << ", base_offset=" << src_base_offset_calc 
+                     << " (node_id=" << curr_id << ", len=" << curr_len << ")" << endl;
+            }
+            
+            // Move to next node
+            src_base_offset_calc += curr_len;
+            src_node_idx++;
+            src_pos = gbwt_index_ptr->LF(src_pos);
+            
+            // Limit output for very long paths
+            if (src_node_idx > 10000000) {
+                cerr << "  (stopped after 10M nodes)" << endl;
+                break;
+            }
+        }
+        
+        size_t src_total_nodes = src_node_idx;
+        cerr << "  Source path total: " << src_total_nodes << " nodes, " << src_base_offset_calc << " bases" << endl;
+        
+        // GBWT seqOffset is from the END of the path, so convert:
+        // offset_from_end = (total_nodes - 1) - offset_from_start
+        if (found_anchor_in_source) {
+            size_t anchor_src_offset_from_end = (src_total_nodes - 1) - anchor_src_node_idx_calc;
+            cerr << "  ANCHOR verification:" << endl;
+            cerr << "    Node offset from START (calculated): " << anchor_src_node_idx_calc << endl;
+            cerr << "    Node offset from END (converted):    " << anchor_src_offset_from_end << endl;
+            cerr << "    Expected (GBWT seqOffset from END):  " << anchor_source_offset 
+                 << (anchor_source_offset == anchor_src_offset_from_end ? " ✓" : " ✗ MISMATCH!") << endl;
+            cerr << "    Base offset: expected=" << anchor_source_base << ", calculated=" << anchor_src_base_calc 
+                 << (anchor_source_base == anchor_src_base_calc ? " ✓" : " ✗ MISMATCH!") << endl;
+        } else {
+            cerr << "  WARNING: Anchor node NOT FOUND in source path!" << endl;
+        }
+        
+        if (found_last_in_source) {
+            size_t last_src_offset_from_end = (src_total_nodes - 1) - last_src_node_idx_calc;
+            cerr << "  LAST verification:" << endl;
+            cerr << "    Node offset from START (calculated): " << last_src_node_idx_calc << endl;
+            cerr << "    Node offset from END (converted):    " << last_src_offset_from_end << endl;
+            cerr << "    Expected (GBWT seqOffset from END):  " << last_common_source_offset 
+                 << (last_common_source_offset == last_src_offset_from_end ? " ✓" : " ✗ MISMATCH!") << endl;
+            cerr << "    Base offset: expected=" << last_common_source_base << ", calculated=" << last_src_base_calc 
+                 << (last_common_source_base == last_src_base_calc ? " ✓" : " ✗ MISMATCH!") << endl;
+        } else {
+            cerr << "  WARNING: Last common node NOT FOUND in source path!" << endl;
+        }
+        
+        // ========== Print first 8000 bases of SOURCE path with node details ==========
+        cerr << "\n--- SOURCE path: First 8000 bases (node by node) ---" << endl;
+        cerr << "Format: [node_idx] node_id (rev?) len=X | base_range: start..end | seq: SEQUENCE" << endl;
+        
+        gbwt::edge_type src_detail_pos = gbwt_index_ptr->start(source_seq_id);
+        size_t src_detail_node_idx = 0;
+        size_t src_detail_base_offset = 0;
+        
+        while (src_detail_pos.first != gbwt::ENDMARKER && src_detail_base_offset < 8000) {
+            gbwt::node_type curr_node = src_detail_pos.first;
+            int64_t curr_id = gbwt::Node::id(curr_node);
+            bool curr_rev = gbwt::Node::is_reverse(curr_node);
+            
+            gbwtgraph::handle_t curr_handle = graph.get_handle(curr_id, curr_rev);
+            size_t curr_len = graph.get_length(curr_handle);
+            std::string curr_seq = graph.get_sequence(curr_handle);
+            
+            // Truncate sequence if too long for display
+            std::string display_seq = curr_seq;
+            if (display_seq.length() > 50) {
+                display_seq = display_seq.substr(0, 25) + "..." + display_seq.substr(display_seq.length() - 22);
+            }
+            
+            // Compute tag_code for this node (reverse of decode_tag)
+            // decode_tag: decoded = tag_code - 1; node_id = (decoded >> 1) + 1; is_rev = (decoded & 1)
+            // encode: decoded = ((node_id - 1) << 1) | (is_rev ? 1 : 0); tag_code = decoded + 1
+            uint64_t tag_code = (((curr_id - 1) << 1) | (curr_rev ? 1 : 0)) + 1;
+            
+            cerr << "[" << src_detail_node_idx << "] node_id=" << curr_id 
+                 << (curr_rev ? " (rev)" : "") 
+                 << " len=" << curr_len 
+                 << " | base_range: " << src_detail_base_offset << ".." << (src_detail_base_offset + curr_len - 1)
+                 << " | tag_code=" << tag_code
+                 << " | seq: " << display_seq << endl;
+            
+            // Move to next node
+            src_detail_base_offset += curr_len;
+            src_detail_node_idx++;
+            src_detail_pos = gbwt_index_ptr->LF(src_detail_pos);
+        }
+        
+        cerr << "--- End of first 8000 bases (stopped at base " << src_detail_base_offset << ") ---\n" << endl;
+        
+        // Traverse TARGET path from start
+        cerr << "\n--- Traversing TARGET path (seq_id=" << target_seq_id << ") from start ---" << endl;
+        gbwt::edge_type tgt_pos = gbwt_index_ptr->start(target_seq_id);
+        size_t tgt_node_idx = 0;
+        size_t tgt_base_offset_calc = 0;
+        bool found_anchor_in_target = false;
+        bool found_last_in_target = false;
+        size_t anchor_tgt_node_idx_calc = 0;
+        size_t anchor_tgt_base_calc = 0;
+        size_t last_tgt_node_idx_calc = 0;
+        size_t last_tgt_base_calc = 0;
+        
+        while (tgt_pos.first != gbwt::ENDMARKER) {
+            gbwt::node_type curr_node = tgt_pos.first;
+            int64_t curr_id = gbwt::Node::id(curr_node);
+            bool curr_rev = gbwt::Node::is_reverse(curr_node);
+            
+            gbwtgraph::handle_t curr_handle = graph.get_handle(curr_id, curr_rev);
+            size_t curr_len = graph.get_length(curr_handle);
+            
+            // Check if this is the anchor node
+            if (curr_node == anchor_gbwt_node && !found_anchor_in_target) {
+                found_anchor_in_target = true;
+                anchor_tgt_node_idx_calc = tgt_node_idx;
+                anchor_tgt_base_calc = tgt_base_offset_calc;
+                cerr << "  FOUND ANCHOR at node_idx=" << tgt_node_idx 
+                     << ", base_offset=" << tgt_base_offset_calc 
+                     << " (node_id=" << curr_id << ", len=" << curr_len << ")" << endl;
+            }
+            
+            // Check if this is the last common node
+            if (curr_node == last_gbwt_node) {
+                found_last_in_target = true;
+                last_tgt_node_idx_calc = tgt_node_idx;
+                last_tgt_base_calc = tgt_base_offset_calc;
+                cerr << "  FOUND LAST at node_idx=" << tgt_node_idx 
+                     << ", base_offset=" << tgt_base_offset_calc 
+                     << " (node_id=" << curr_id << ", len=" << curr_len << ")" << endl;
+            }
+            
+            // Move to next node
+            tgt_base_offset_calc += curr_len;
+            tgt_node_idx++;
+            tgt_pos = gbwt_index_ptr->LF(tgt_pos);
+            
+            // Limit output for very long paths
+            if (tgt_node_idx > 10000000) {
+                cerr << "  (stopped after 10M nodes)" << endl;
+                break;
+            }
+        }
+        
+        size_t tgt_total_nodes = tgt_node_idx;
+        cerr << "  Target path total: " << tgt_total_nodes << " nodes, " << tgt_base_offset_calc << " bases" << endl;
+        
+        // GBWT seqOffset is from the END of the path, so convert:
+        // offset_from_end = (total_nodes - 1) - offset_from_start
+        if (found_anchor_in_target) {
+            size_t anchor_tgt_offset_from_end = (tgt_total_nodes - 1) - anchor_tgt_node_idx_calc;
+            cerr << "  ANCHOR verification:" << endl;
+            cerr << "    Node offset from START (calculated): " << anchor_tgt_node_idx_calc << endl;
+            cerr << "    Node offset from END (converted):    " << anchor_tgt_offset_from_end << endl;
+            cerr << "    Expected (GBWT seqOffset from END):  " << anchor_target_offset 
+                 << (anchor_target_offset == anchor_tgt_offset_from_end ? " ✓" : " ✗ MISMATCH!") << endl;
+            cerr << "    Base offset: expected=" << anchor_target_base << ", calculated=" << anchor_tgt_base_calc 
+                 << (anchor_target_base == anchor_tgt_base_calc ? " ✓" : " ✗ MISMATCH!") << endl;
+        } else {
+            cerr << "  WARNING: Anchor node NOT FOUND in target path!" << endl;
+        }
+        
+        if (found_last_in_target) {
+            size_t last_tgt_offset_from_end = (tgt_total_nodes - 1) - last_tgt_node_idx_calc;
+            cerr << "  LAST verification:" << endl;
+            cerr << "    Node offset from START (calculated): " << last_tgt_node_idx_calc << endl;
+            cerr << "    Node offset from END (converted):    " << last_tgt_offset_from_end << endl;
+            cerr << "    Expected (GBWT seqOffset from END):  " << last_common_target_offset 
+                 << (last_common_target_offset == last_tgt_offset_from_end ? " ✓" : " ✗ MISMATCH!") << endl;
+            cerr << "    Base offset: expected=" << last_common_target_base << ", calculated=" << last_tgt_base_calc 
+                 << (last_common_target_base == last_tgt_base_calc ? " ✓" : " ✗ MISMATCH!") << endl;
+        } else {
+            cerr << "  WARNING: Last common node NOT FOUND in target path!" << endl;
+        }
+        
+        // ========== Print first 1500 bases of TARGET path with node details ==========
+        cerr << "\n--- TARGET path: First 1500 bases (node by node) ---" << endl;
+        cerr << "Format: [node_idx] node_id (rev?) len=X | base_range: start..end | seq: SEQUENCE" << endl;
+        
+        gbwt::edge_type tgt_detail_pos = gbwt_index_ptr->start(target_seq_id);
+        size_t detail_node_idx = 0;
+        size_t detail_base_offset = 0;
+        
+        while (tgt_detail_pos.first != gbwt::ENDMARKER && detail_base_offset < 1500) {
+            gbwt::node_type curr_node = tgt_detail_pos.first;
+            int64_t curr_id = gbwt::Node::id(curr_node);
+            bool curr_rev = gbwt::Node::is_reverse(curr_node);
+            
+            gbwtgraph::handle_t curr_handle = graph.get_handle(curr_id, curr_rev);
+            size_t curr_len = graph.get_length(curr_handle);
+            std::string curr_seq = graph.get_sequence(curr_handle);
+            
+            // Truncate sequence if too long for display
+            std::string display_seq = curr_seq;
+            if (display_seq.length() > 50) {
+                display_seq = display_seq.substr(0, 25) + "..." + display_seq.substr(display_seq.length() - 22);
+            }
+            
+            cerr << "[" << detail_node_idx << "] node_id=" << curr_id 
+                 << (curr_rev ? " (rev)" : "") 
+                 << " len=" << curr_len 
+                 << " | base_range: " << detail_base_offset << ".." << (detail_base_offset + curr_len - 1)
+                 << " | seq: " << display_seq << endl;
+            
+            // Move to next node
+            detail_base_offset += curr_len;
+            detail_node_idx++;
+            tgt_detail_pos = gbwt_index_ptr->LF(tgt_detail_pos);
+        }
+        
+        cerr << "--- End of first 1500 bases (stopped at base " << detail_base_offset << ") ---\n" << endl;
+        
+        // ========== CRITICAL: Show nodes ACTUALLY in the query interval ==========
+        cerr << "\n--- NODES ACTUALLY IN SOURCE INTERVAL [" << seq_start << ", " << seq_end << "] ---" << endl;
+        cerr << "These are the TAGs that SHOULD have been found by find_tags_in_interval:" << endl;
+        
+        gbwt::edge_type interval_pos = gbwt_index_ptr->start(source_seq_id);
+        size_t interval_node_idx = 0;
+        size_t interval_base_offset = 0;
+        std::vector<uint64_t> actual_tags_in_interval;
+        
+        while (interval_pos.first != gbwt::ENDMARKER) {
+            gbwt::node_type curr_node = interval_pos.first;
+            int64_t curr_id = gbwt::Node::id(curr_node);
+            bool curr_rev = gbwt::Node::is_reverse(curr_node);
+            
+            gbwtgraph::handle_t curr_handle = graph.get_handle(curr_id, curr_rev);
+            size_t curr_len = graph.get_length(curr_handle);
+            
+            // Check if this node overlaps with the query interval
+            size_t node_end = interval_base_offset + curr_len - 1;
+            if (interval_base_offset <= seq_end && node_end >= seq_start) {
+                // This node is in the interval!
+                uint64_t tag_code = ((static_cast<uint64_t>(curr_id) - 1) << 1) | (curr_rev ? 1 : 0);
+                tag_code += 1;  // +1 because 0 is reserved for gaps
+                
+                actual_tags_in_interval.push_back(tag_code);
+                
+                if (actual_tags_in_interval.size() <= 20) {  // Print first 20
+                    cerr << "  [" << interval_node_idx << "] node_id=" << curr_id 
+                         << (curr_rev ? " (rev)" : "")
+                         << " | base_range: " << interval_base_offset << ".." << node_end
+                         << " | tag_code=" << tag_code << endl;
+                }
+            }
+            
+            // Stop if we've passed the interval
+            if (interval_base_offset > seq_end) {
+                break;
+            }
+            
+            interval_base_offset += curr_len;
+            interval_node_idx++;
+            interval_pos = gbwt_index_ptr->LF(interval_pos);
+        }
+        
+        cerr << "Total nodes in interval: " << actual_tags_in_interval.size() << endl;
+        
+        // Compare with TAGs found by find_tags_in_interval
+        cerr << "\n--- COMPARISON: TAGs found vs TAGs that should exist ---" << endl;
+        cerr << "TAGs found by find_tags_in_interval: " << source_tags.size() << endl;
+        for (size_t i = 0; i < std::min(source_tags.size(), (size_t)10); i++) {
+            const auto& tag = source_tags[i];
+            auto [tid, trev] = decode_tag(tag.tag_code);
+            bool found_in_actual = std::find(actual_tags_in_interval.begin(), 
+                                              actual_tags_in_interval.end(), 
+                                              tag.tag_code) != actual_tags_in_interval.end();
+            cerr << "  tag_code=" << tag.tag_code << " (node_id=" << tid << ")"
+                 << (found_in_actual ? " ✓ EXISTS in interval" : " ✗ NOT in interval!") << endl;
+        }
+        
+        cerr << "========== END VERIFICATION ==========\n" << endl;
+    }
+    // ========== END DEBUG ==========
     
     // Step 3: Trace coordinates using GBWT LF mapping
     auto start_trace = high_resolution_clock::now();
@@ -2180,13 +2655,15 @@ int main(int argc, char** argv) {
     
     auto end_total = high_resolution_clock::now();
     auto duration_total = duration_cast<milliseconds>(end_total - start_total);
+    auto duration_excl_load = duration_cast<milliseconds>(end_total - start_after_load);
     
     if (debug) {
         cerr << "\n=== Timing Statistics ===" << endl;
         cerr << "  Find tags in interval: " << duration_find_tags.count() << " ms" << endl;
         cerr << "  Find common node: " << duration_find_common.count() << " ms" << endl;
-        cerr << "  Trace coordinates: " << duration_trace.count() << " ms" << endl;
-        cerr << "  Total time: " << duration_total.count() << " ms" << endl;
+        cerr << "  Trace coordinates (GBWT): " << duration_trace.count() << " ms" << endl;
+        cerr << "  Total (excluding load): " << duration_excl_load.count() << " ms" << endl;
+        cerr << "  Total (including load): " << duration_total.count() << " ms" << endl;
     }
     
     return 0;

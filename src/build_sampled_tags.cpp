@@ -36,7 +36,12 @@ int main(int argc, char** argv) {
     };
     std::cerr << "Building sampled tags" << std::endl;
     sampled.build_from_enumerator(enumerator, tags.bwt_size());
-    
+
+    // std::cerr << "--- Sampled tags (is_first_run_gap + bwt_intervals, rank) ---\n";
+    // sampled.print_bwt_intervals_and_rank(200, std::cerr);
+    // std::cerr << "--- Tags (bwt_intervals, rank) ---\n";
+    // tags.print_bwt_intervals_and_rank(200, std::cerr);
+
     // On macOS, add a small delay to ensure all destructors are called
     // This helps identify if the issue is during destruction
     std::cerr << "About to serialize..." << std::endl;

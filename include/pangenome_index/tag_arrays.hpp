@@ -62,10 +62,9 @@ namespace panindexer {
         // Compact variant: encodes only position fields in encoded_runs; lengths are implied by bwt_intervals
         void compressed_serialize_compact(std::ostream &main_out, std::ostream &encoded_starts_file, std::ostream &bwt_intervals_file, std::vector<std::pair<pos_t, uint16_t>> &tag_runs);
         void merge_compressed_files(const std::string filename, const std::string encoded_starts_file, const std::string bwt_intervals_file);
-        void load_compressed_tags(std::istream &in);
-        // sdsl int_vector format loader
-        void load_compressed_tags_sdsl(std::istream &in);
-        // Alias to sdsl loader for compact mode
+        void load_compressed_tags(std::istream &in);  // Older format: raw encoded_runs (byte vector)
+        void load_compressed_tags_sdsl(std::istream &in);  // SDSL format: int_vector<0> + sd_vectors
+        // Alias: "compact" = SDSL format (positions in int_vector, lengths from bwt_intervals)
         inline void load_compressed_tags_compact(std::istream &in) { load_compressed_tags_sdsl(in); }
         void query_compressed(size_t start, size_t end, size_t &number_of_runs);
         // Compact variant: decodes positions using decode_run_length_compact
@@ -102,6 +101,9 @@ namespace panindexer {
 
         // Returns the logical BWT size used for building bwt_intervals (sd_vector size)
         inline size_t bwt_size() const { return this->bwt_intervals.size(); }
+
+        // Debug: print bwt_intervals bit and rank for positions [0, limit)
+        void print_bwt_intervals_and_rank(size_t limit, std::ostream& out = std::cerr) const;
 
     private:
 

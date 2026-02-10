@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstring>
+#include <random>
 
 
 #ifndef TIME
@@ -356,11 +357,441 @@ static bool text_pos_to_bwt_pos(panindexer::FastLocate& r_index, size_t text_pos
     return true;
 }
 
+// Print the sampled tag array completely: every run with run_id, BWT span, length, and tag (node_id, is_rev).
+static int print_sampled_tag_array(const std::string& sampled_tags_file) {
+    using namespace panindexer;
+    std::cerr << "Loading sampled tag array: " << sampled_tags_file << std::endl;
+    SampledTagArray arr;
+    {
+        std::ifstream sin(sampled_tags_file, std::ios::binary);
+        if (!sin) {
+            std::cerr << "Cannot open sampled tags file: " << sampled_tags_file << std::endl;
+            return 1;
+        }
+        arr.load(sin);
+    }
+    arr.ensure_run_rank();
+    arr.ensure_run_select();
+
+    size_t n_runs = arr.total_runs();
+    size_t bwt_size = (arr.run_starts().size() > 0) ? (arr.run_starts().size() - 1) : 0;
+    std::cout << "# Sampled tag array: " << n_runs << " runs, BWT size " << bwt_size
+              << " first_run_is_gap=" << arr.is_first_run_gap() << "\n";
+    std::cout << "# run_id\tbwt_start\tbwt_end\tlen\ttag\tnode_id\tis_rev\n";
+
+    for (size_t run_id = 0; run_id < n_runs; ++run_id) {
+        auto [bwt_start, bwt_end] = arr.run_span(run_id);
+        size_t len = (bwt_end >= bwt_start) ? (bwt_end - bwt_start + 1) : 0;
+        uint64_t tag = arr.run_value(run_id);
+        std::cout << run_id << "\t" << bwt_start << "\t" << bwt_end << "\t" << len << "\t" << tag;
+        if (tag == 0) {
+            std::cout << "\t-\t-\n";
+        } else {
+            auto [node_id, is_rev] = decode_tag(tag);
+            std::cout << "\t" << node_id << "\t" << (is_rev ? 1 : 0) << "\n";
+        }
+    }
+    std::cerr << "Printed " << n_runs << " runs." << std::endl;
+    return 0;
+}
+
+// ======================= Verify non-encoded vs encoded r-index =======================
+// Complete comparison: sizes, samples, last/last_to_run, LF, rankAt, run_id_and_offset_at,
+// single-step LF, bwt_end_position_of_run, full decompressDA; reports every mismatch.
+static int verify_rindex_encoded_vs_legacy(const std::string& legacy_ri_file,
+                                           const std::string& encoded_ri_file,
+                                           size_t random_trials) {
+    using namespace panindexer;
+    std::cerr << "Loading legacy (non-encoded) r-index: " << legacy_ri_file << std::endl;
+    FastLocate legacy;
+    {
+        std::ifstream in(legacy_ri_file, std::ios::binary);
+        if (!in) {
+            std::cerr << "Cannot open legacy r-index: " << legacy_ri_file << std::endl;
+            return 1;
+        }
+        legacy.load_encoded(in);
+    }
+    if (legacy.is_encoded()) {
+        std::cerr << "ERROR: First file is encoded; expected non-encoded (legacy). Pass legacy .ri first, then encoded .ri." << std::endl;
+        return 1;
+    }
+
+    std::cerr << "Loading encoded r-index: " << encoded_ri_file << std::endl;
+    FastLocate encoded;
+    {
+        std::ifstream in(encoded_ri_file, std::ios::binary);
+        if (!in) {
+            std::cerr << "Cannot open encoded r-index: " << encoded_ri_file << std::endl;
+            return 1;
+        }
+        encoded.load_encoded(in);
+    }
+    if (!encoded.is_encoded()) {
+        std::cerr << "ERROR: Second file is not encoded; expected encoded .ri. Pass legacy .ri first, then encoded .ri." << std::endl;
+        return 1;
+    }
+
+    int exit_code = 0;
+    const size_t n = legacy.bwt_size();
+    const size_t num_runs = legacy.tot_runs();
+    std::vector<std::string> passed, failed;
+
+    auto ok = [&](int c, const std::string& name, bool cond) {
+        if (cond) { passed.push_back(name); std::cerr << "  Check " << c << " (" << name << ") passed." << std::endl; }
+        else { failed.push_back(name); exit_code = 1; }
+    };
+
+    std::cerr << "--- Running checks ---" << std::endl;
+
+    // 1) Global sizes
+    bool c1 = (encoded.bwt_size() == n && encoded.tot_runs() == num_runs &&
+               encoded.get_sequence_size() == legacy.get_sequence_size());
+    if (!c1) {
+        if (encoded.bwt_size() != n) std::cerr << "MISMATCH bwt_size(): legacy=" << n << " encoded=" << encoded.bwt_size() << std::endl;
+        if (encoded.tot_runs() != num_runs) std::cerr << "MISMATCH tot_runs(): legacy=" << num_runs << " encoded=" << encoded.tot_runs() << std::endl;
+        if (encoded.get_sequence_size() != legacy.get_sequence_size())
+            std::cerr << "MISMATCH get_sequence_size(): legacy=" << legacy.get_sequence_size() << " encoded=" << encoded.get_sequence_size() << std::endl;
+    }
+    ok(1, "bwt_size, tot_runs, sequence_size", c1);
+
+    // 2) C array (same size and values)
+    bool c2 = (legacy.C.size() == encoded.C.size());
+    if (c2) {
+        for (size_t i = 0; i < legacy.C.size() && c2; ++i)
+            if (legacy.C[i] != encoded.C[i]) {
+                std::cerr << "MISMATCH C[" << i << "]: legacy=" << legacy.C[i] << " encoded=" << encoded.C[i] << std::endl;
+                c2 = false;
+            }
+    } else {
+        std::cerr << "MISMATCH C.size(): legacy=" << legacy.C.size() << " encoded=" << encoded.C.size() << std::endl;
+    }
+    ok(2, "C array", c2);
+
+    // 3) sym_map (same)
+    bool c3 = (legacy.sym_map.size() == encoded.sym_map.size());
+    if (c3) {
+        for (size_t i = 0; i < legacy.sym_map.size() && c3; ++i)
+            if (legacy.sym_map[i] != encoded.sym_map[i]) {
+                std::cerr << "MISMATCH sym_map[" << (int)i << "]: legacy=" << (int)legacy.sym_map[i] << " encoded=" << (int)encoded.sym_map[i] << std::endl;
+                c3 = false;
+            }
+    } else {
+        std::cerr << "MISMATCH sym_map.size(): legacy=" << legacy.sym_map.size() << " encoded=" << encoded.sym_map.size() << std::endl;
+    }
+    ok(3, "sym_map", c3);
+
+    // 4) samples
+    bool c4 = true;
+    for (size_t run_id = 0; run_id < num_runs && c4; ++run_id) {
+        if (legacy.getSample(run_id) != encoded.getSample(run_id)) {
+            std::cerr << "MISMATCH getSample(run_id=" << run_id << "): legacy=" << legacy.getSample(run_id) << " encoded=" << encoded.getSample(run_id) << std::endl;
+            c4 = false;
+        }
+    }
+    ok(4, "samples", c4);
+
+    // 5) last and last_to_run (check only a prefix and a tail to keep runtime low)
+    const size_t last_check_prefix = 100000;
+    const size_t last_check_tail = 5000;
+    bool c5 = (legacy.last.size() == encoded.last.size() && legacy.last_to_run.size() == encoded.last_to_run.size());
+    if (c5) {
+        size_t n_last = legacy.last.size();
+        size_t n_ltr = legacy.last_to_run.size();
+        for (size_t i = 0; i < n_last && i < last_check_prefix && c5; ++i)
+            if (legacy.last[i] != encoded.last[i]) {
+                std::cerr << "MISMATCH last[" << i << "]" << std::endl;
+                c5 = false;
+            }
+        for (size_t i = (n_last > last_check_prefix + last_check_tail ? n_last - last_check_tail : n_last); i < n_last && c5; ++i)
+            if (legacy.last[i] != encoded.last[i]) {
+                std::cerr << "MISMATCH last[" << i << "]" << std::endl;
+                c5 = false;
+            }
+        for (size_t i = 0; i < n_ltr && i < last_check_prefix && c5; ++i)
+            if (legacy.last_to_run[i] != encoded.last_to_run[i]) {
+                std::cerr << "MISMATCH last_to_run[" << i << "]" << std::endl;
+                c5 = false;
+            }
+        for (size_t i = (n_ltr > last_check_prefix + last_check_tail ? n_ltr - last_check_tail : n_ltr); i < n_ltr && c5; ++i)
+            if (legacy.last_to_run[i] != encoded.last_to_run[i]) {
+                std::cerr << "MISMATCH last_to_run[" << i << "]" << std::endl;
+                c5 = false;
+            }
+    } else {
+        std::cerr << "MISMATCH last.size() or last_to_run.size()" << std::endl;
+    }
+    ok(5, "last, last_to_run", c5);
+
+    // 6) LF(range, sym) on random ranges and symbols
+    std::mt19937 rng(12345);
+    const unsigned char syms[] = {'A', 'C', 'G', 'T'};
+    bool c6 = true;
+    for (size_t t = 0; t < random_trials && n > 0 && c6; ++t) {
+        size_t first = rng() % n;
+        size_t second = rng() % n;
+        if (first > second) std::swap(first, second);
+        for (unsigned char sym : syms) {
+            gbwt::range_type r_leg = legacy.LF({first, second}, sym);
+            gbwt::range_type r_enc = encoded.LF_encoded({first, second}, sym);
+            if (r_leg.first != r_enc.first || r_leg.second != r_enc.second) {
+                std::cerr << "MISMATCH LF(range=[" << first << "," << second << "], sym='" << (char)sym << "')" << std::endl;
+                c6 = false;
+                break;
+            }
+        }
+    }
+    ok(6, "LF(range,sym)", c6);
+
+    // 7) rankAt(pos, sym)
+    bool c7 = true;
+    for (size_t t = 0; t < random_trials && n > 0 && c7; ++t) {
+        size_t pos = rng() % (n + 1);
+        for (unsigned char sym : syms) {
+            if (legacy.rankAt(pos, sym) != encoded.rankAt(pos, sym)) {
+                std::cerr << "MISMATCH rankAt(pos=" << pos << ", sym='" << (char)sym << "')" << std::endl;
+                c7 = false;
+                break;
+            }
+        }
+    }
+    ok(7, "rankAt", c7);
+
+    // 8) run_id_and_offset_at(pos)
+    bool c8 = true;
+    for (size_t t = 0; t < random_trials && n > 0 && c8; ++t) {
+        size_t pos = rng() % n;
+        size_t run_leg, run_enc, off_leg, off_enc;
+        legacy.run_id_and_offset_at(pos, run_leg, off_leg);
+        encoded.run_id_and_offset_at(pos, run_enc, off_enc);
+        if (run_leg != run_enc || off_leg != off_enc) {
+            std::cerr << "MISMATCH run_id_and_offset_at(pos=" << pos << ")" << std::endl;
+            c8 = false;
+        }
+    }
+    ok(8, "run_id_and_offset_at", c8);
+
+    // 9) Single-step LF(pos)
+    bool c9 = true;
+    for (size_t t = 0; t < random_trials && n > 0 && c9; ++t) {
+        size_t pos = rng() % n;
+        if (legacy.LF(pos) != encoded.LF(pos)) {
+            std::cerr << "MISMATCH LF(pos=" << pos << ")" << std::endl;
+            c9 = false;
+        }
+    }
+    ok(9, "LF(pos)", c9);
+
+    // 10) bwt_end_position_of_run(run_id)
+    bool c10 = true;
+    for (size_t run_id = 0; run_id < num_runs && c10; ++run_id) {
+        if (legacy.bwt_end_position_of_run(run_id) != encoded.bwt_end_position_of_run(run_id)) {
+            std::cerr << "MISMATCH bwt_end_position_of_run(run_id=" << run_id << ")" << std::endl;
+            c10 = false;
+        }
+    }
+    ok(10, "bwt_end_position_of_run", c10);
+
+    // 11) Full decompressDA()
+    auto da_leg = legacy.decompressDA();
+    auto da_enc = encoded.decompressDA();
+    bool c11 = (da_leg.size() == da_enc.size());
+    if (c11) {
+        for (size_t i = 0; i < da_leg.size() && c11; ++i)
+            if (da_leg[i] != da_enc[i]) {
+                std::cerr << "MISMATCH decompressDA()[" << i << "]" << std::endl;
+                c11 = false;
+            }
+    } else {
+        std::cerr << "MISMATCH decompressDA().size(): legacy=" << da_leg.size() << " encoded=" << da_enc.size() << std::endl;
+    }
+    ok(11, "decompressDA", c11);
+
+    // 12) Block runs: Blocks (legacy) vs EncodedBlock (encoded) — same runs per block
+    size_t num_blocks_legacy = legacy.num_blocks();
+    size_t num_blocks_encoded = encoded.num_blocks();
+    bool c12 = (num_blocks_legacy == num_blocks_encoded);
+    if (!c12) {
+        std::cerr << "MISMATCH num_blocks(): legacy=" << num_blocks_legacy << " encoded=" << num_blocks_encoded << std::endl;
+        failed.push_back("block_runs");
+        exit_code = 1;
+    } else {
+        std::vector<std::pair<size_t, size_t>> runs_legacy, runs_encoded;
+        size_t first_bad_block = static_cast<size_t>(-1);
+        for (size_t block_id = 0; block_id < num_blocks_legacy; ++block_id) {
+            legacy.get_block_runs(block_id, runs_legacy);
+            encoded.get_block_runs(block_id, runs_encoded);
+            if (runs_legacy.size() != runs_encoded.size()) {
+                c12 = false;
+                std::cerr << "MISMATCH block " << block_id << " run count: legacy=" << runs_legacy.size()
+                          << " encoded=" << runs_encoded.size() << std::endl;
+                // Print actual runs for this block (sym as byte; show char if printable)
+                std::cerr << "  Legacy runs (" << runs_legacy.size() << "):" << std::endl;
+                for (size_t r = 0; r < runs_legacy.size(); ++r) {
+                    size_t sym = runs_legacy[r].first;
+                    size_t len = runs_legacy[r].second;
+                    char sym_char = (sym < 128 && sym >= 32) ? static_cast<char>(sym) : '?';
+                    std::cerr << "    run " << r << ": sym=" << sym << " ('" << sym_char << "') len=" << len << std::endl;
+                }
+                std::cerr << "  Encoded runs (" << runs_encoded.size() << "):" << std::endl;
+                for (size_t r = 0; r < runs_encoded.size(); ++r) {
+                    size_t sym = runs_encoded[r].first;
+                    size_t len = runs_encoded[r].second;
+                    char sym_char = (sym < 128 && sym >= 32) ? static_cast<char>(sym) : '?';
+                    std::cerr << "    run " << r << ": sym=" << sym << " ('" << sym_char << "') len=" << len << std::endl;
+                }
+                // Extra context only for first block run-count mismatch
+                if (first_bad_block == static_cast<size_t>(-1)) {
+                    first_bad_block = block_id;
+                    std::cerr << "  Context: num_blocks(legacy)=" << num_blocks_legacy
+                              << " num_blocks(encoded)=" << num_blocks_encoded
+                              << " bwt_size(legacy)=" << legacy.bwt_size()
+                              << " bwt_size(encoded)=" << encoded.bwt_size()
+                              << " tot_runs(legacy)=" << legacy.tot_runs()
+                              << " tot_runs(encoded)=" << encoded.tot_runs() << std::endl;
+                    std::cerr << "  Legacy block_size=" << legacy.block_size
+                              << " encoded_block_size(encoded)=" << encoded.encoded_block_size << std::endl;
+                    size_t lo = (block_id >= 3) ? block_id - 3 : 0;
+                    size_t hi = (block_id + 4 <= num_blocks_legacy) ? block_id + 4 : num_blocks_legacy;
+                    std::cerr << "  Run counts per block (block_id -> legacy, encoded) for blocks [" << lo << ".." << (hi-1) << "]:" << std::endl;
+                    for (size_t b = lo; b < hi; ++b) {
+                        legacy.get_block_runs(b, runs_legacy);
+                        encoded.get_block_runs(b, runs_encoded);
+                        std::cerr << "    block " << b << ": legacy=" << runs_legacy.size() << " encoded=" << runs_encoded.size()
+                                  << (runs_legacy.size() != runs_encoded.size() ? "  <-- MISMATCH" : "") << std::endl;
+                    }
+                }
+                exit_code = 1;
+            } else {
+                for (size_t r = 0; r < runs_legacy.size(); ++r) {
+                    if (runs_legacy[r].first != runs_encoded[r].first || runs_legacy[r].second != runs_encoded[r].second) {
+                        c12 = false;
+                        std::cerr << "MISMATCH block " << block_id << " run " << r << ": legacy (sym=" << runs_legacy[r].first
+                                  << ", len=" << runs_legacy[r].second << ") encoded (sym=" << runs_encoded[r].first
+                                  << ", len=" << runs_encoded[r].second << ")" << std::endl;
+                        exit_code = 1;
+                    }
+                }
+            }
+        }
+        if (c12)
+            std::cerr << "  Check 12 (block_runs) passed." << std::endl;
+        else
+            failed.push_back("block_runs");
+        if (c12) passed.push_back("block_runs");
+    }
+
+    // Summary
+    std::cerr << "--- Summary ---" << std::endl;
+    std::cerr << "Passed (" << passed.size() << "): ";
+    for (size_t i = 0; i < passed.size(); ++i) std::cerr << (i ? ", " : "") << passed[i];
+    std::cerr << std::endl;
+    if (!failed.empty()) {
+        std::cerr << "Failed (" << failed.size() << "): ";
+        for (size_t i = 0; i < failed.size(); ++i) std::cerr << (i ? ", " : "") << failed[i];
+        std::cerr << std::endl;
+        std::cerr << "One or more mismatches found; see above for details." << std::endl;
+    } else {
+        std::cerr << "All checks passed: legacy and encoded r-index agree (bwt_size=" << n << ", tot_runs=" << num_runs
+                  << ", random trials=" << random_trials << ")." << std::endl;
+    }
+    return exit_code;
+}
+
+// Encode pos_t to the same integer code used by SampledTagArray (gaps -> 0).
+static uint64_t encode_pos_for_sampled(handlegraph::pos_t p) {
+    if (gbwtgraph::offset(p) != 0) return 0;
+    if (gbwtgraph::id(p) == 0) return 0;
+    return panindexer::SampledTagArray::encode_value(gbwtgraph::id(p), gbwtgraph::is_rev(p));
+}
+
+// Verify sampled tag array against the full (compressed) tag array by traversing from the beginning
+// run-by-run and comparing the tag value at each run start.
+static int verify_sampled_vs_tag_array(const std::string& compressed_tags_file,
+                                       const std::string& sampled_tags_file) {
+    using namespace panindexer;
+    std::cerr << "Loading compressed tag array: " << compressed_tags_file << std::endl;
+    TagArray tag_array;
+    {
+        std::ifstream tin(compressed_tags_file, std::ios::binary);
+        if (!tin) {
+            std::cerr << "Cannot open compressed tags file: " << compressed_tags_file << std::endl;
+            return 1;
+        }
+        tag_array.load_compressed_tags_compact(tin);
+    }
+    std::cerr << "Loading sampled tag array: " << sampled_tags_file << std::endl;
+    SampledTagArray sampled;
+    {
+        std::ifstream sin(sampled_tags_file, std::ios::binary);
+        if (!sin) {
+            std::cerr << "Cannot open sampled tags file: " << sampled_tags_file << std::endl;
+            return 1;
+        }
+        sampled.load(sin);
+    }
+
+    size_t tag_bwt_size = tag_array.bwt_size();
+    size_t sampled_bwt_size = (sampled.run_starts().size() > 0) ? (sampled.run_starts().size() - 1) : 0;
+    if (tag_bwt_size != sampled_bwt_size) {
+        std::cerr << "WARNING: Tag array BWT size (" << tag_bwt_size
+                  << ") != sampled tag array BWT size (" << sampled_bwt_size
+                  << "). Verification may be wrong." << std::endl;
+    }
+
+    sampled.ensure_run_rank();
+    sampled.ensure_run_select();
+
+    size_t run_index = 0;
+    size_t mismatches = 0;
+    const size_t max_mismatch_print = 20;
+
+    tag_array.for_each_run_compact_with_bwt([&](handlegraph::pos_t p, uint64_t len,
+                                                 size_t bwt_start, size_t bwt_end) {
+        uint64_t expected = encode_pos_for_sampled(p);
+        if (bwt_start >= sampled.run_starts().size()) {
+            std::cerr << "Run " << run_index << ": bwt_start=" << bwt_start
+                      << " >= sampled size (" << sampled.run_starts().size() << "), skipping." << std::endl;
+            run_index++;
+            return;
+        }
+        size_t run_id = sampled.run_id_at(bwt_start);
+        uint64_t got = sampled.run_value(run_id);
+        if (expected != got) {
+            mismatches++;
+            if (mismatches <= max_mismatch_print) {
+                std::cerr << "MISMATCH run " << run_index
+                          << " bwt_start=" << bwt_start << " bwt_end=" << bwt_end
+                          << " tag_array: node_id=" << gbwtgraph::id(p)
+                          << " is_rev=" << gbwtgraph::is_rev(p)
+                          << " offset=" << gbwtgraph::offset(p)
+                          << " len=" << len << " expected_tag=" << expected
+                          << " sampled: run_id=" << run_id << " got_tag=" << got;
+                if (got != 0) {
+                    auto [got_node_id, got_is_rev] = decode_tag(got);
+                    std::cerr << " sampled_decoded: node_id=" << got_node_id << " is_rev=" << got_is_rev;
+                } else {
+                    std::cerr << " sampled_decoded: gap";
+                }
+                std::cerr << std::endl;
+            }
+        }
+        run_index++;
+    });
+
+    std::cerr << "Verification done: " << run_index << " runs checked, "
+              << mismatches << " mismatch(es)." << std::endl;
+    if (mismatches > max_mismatch_print) {
+        std::cerr << "  (first " << max_mismatch_print << " mismatches printed)" << std::endl;
+    }
+    return mismatches > 0 ? 1 : 0;
+}
+
 // Verify sampled tag array by traversing a GBWT path from the start and comparing
 // the tag at each (seq_id, base_offset) with the node on the path at that offset.
+// Uses only .gbz (GBZ contains both the GBWT index and the graph).
 static int verify_sampled_against_gbwt(const std::string& r_index_file,
                                        const std::string& sampled_tags_file,
-                                       const std::string& gbwt_index_file,
                                        const std::string& gbz_file,
                                        size_t path_id,
                                        size_t sample_every) {
@@ -392,19 +823,12 @@ static int verify_sampled_against_gbwt(const std::string& r_index_file,
                   << ") != sampled tag array BWT size (" << sampled_bwt_size
                   << "). Verification may be wrong." << std::endl;
     }
-    std::cerr << "Loading GBWT index: " << gbwt_index_file << std::endl;
-    gbwt::GBWT gbwt_index;
-    {
-        std::ifstream gin(gbwt_index_file, std::ios::binary);
-        if (!gin) {
-            std::cerr << "Cannot open GBWT index: " << gbwt_index_file << std::endl;
-            return 1;
-        }
-        sdsl::load_from_file(gbwt_index, gbwt_index_file);
-    }
-    std::cerr << "Loading GBZ (graph): " << gbz_file << std::endl;
+    std::cerr << "Encoded r-index BWT character counts:" << std::endl;
+    r_index.print_character_counts(std::cerr);
+    std::cerr << "Loading GBZ (GBWT index + graph): " << gbz_file << std::endl;
     gbwtgraph::GBZ gbz;
     sdsl::simple_sds::load_from(gbz, gbz_file);
+    const gbwt::GBWT& gbwt_index = gbz.index;
     const gbwtgraph::GBWTGraph& graph = gbz.graph;
 
     gbwt::vector_type path = gbwt_index.extract(gbwt::Path::encode(path_id, false));
@@ -436,6 +860,7 @@ static int verify_sampled_against_gbwt(const std::string& r_index_file,
     size_t node_index = 0;
     size_t checked = 0;
     size_t mismatches = 0;
+    const size_t max_mismatch_print = 30;
     for (gbwt::node_type node : path) {
         if (node == gbwt::ENDMARKER) break;
         int64_t node_id = gbwt::Node::id(node);
@@ -444,101 +869,242 @@ static int verify_sampled_against_gbwt(const std::string& r_index_file,
         size_t node_len = graph.get_length(handle);
         uint64_t expected_tag = SampledTagArray::encode_value(node_id, node_rev);
 
-        // For this GBWT node, find all runs in the sampled tag array with this tag
-        {
-            size_t total_occ = wm.rank(wm.size(), expected_tag);
-            std::cerr << "  [node_index=" << node_index << " node_id=" << node_id << " rev=" << node_rev
-                      << " tag=" << expected_tag << "] In sampled tag array: " << total_occ << " run(s) with this tag:";
-            if (total_occ == 0) {
-                std::cerr << " (none)" << std::endl;
-            } else {
-                std::cerr << std::endl;
-                for (size_t j = 1; j <= total_occ; ++j) {
-                    size_t tag_run_id = wm.select(j, expected_tag);  // 0-based index in non-gap runs
-                    size_t bwt_run_id = 2 * tag_run_id + 1 - static_cast<size_t>(first_run_is_gap);
-                    auto span = sampled.run_span(bwt_run_id);
-                    std::cerr << "      run " << j << "/" << total_occ << ": bwt_run_id=" << bwt_run_id
-                              << "  BWT [" << span.first << ", " << span.second << "]"
-                              << " (length " << (span.second - span.first + 1) << ")";
-                    // Locate BWT start and end to get text positions (seq_id, offset)
-                    if (span.first < r_index.bwt_size()) {
-                        size_t packed_start = recover_text_pos_from_bwt(r_index, span.first);
-                        auto [seq_start, offset_start] = r_index.unpack(packed_start);
-                        std::cerr << "  text@start: packed=" << packed_start << " seq_id=" << seq_start << " offset=" << offset_start;
-                        if (span.second < r_index.bwt_size() && span.second != span.first) {
-                            size_t packed_end = recover_text_pos_from_bwt(r_index, span.second);
-                            auto [seq_end, offset_end] = r_index.unpack(packed_end);
-                            std::cerr << "  text@end: packed=" << packed_end << " seq_id=" << seq_end << " offset=" << offset_end;
-                        }
+        // Check only at the start of each node (offset 0 within node)
+        size_t base_offset = cumulative_bases;
+        size_t text_pos = r_index.pack(seq_id, base_offset);
+        size_t bwt_pos = 0;
+        if (text_pos_to_bwt_pos(r_index, text_pos, seq_end_text_pos, bwt_pos)) {
+            size_t run_id = sampled.run_id_at(bwt_pos);
+            uint64_t tag_val = sampled.run_value(run_id);
+            checked++;
+            bool match = (tag_val == expected_tag);
+            if (!match) {
+                mismatches++;
+                if (mismatches <= max_mismatch_print) {
+                    size_t packed_at = recover_text_pos_from_bwt(r_index, bwt_pos);
+                    auto [seq_id_at, offset_at] = r_index.unpack(packed_at);
+                    std::cerr << "MISMATCH node_index=" << node_index << " base_offset=" << base_offset
+                              << " bwt_pos=" << bwt_pos
+                              << " text: packed=" << packed_at << " seq_id=" << seq_id_at << " offset=" << offset_at;
+                    if (seq_id_at != path_id || offset_at != base_offset) {
+                        std::cerr << " [expected seq_id=" << path_id << " offset=" << base_offset << "]";
+                    }
+                    std::cerr << "  expected: node_id=" << node_id << " rev=" << node_rev << " tag=" << expected_tag;
+                    if (tag_val == 0) {
+                        std::cerr << "  sampled: gap (tag=0)";
+                    } else {
+                        auto [got_id, got_rev] = decode_tag(tag_val);
+                        std::cerr << "  sampled: tag=" << tag_val << " node_id=" << got_id << " rev=" << got_rev;
                     }
                     std::cerr << std::endl;
                 }
             }
         }
-
-        for (size_t off_in_node = 0; off_in_node < node_len; off_in_node += sample_every) {
-            size_t base_offset = cumulative_bases + off_in_node;
-            size_t text_pos = r_index.pack(seq_id, base_offset);
-            size_t bwt_pos = 0;
-            if (!text_pos_to_bwt_pos(r_index, text_pos, seq_end_text_pos, bwt_pos)) {
-                std::cerr << "  Skip base_offset=" << base_offset << " (could not get BWT position)" << std::endl;
-                continue;
-            }
-            size_t run_id = sampled.run_id_at(bwt_pos);
-            uint64_t tag_val = sampled.run_value(run_id);
-            checked++;
-            bool match = (tag_val == expected_tag);
-            if (!match) mismatches++;
-
-            // Print only at the beginning of each node (first base of the node)
-            if (off_in_node == 0) {
-                size_t packed_at = recover_text_pos_from_bwt(r_index, bwt_pos);
-                auto [seq_id_at, offset_at] = r_index.unpack(packed_at);
-                std::cerr << "  base_offset=" << base_offset
-                          << " bwt_pos=" << bwt_pos
-                          << " text: packed=" << packed_at << " seq_id=" << seq_id_at << " offset=" << offset_at;
-                if (seq_id_at != path_id || offset_at != base_offset) {
-                    std::cerr << " [expected seq_id=" << path_id << " offset=" << base_offset << "]";
-                }
-                std::cerr << "  node_index=" << node_index
-                          << " expected: node_id=" << node_id << " rev=" << node_rev << " tag=" << expected_tag;
-                if (tag_val == 0) {
-                    std::cerr << "  sampled: gap (tag=0)";
-                } else {
-                    auto [got_id, got_rev] = decode_tag(tag_val);
-                    std::cerr << "  sampled: tag=" << tag_val << " node_id=" << got_id << " rev=" << got_rev;
-                }
-                std::cerr << "  " << (match ? "OK" : "MISMATCH") << std::endl;
-            }
-        }
         cumulative_bases += node_len;
         node_index++;
     }
-    std::cerr << "Verification done: " << checked << " positions checked, "
-              << mismatches << " mismatches." << std::endl;
+    std::cerr << "Verification done: " << checked << " node starts checked, "
+              << mismatches << " mismatch(es)." << std::endl;
+    if (mismatches > max_mismatch_print) {
+        std::cerr << "  (first " << max_mismatch_print << " mismatches printed above)" << std::endl;
+    }
+    return mismatches > 0 ? 1 : 0;
+}
+
+// Verify full compact tag array against GBWT: for each run, get expected (node_id, is_rev, offset)
+// from the GBWT path at the text position corresponding to the run start, and compare with the tag.
+// Uses only .gbz (GBZ contains both the GBWT index and the graph).
+static int verify_compact_tags_against_gbwt(const std::string& r_index_file,
+                                            const std::string& compact_tags_file,
+                                            const std::string& gbz_file,
+                                            size_t path_id,
+                                            size_t sample_every) {
+    using namespace panindexer;
+    std::cerr << "Loading RLBWT r-index: " << r_index_file << std::endl;
+    FastLocate r_index;
+    {
+        std::ifstream rin(r_index_file, std::ios::binary);
+        if (!rin) {
+            std::cerr << "Cannot open r-index file: " << r_index_file << std::endl;
+            return 1;
+        }
+        r_index.load_encoded(rin);
+    }
+    std::cerr << "Loading compact tag array: " << compact_tags_file << std::endl;
+    TagArray tag_array;
+    {
+        std::ifstream tin(compact_tags_file, std::ios::binary);
+        if (!tin) {
+            std::cerr << "Cannot open compact tags file: " << compact_tags_file << std::endl;
+            return 1;
+        }
+        tag_array.load_compressed_tags_compact(tin);
+    }
+    std::cerr << "Loading GBZ (contains GBWT index + graph): " << gbz_file << std::endl;
+    gbwtgraph::GBZ gbz;
+    sdsl::simple_sds::load_from(gbz, gbz_file);
+    const gbwtgraph::GBWTGraph& graph = gbz.graph;
+    const gbwt::GBWT& gbwt_index = gbz.index;
+
+    gbwt::vector_type path = gbwt_index.extract(gbwt::Path::encode(path_id, false));
+    if (path.empty()) {
+        std::cerr << "Path " << path_id << " not found in GBWT." << std::endl;
+        return 1;
+    }
+    // Build prefix sum of node lengths so we can map base_offset -> (node_index, off_in_node)
+    std::vector<size_t> node_prefix;
+    node_prefix.push_back(0);
+    size_t path_length_bases = 0;
+    for (gbwt::node_type node : path) {
+        if (node == gbwt::ENDMARKER) break;
+        path_length_bases += graph.get_length(
+            graph.get_handle(gbwt::Node::id(node), gbwt::Node::is_reverse(node)));
+        node_prefix.push_back(path_length_bases);
+    }
+    std::cerr << "Path " << path_id << " has " << (node_prefix.size() - 1) << " nodes, "
+              << path_length_bases << " bases." << std::endl;
+
+    auto offset_to_pos = [&](size_t base_offset) -> handlegraph::pos_t {
+        if (base_offset >= path_length_bases) {
+            return make_pos_t(0, false, 0);
+        }
+        size_t i = 0;
+        while (i + 1 < node_prefix.size() && node_prefix[i + 1] <= base_offset) ++i;
+        gbwt::node_type node = path[i];
+        if (node == gbwt::ENDMARKER) return make_pos_t(0, false, 0);
+        int64_t node_id = gbwt::Node::id(node);
+        bool node_rev = gbwt::Node::is_reverse(node);
+        size_t off_in_node = base_offset - node_prefix[i];
+        return make_pos_t(node_id, node_rev, static_cast<size_t>(off_in_node));
+    };
+
+    size_t run_index = 0;
+    size_t checked = 0;
+    size_t mismatches = 0;
+    size_t skipped_other_seq = 0;
+    const size_t max_mismatch_print = 30;
+
+    tag_array.for_each_run_compact_with_bwt([&](handlegraph::pos_t p, uint64_t len,
+                                                  size_t bwt_start, size_t bwt_end) {
+        if (run_index % sample_every != 0) {
+            run_index++;
+            return;
+        }
+        size_t text_pos = recover_text_pos_from_bwt(r_index, bwt_start);
+        auto [seq_id, offset] = r_index.unpack(text_pos);
+        if (seq_id != path_id) {
+            skipped_other_seq++;
+            run_index++;
+            return;
+        }
+        if (offset >= path_length_bases) {
+            run_index++;
+            return;
+        }
+        handlegraph::pos_t expected = offset_to_pos(offset);
+        bool match = (gbwtgraph::id(p) == gbwtgraph::id(expected) &&
+                      gbwtgraph::is_rev(p) == gbwtgraph::is_rev(expected) &&
+                      gbwtgraph::offset(p) == gbwtgraph::offset(expected));
+        checked++;
+        if (!match) mismatches++;
+
+        if (!match && mismatches <= max_mismatch_print) {
+            std::cerr << "MISMATCH run " << run_index << " bwt_start=" << bwt_start << " bwt_end=" << bwt_end
+                      << " text: seq_id=" << seq_id << " offset=" << offset
+                      << " compact: node_id=" << gbwtgraph::id(p) << " is_rev=" << gbwtgraph::is_rev(p)
+                      << " offset=" << gbwtgraph::offset(p)
+                      << " expected: node_id=" << gbwtgraph::id(expected) << " is_rev=" << gbwtgraph::is_rev(expected)
+                      << " offset=" << gbwtgraph::offset(expected) << std::endl;
+        }
+        run_index++;
+    });
+
+    std::cerr << "Verification done: " << checked << " runs checked (path_id=" << path_id << "), "
+              << skipped_other_seq << " runs skipped (other seq), "
+              << mismatches << " mismatch(es)." << std::endl;
+    if (mismatches > max_mismatch_print) {
+        std::cerr << "  (first " << max_mismatch_print << " mismatches printed)" << std::endl;
+    }
     return mismatches > 0 ? 1 : 0;
 }
 
 static void usage_verify(const char* prog) {
-    std::cerr << "Usage: " << prog << " --verify-sampled <r_index.ri> <sampled.tags> --gbwt-index <graph.gbwt> --gbz <graph.gbz> [options]\n"
-              << "  Verify that the sampled tag array matches the GBWT path by traversing from the start.\n"
+    std::cerr << "Usage: " << prog << " --verify-sampled <r_index.ri> <sampled.tags> --gbz <graph.gbz> [options]\n"
+              << "  Verify that the sampled tag array matches the GBWT path at node starts only.\n"
+              << "  Only positions at the start of each node are checked; only incorrect ones are printed.\n"
+              << "  Uses only .gbz (GBZ contains both the GBWT index and the graph).\n"
               << "Options:\n"
-              << "  --path-id N       GBWT path/sequence ID to traverse (default: 0)\n"
-              << "  --sample-every N  Check every N bases along the path (default: 1)\n" << std::endl;
+              << "  --gbz FILE        GBZ file (required; contains GBWT + graph)\n"
+              << "  --path-id N       GBWT path/sequence ID to traverse (default: 0)\n" << std::endl;
+}
+
+static void usage_verify_compact_vs_gbwt(const char* prog) {
+    std::cerr << "Usage: " << prog << " --verify-compact-vs-gbwt <r_index.ri> <compact_tags.tags> --gbz <graph.gbz> [options]\n"
+              << "  Verify that the full compact tag array matches the GBWT path.\n"
+              << "  Uses only .gbz (GBZ contains both the GBWT index and the graph).\n"
+              << "  For each run, locates the run start in text space and compares (node_id, is_rev, offset) with the path.\n"
+              << "Options:\n"
+              << "  --gbz FILE        GBZ file (required; contains GBWT + graph)\n"
+              << "  --path-id N       GBWT path/sequence ID to compare (default: 0)\n"
+              << "  --sample-every N  Check every N-th run only (default: 1 = every run)\n" << std::endl;
+}
+
+static void usage_verify_sampled_vs_tags(const char* prog) {
+    std::cerr << "Usage: " << prog << " --verify-sampled-vs-tags <compressed_tags.tags> <sampled.tags>\n"
+              << "  Verify that the sampled tag array was built correctly from the full (compressed) tag array.\n"
+              << "  Traverses from the beginning run-by-run and compares the tag value at each run start.\n"
+              << std::endl;
+}
+
+static void usage_verify_rindex_encoded_vs_legacy(const char* prog) {
+    std::cerr << "Usage: " << prog << " --verify-rindex-encoded-vs-legacy <legacy.ri> <encoded.ri> [--trials N]\n"
+              << "  Complete comparison of non-encoded (legacy) and encoded r-index.\n"
+              << "  Checks: bwt_size, tot_runs, C, sym_map, samples, last, last_to_run,\n"
+              << "  LF(range,sym), rankAt, run_id_and_offset_at, LF(pos), bwt_end_position_of_run, decompressDA,\n"
+              << "  and block runs (Blocks vs EncodedBlock: same runs per block).\n"
+              << "  --trials N  number of random positions/ranges for LF/rank/run_id checks (default: 500)\n"
+              << std::endl;
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 3 && std::strcmp(argv[1], "--print-sampled-tags") == 0) {
+        std::string sampled_tags_file = argv[2];
+        return print_sampled_tag_array(sampled_tags_file);
+    }
+
+    if (argc >= 4 && std::strcmp(argv[1], "--verify-sampled-vs-tags") == 0) {
+        std::string compressed_tags_file = argv[2];
+        std::string sampled_tags_file = argv[3];
+        return verify_sampled_vs_tag_array(compressed_tags_file, sampled_tags_file);
+    }
+
+    if (argc >= 2 && std::strcmp(argv[1], "--verify-rindex-encoded-vs-legacy") == 0) {
+        std::string legacy_ri, encoded_ri;
+        size_t trials = 500;
+        for (int i = 2; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--trials") == 0 && i + 1 < argc) {
+                trials = static_cast<size_t>(std::stoull(argv[++i]));
+                if (trials == 0) trials = 500;
+            } else if (argv[i][0] != '-') {
+                if (legacy_ri.empty()) legacy_ri = argv[i];
+                else if (encoded_ri.empty()) encoded_ri = argv[i];
+            }
+        }
+        if (legacy_ri.empty() || encoded_ri.empty()) {
+            usage_verify_rindex_encoded_vs_legacy(argv[0]);
+            return 1;
+        }
+        return verify_rindex_encoded_vs_legacy(legacy_ri, encoded_ri, trials);
+    }
+
     if (argc >= 2 && std::strcmp(argv[1], "--verify-sampled") == 0) {
         std::string r_index_file;
         std::string sampled_tags_file;
-        std::string gbwt_index_file;
         std::string gbz_file;
         size_t path_id = 0;
         size_t sample_every = 1;
         for (int i = 2; i < argc; i++) {
-            if (std::strcmp(argv[i], "--gbwt-index") == 0 && i + 1 < argc) {
-                gbwt_index_file = argv[++i];
-            } else if (std::strcmp(argv[i], "--gbz") == 0 && i + 1 < argc) {
+            if (std::strcmp(argv[i], "--gbz") == 0 && i + 1 < argc) {
                 gbz_file = argv[++i];
             } else if (std::strcmp(argv[i], "--path-id") == 0 && i + 1 < argc) {
                 path_id = static_cast<size_t>(std::stoull(argv[++i]));
@@ -550,17 +1116,47 @@ int main(int argc, char **argv) {
                 else if (sampled_tags_file.empty()) sampled_tags_file = argv[i];
             }
         }
-        if (r_index_file.empty() || sampled_tags_file.empty() || gbwt_index_file.empty() || gbz_file.empty()) {
+        if (r_index_file.empty() || sampled_tags_file.empty() || gbz_file.empty()) {
             usage_verify(argv[0]);
             return 1;
         }
         return verify_sampled_against_gbwt(r_index_file, sampled_tags_file,
-                                          gbwt_index_file, gbz_file, path_id, sample_every);
+                                          gbz_file, path_id, sample_every);
+    }
+
+    if (argc >= 2 && std::strcmp(argv[1], "--verify-compact-vs-gbwt") == 0) {
+        std::string r_index_file;
+        std::string compact_tags_file;
+        std::string gbz_file;
+        size_t path_id = 0;
+        size_t sample_every = 1;
+        for (int i = 2; i < argc; i++) {
+            if (std::strcmp(argv[i], "--gbz") == 0 && i + 1 < argc) {
+                gbz_file = argv[++i];
+            } else if (std::strcmp(argv[i], "--path-id") == 0 && i + 1 < argc) {
+                path_id = static_cast<size_t>(std::stoull(argv[++i]));
+            } else if (std::strcmp(argv[i], "--sample-every") == 0 && i + 1 < argc) {
+                sample_every = static_cast<size_t>(std::stoull(argv[++i]));
+            } else if (argv[i][0] != '-') {
+                if (r_index_file.empty()) r_index_file = argv[i];
+                else if (compact_tags_file.empty()) compact_tags_file = argv[i];
+            }
+        }
+        if (r_index_file.empty() || compact_tags_file.empty() || gbz_file.empty()) {
+            usage_verify_compact_vs_gbwt(argv[0]);
+            return 1;
+        }
+        return verify_compact_tags_against_gbwt(r_index_file, compact_tags_file,
+                                                gbz_file, path_id, sample_every);
     }
 
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0] << " <gbz_graph> <r_index.ri> <tag_array_index_dir>\n"
-                  << "   Or: " << argv[0] << " --verify-sampled <r_index.ri> <sampled.tags> --gbwt-index <graph.gbwt> --gbz <graph.gbz> [--path-id N] [--sample-every N]" << std::endl;
+                  << "   Or: " << argv[0] << " --print-sampled-tags <sampled.tags>\n"
+                  << "   Or: " << argv[0] << " --verify-sampled-vs-tags <compressed_tags.tags> <sampled.tags>\n"
+                  << "   Or: " << argv[0] << " --verify-rindex-encoded-vs-legacy <legacy.ri> <encoded.ri> [--trials N]\n"
+                  << "   Or: " << argv[0] << " --verify-sampled <r_index.ri> <sampled.tags> --gbz <graph.gbz> [--path-id N] [--sample-every N]\n"
+                  << "   Or: " << argv[0] << " --verify-compact-vs-gbwt <r_index.ri> <compact_tags.tags> --gbz <graph.gbz> [--path-id N] [--sample-every N]\n";
         return 1;
     }
 

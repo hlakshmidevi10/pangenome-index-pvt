@@ -11,6 +11,7 @@
 #include <sdsl/construct.hpp>
 #include <sdsl/util.hpp>
 #include <mutex>
+#include <ostream>
 #include <gbwtgraph/utils.h>
 
 namespace panindexer {
@@ -36,6 +37,9 @@ namespace panindexer {
         inline const sdsl::sd_vector<>& run_starts() const { return bwt_intervals; }
         inline bool is_first_run_gap() const { return first_run_is_gap; }
 
+        // Debug: print is_first_run_gap, then bwt_intervals bit and rank for positions [0, limit)
+        void print_bwt_intervals_and_rank(size_t limit, std::ostream& out = std::cerr) const;
+
         // Lazy support initialization for run_starts()
         inline void ensure_run_rank() const {
             std::call_once(run_rank_once, [&]() {
@@ -57,11 +61,17 @@ namespace panindexer {
             return run_rank_support(bwt_intervals.size());
         }
 
-        // Return run id that contains BWT position pos
-        // Uses predecessor query on bwt_intervals
+        // Return run id (0-based) that contains BWT position pos.
+        // Uses rank: run containing pos is the one whose start is the last 1-bit at or before pos.
+        // SDSL rank_1(i) = number of 1s in [0..i-1], so rank_1(pos+1) = number of 1s in [0..pos].
+        // So run_id = rank_1(pos+1) - 1 (0-based); when rank==0 we return 0 (pos before first run start).
         inline size_t run_id_at(size_t pos) const {
-            auto iter = bwt_intervals.predecessor(pos);
-            return iter->first; // rank (0-indexed run_id)
+            ensure_run_rank();
+            if (pos >= bwt_intervals.size()) {
+                pos = bwt_intervals.size() - 1;
+            }
+            size_t r = run_rank_support(pos + 1);
+            return (r == 0) ? 0 : (r - 1);
         }
 
         // Return [start,end] BWT span for run_id

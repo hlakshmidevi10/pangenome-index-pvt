@@ -635,6 +635,7 @@ namespace panindexer {
         std::ifstream in_bwt_intervals(bwt_intervals_file, std::ios::binary);
         size_t bwt_pos_read;
         sdsl::sd_vector_builder builder_bwt(this->cumulative_run_bwt_position + 1, this->remaining_run_to_write_start);
+        std::cerr << "Building the bwt_intervals vector with size " << this->cumulative_run_bwt_position + 1 << " and the number of 1s is " << this->remaining_run_to_write_start << std::endl;
         while (in_bwt_intervals.read(reinterpret_cast<char*>(&bwt_pos_read), sizeof(bwt_pos_read))){
             builder_bwt.set(bwt_pos_read);
         }
@@ -775,7 +776,15 @@ namespace panindexer {
         this->bwt_intervals_rank = sdsl::sd_vector<>::rank_1_type(&this->bwt_intervals);
     }
 
-
+    void TagArray::print_bwt_intervals_and_rank(size_t limit, std::ostream& out) const {
+        size_t n = std::min(limit, static_cast<size_t>(this->bwt_intervals.size()));
+        out << "bwt_intervals (pos, bit, rank) up to " << n << " positions:\n";
+        for (size_t i = 0; i < n; ++i) {
+            // rank_1(i+1) = number of 1s in [0..i] (SDSL rank is exclusive of argument)
+            size_t r = this->bwt_intervals_rank(i + 1);
+            out << "  pos=" << i << " bit=" << static_cast<int>(this->bwt_intervals[i]) << " rank=" << r << "\n";
+        }
+    }
 
     void TagArray::query_compressed(size_t start, size_t end, size_t &number_of_runs) {
 

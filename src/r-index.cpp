@@ -561,7 +561,7 @@ namespace panindexer {
     // current_position Tracks how far we've gone through the BWT
     // The number does not include the index symbol
     size_t FastLocate::rankAt(size_t pos, size_t symbol, size_t &run_id, size_t &current_position) const {
-
+        if (this->is_encoded()) { return this->rankAt_encoded(pos, symbol, run_id, current_position); }
         auto iter = this->blocks_start_pos.predecessor(pos);
         size_t run_num = 0;
         size_t cur_pos = 0;
@@ -572,6 +572,7 @@ namespace panindexer {
         return cumulative_rank;
     }
 
+    // Returns exclusive rank: count of symbol in BWT[0..pos-1] (position pos is not included).
     size_t FastLocate::rankAt_encoded(size_t pos, size_t symbol, size_t &run_id, size_t &current_position) const {
         if (!this->is_encoded()) { return this->rankAt(pos, symbol, run_id, current_position); }
         auto iter = this->blocks_start_pos.predecessor(pos);
@@ -1050,7 +1051,7 @@ namespace panindexer {
 
         // running with how many threads
         std::cerr << omp_get_max_threads() << std::endl;
-#pragma omp parallel for schedule(dynamic, 1)
+// #pragma omp parallel for schedule(dynamic, 1)
         for (size_type i = 0; i < n_seq; i++) {
 
 //            std::cerr << "Starting a sub job for seq" << i << std::endl;
@@ -1069,6 +1070,8 @@ namespace panindexer {
             range_type run(0, 0);
 
             while (curr.first != NENDMARKER) {
+                // printing sequence id and offset
+                std::cerr << "Sequence id " << i << " offset " << seq_offset << std::endl;
 
 
 //                auto next1 = this->psi(curr.second); // TODO: make a function that does these two lines at once
@@ -1083,6 +1086,8 @@ namespace panindexer {
                 run.second = tem_cur + tt.second - 1;
 
                 run_id = temp_run_id;
+                // // printing run id and offset and base character
+                // std::cerr << "Run id " << run_id << " offset " << seq_offset << " base character " << curr.first << std::endl;
 
 //                assert(1 == 2);
 //                assert(static_cast<size_t>(run_id1) == temp_run_id);
@@ -1299,6 +1304,37 @@ namespace panindexer {
             }
             
             return block_start_bwt_pos + cumulative_length - 1;
+        }
+    }
+
+    void FastLocate::get_block_runs(size_t block_id, std::vector<std::pair<size_t, size_t>>& runs_out) const {
+        runs_out.clear();
+        if (!this->blocks.empty()) {
+            if (block_id >= this->blocks.size()) return;
+            const auto& blk = this->blocks[block_id];
+            for (size_t i = 0; i < blk.get_run_nums(); ++i) {
+                auto r = blk.get_run(i);
+                runs_out.emplace_back(r.first, r.second);
+            }
+            return;
+        }
+        // Encoded: decode runs from EncodedBlock
+        if (block_id >= this->blocks_encoded_start_bits.size()) return;
+        gbwt::size_type loc = static_cast<gbwt::size_type>(this->blocks_encoded_start_bits[block_id]);
+        size_t end_pos = (block_id + 1 < this->blocks_encoded_start_bits.size())
+            ? this->blocks_encoded_start_bits[block_id + 1]
+            : this->blocks_encoded_stream.size();
+        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
+        blk.skip_header(loc);
+        while (static_cast<size_t>(loc) < end_pos) {
+            gbwt::byte_type header = this->blocks_encoded_stream[loc++];
+            int code = (header >> 5) & 0x7;
+            size_t prefix = header & 0x1F;
+            size_t run_length = (prefix < 31)
+                ? (prefix + 1)
+                : (32 + static_cast<size_t>(gbwt::ByteCode::read(this->blocks_encoded_stream, loc)));
+            size_t symbol = this->code_to_symbol(code);
+            runs_out.emplace_back(symbol, run_length);
         }
     }
 
@@ -1623,6 +1659,31 @@ FastLocate::bi_interval FastLocate::forward_extend(const bi_interval& bint, size
     return bi_interval(tmp.reverse, tmp.forward, tmp.size);
 }
 
+
+void FastLocate::print_character_counts(std::ostream& out) const {
+    if (this->C.empty()) { out << "(r-index C array empty)\n"; return; }
+    const size_t sigma = this->C.size();
+    const size_t total = this->sequence_size;
+    out << "# BWT character counts (encoded_has_N=" << (this->encoded_has_N ? 1 : 0) << ")\n";
+    out << "# symbol\tcount\n";
+    for (char s : nuc) {
+        size_t idx = static_cast<size_t>(this->sym_map[static_cast<size_t>(s)]);
+        size_t count = 0;
+        if (idx < sigma) {
+            if (idx + 1 < sigma)
+                count = this->C[idx + 1] - this->C[idx];
+            else
+                count = total - this->C[idx];
+        }
+        if (s == 'N' && this->is_encoded() && !this->encoded_has_N)
+            count = 0;
+        const char* name = (s == NENDMARKER) ? "endmarker" : (s == '\n' ? "\\n" : nullptr);
+        if (name)
+            out << name << "\t" << count << "\n";
+        else
+            out << (char)s << "\t" << count << "\n";
+    }
+}
 
 void FastLocate::initialize_complement_table() {
     for (size_t i = 0; i < 256; ++i) {

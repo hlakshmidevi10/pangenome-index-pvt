@@ -427,16 +427,26 @@ int main(int argc, char** argv) {
     auto successor_result = r_index.last_successor(text_pos_j);
     size_t text_pos_x = successor_result.first;   // The marked text position at or after j
     size_t rank_x = successor_result.second;      // 0-based index into last_to_run
-    
-    // Get run ID: rank_x is already 0-based index into last_to_run
-    size_t run_id = (rank_x < r_index.last_to_run.size()) 
-        ? r_index.last_to_run[rank_x] : 0;
-    
+
+    size_t tot_runs = r_index.tot_runs();
+    size_t run_id = 0;
+    if (rank_x < r_index.last_to_run.size()) {
+        run_id = r_index.last_to_run[rank_x];
+        // last_to_run is int_vector; reading into size_t can sign-extend if stored value had high bit set
+        if (r_index.last_to_run.width() < 64 && (run_id >> r_index.last_to_run.width()) != 0) {
+            run_id &= (1ULL << r_index.last_to_run.width()) - 1;
+        }
+        if (run_id >= tot_runs) {
+            cerr << "Error: last_to_run[" << rank_x << "]=" << r_index.last_to_run[rank_x]
+                 << " is invalid (tot_runs=" << tot_runs << "). Index may be corrupt or built with a bug." << endl;
+            return 1;
+        }
+    }
+
     // Find BWT position ISA[x] at the end of this run
-    // Use bwt_end_position_of_run to get the BWT end position of the run
     size_t bwt_pos_x = r_index.bwt_end_position_of_run(run_id);
-    
-    if (debug) cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x 
+
+    if (debug) cerr << "Found marked text position x=" << text_pos_x << " (rank=" << rank_x
          << ", run_id=" << run_id << ", BWT_pos=" << bwt_pos_x << ")" << endl;
     
     // Check if text_pos_x is after the sequence end, and if so, start from BWT[seq_id]

@@ -117,7 +117,12 @@ namespace panindexer {
         };
 
         enumerator(sink);
-        
+
+        if (cum != bwt_size) {
+            std::cerr << "WARNING: Sampled tag array build: streamed run lengths sum to " << cum
+                      << " but bwt_size is " << bwt_size << ". Alignment may be wrong." << std::endl;
+        }
+
         // Determine if first run is gap (with bounds check for empty input)
         first_run_is_gap = (values.empty() || values[0] == 0);
 
@@ -141,6 +146,7 @@ namespace panindexer {
                 if (i + 1 < values.size() && values[i + 1] != 0) {
                     // Insert gap run at the start position of next run (zero-length gap)
                     bwt_starts.push_back(starts[i + 1]);
+                    std::cerr << "Inserting gap run at the start position of next run (zero-length gap) " << starts[i + 1] << std::endl;
                 }
             }
         }
@@ -151,11 +157,35 @@ namespace panindexer {
             for (uint64_t s : bwt_starts) builder.set(s);
             bwt_intervals = sdsl::sd_vector<>(builder);
         }
-        
+
+        std::cerr << "The size of the bwt is: " << bwt_size << std::endl;
+        std::cerr << "The size of the bwt_starts vector is: " << bwt_starts.size() << std::endl;
+        std::cerr << "The size of the bwt_intervals vector is: " << bwt_intervals.size() << std::endl;
+
+        std::cerr << "The size of the non_gap_values vector is: " << non_gap_values.size() << std::endl;
         // Build wt_gmr from only non-gap values
         construct_wt_gmr_from_values(sampled_values, non_gap_values);
         
         std::cerr << "Finished building sampled_tag_array" << std::endl;
+    }
+
+    void SampledTagArray::print_bwt_intervals_and_rank(size_t limit, std::ostream& out) const {
+        // Same rank as run_id_at: rank_1(pos+1) = number of 1s in [0..pos]; run_id = rank - 1 (so run_id_at is correct).
+        ensure_run_rank();
+        ensure_run_select();
+        size_t n = std::min(limit, static_cast<size_t>(bwt_intervals.size()));
+        size_t nruns = total_runs();
+        out << "is_first_run_gap=" << first_run_is_gap << "\n";
+        out << "bwt_intervals (pos, bit, rank) up to " << n << " positions (rank = rank_1(pos+1), run_id = rank-1):\n";
+        for (size_t i = 0; i < n; ++i) {
+            size_t r = run_rank_support(i + 1);
+            out << "  pos=" << i << " bit=" << static_cast<int>(bwt_intervals[i]) << " rank=" << r << "\n";
+        }
+        out << "select_1(1..10) [position of j-th run start]:\n";
+        for (size_t j = 1; j <= 10 && j <= nruns; ++j) {
+            size_t sel = run_select_support(j);
+            out << "  select(" << j << ")=" << sel << "\n";
+        }
     }
 
     void SampledTagArray::serialize(std::ostream& out) const {

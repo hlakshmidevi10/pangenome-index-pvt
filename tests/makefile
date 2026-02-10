@@ -13,8 +13,11 @@ MY_CXX ?= g++
 # Parallelization flags
 PARALLEL_FLAGS=-fopenmp -pthread
 
-# Libraries
-LIBS=-L$(LIB_DIR) -L../deps/grlBWT/build -lgbwt -lgbwtgraph -lhandlegraph -lsdsl -ldivsufsort -ldivsufsort64 -lgrlbwt -lgtest -lgtest_main
+# Libraries - base libs without paths (paths added per-platform)
+BASE_LIBS=-lgbwt -lgbwtgraph -lhandlegraph -lsdsl -ldivsufsort -ldivsufsort64 -lgrlbwt
+GTEST_LIBS=-lgtest -lgtest_main
+# Default LIBS for non-Darwin (will be overridden on Darwin)
+LIBS=-L$(LIB_DIR) -L../deps/grlBWT/build $(BASE_LIBS) $(GTEST_LIBS)
 
 # macOS-specific OpenMP & compiler handling
 ifeq ($(shell uname -s), Darwin)
@@ -32,27 +35,28 @@ ifeq ($(shell uname -s), Darwin)
         ifeq ($(shell if [ -e $(HOMEBREW_PREFIX)/include/omp.h ]; then echo 1; else echo 0; fi), 1)
             $(info Found libomp via Homebrew.)
             PARALLEL_FLAGS += -I$(HOMEBREW_PREFIX)/include
-            LIBS += -L$(HOMEBREW_PREFIX)/lib
+            LIBOMP_PATH := $(HOMEBREW_PREFIX)/lib
         else ifeq ($(shell if [ -d $(HOMEBREW_PREFIX)/opt/libomp/include ]; then echo 1; else echo 0; fi), 1)
             $(info Found keg-only libomp via Homebrew.)
             PARALLEL_FLAGS += -I$(HOMEBREW_PREFIX)/opt/libomp/include
-            LIBS += -L$(HOMEBREW_PREFIX)/opt/libomp/lib
+            LIBOMP_PATH := $(HOMEBREW_PREFIX)/opt/libomp/lib
         else ifeq ($(shell if [ -d /opt/local/lib/libomp ]; then echo 1; else echo 0; fi), 1)
             $(info Found libomp via MacPorts.)
             PARALLEL_FLAGS += -I/opt/local/include/libomp
-            LIBS += -L/opt/local/lib/libomp
+            LIBOMP_PATH := /opt/local/lib/libomp
         else
             $(error Could not find libomp. Please install it using Homebrew or MacPorts.)
         endif
-
-        # We also need to link it.
-        LIBS += -lomp
     endif
 
+    CXX_FLAGS += -I$(HOMEBREW_PREFIX)/opt/openssl/include
     CXX_FLAGS += -I$(HOMEBREW_PREFIX)/include
+    
+    # Override LIBS: Homebrew path FIRST (for gtest), then other libs
+    LIBS := -L$(HOMEBREW_PREFIX)/lib -L$(LIB_DIR) -L../deps/grlBWT/build $(BASE_LIBS) -L$(LIBOMP_PATH) -lomp -L$(HOMEBREW_PREFIX)/opt/openssl/lib -lcrypto $(GTEST_LIBS)
 endif
 
-CXX_FLAGS=$(MY_CXX_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -I../include -I$(INC_DIR) -I../lib -I../deps/r-index/internal -I../deps/vg -I../deps/grlBWT/include
+CXX_FLAGS += $(MY_CXX_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -I../include -I$(INC_DIR) -I../lib -I../deps/r-index/internal -I../deps/vg -I../deps/grlBWT/include
 
 HEADERS=$(wildcard ../include/pangenome_index/*.hpp)
 

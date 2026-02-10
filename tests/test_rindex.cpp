@@ -29,6 +29,7 @@ namespace {
 struct Rotation {
     std::string rotation;
     int seq_index;
+    size_t start_pos;  // Starting position in original string (SA value)
 };
 
 // Function to create BWT from a given string and track the sequence index
@@ -39,7 +40,7 @@ createBWTWithSequenceInfo(const std::string &input, const std::vector<int> &seq_
 
     // Generate all rotations of the input string and associate each rotation with a sequence index
     for (int i = 0; i < n; ++i) {
-        rotations.push_back({input.substr(i) + input.substr(0, i), seq_indices[i]});
+        rotations.push_back({input.substr(i) + input.substr(0, i), seq_indices[i], static_cast<size_t>(i)});
     }
 
     std::sort(rotations.begin(), rotations.end(), [](const Rotation &a, const Rotation &b) {
@@ -57,6 +58,33 @@ createBWTWithSequenceInfo(const std::string &input, const std::vector<int> &seq_
 
 
     return {bwt, result_indices};
+}
+
+// Create BWT and return (bwt, result_indices, sa_values) where sa_values[i] = text position for BWT position i
+std::tuple<std::string, std::vector<panindexer::FastLocate::size_type>, std::vector<panindexer::FastLocate::size_type>>
+createBWTWithSA(const std::string &input, const std::vector<int> &seq_indices) {
+    int n = input.size();
+    std::vector<Rotation> rotations;
+
+    for (int i = 0; i < n; ++i) {
+        rotations.push_back({input.substr(i) + input.substr(0, i), seq_indices[i], static_cast<size_t>(i)});
+    }
+
+    std::sort(rotations.begin(), rotations.end(), [](const Rotation &a, const Rotation &b) {
+        return a.rotation < b.rotation;
+    });
+
+    std::string bwt;
+    std::vector<panindexer::FastLocate::size_type> result_indices;
+    std::vector<panindexer::FastLocate::size_type> sa_values;
+
+    for (const auto &rotation : rotations) {
+        bwt += rotation.rotation.back();
+        result_indices.push_back(rotation.seq_index);
+        sa_values.push_back(rotation.start_pos);
+    }
+
+    return {bwt, result_indices, sa_values};
 }
 
 // ======================= Additional encoded consistency tests =======================
@@ -190,12 +218,32 @@ TEST(RINDEX_Test, Locate_small_test) {
 
     std::string rlbwt_file = "../test_data/small_test_nl.rl_bwt";
     FastLocate r_index(rlbwt_file);
+    std::cerr << "r_index size: " << r_index.size() << std::endl;
 
+    // print header max length
+    std::cerr << "header max length: " << r_index.header.max_length << std::endl;
+    // print the samples 
+    std::cerr << "samples: " << std::endl;
+    for (size_t i = 0; i < r_index.samples.size(); i++) {
+        std::cerr << r_index.samples[i] << " ";
+    }
+    std::cerr << std::endl;
 
     auto x = r_index.decompressDA();
+    std::cerr << "x: " << std::endl;
+    for (size_t i = 0; i < x.size(); i++) {
+        std::cerr << x[i] << " ";
+    }
+    std::cerr << std::endl;
+    std::cerr << "sequence_indices: " << std::endl;
+    for (size_t i = 0; i < sequence_indices.size(); i++) {
+        std::cerr << sequence_indices[i] << " ";
+    }
+    std::cerr << std::endl;
     ASSERT_EQ(x, sequence_indices) << "Invalid Locate results from the r-index";
 
 }
+
 
 TEST(RINDEX_Test, Locate_small_test_encoded) {
     std::string filename = "../test_data/small_test_nl.txt";
@@ -364,9 +412,279 @@ TEST(RINDEX_Test, Locate_N_test_encoded) {
 
 // }
 
+// ======================= Encoded vs legacy parity (hard tests) =======================
+// Load legacy from .rl_bwt, serialize to encoded, load encoded; then compare core operations.
 
+static void load_legacy_and_encoded(const std::string& rlbwt_file, const std::string& temp_ri,
+                                     FastLocate& legacy, FastLocate& encoded) {
+    legacy = FastLocate(rlbwt_file);
+    {
+        std::ofstream out(temp_ri, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.good());
+        legacy.serialize_encoded(out);
+    }
+    {
+        std::ifstream in(temp_ri, std::ios::binary);
+        ASSERT_TRUE(in.good());
+        encoded.load_encoded(in);
+    }
+    ASSERT_FALSE(legacy.is_encoded());
+    ASSERT_TRUE(encoded.is_encoded());
+    ASSERT_EQ(legacy.bwt_size(), encoded.bwt_size());
+    ASSERT_EQ(legacy.tot_runs(), encoded.tot_runs());
+}
 
+TEST(RINDEX_Test, EncodedVsLegacy_LF_Range_Small) {
+    const char* rlbwt = "../test_data/small_test_nl.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_small.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    std::mt19937 rng(1001);
+    const size_t num_trials = 200;
+    for (size_t t = 0; t < num_trials; ++t) {
+        size_t first = n ? (rng() % n) : 0;
+        size_t second = n ? (rng() % n) : 0;
+        if (first > second) std::swap(first, second);
+        for (unsigned char sym : {'A', 'C', 'G', 'T'}) {
+            gbwt::range_type leg = legacy.LF({first, second}, sym);
+            gbwt::range_type enc = encoded.LF_encoded({first, second}, sym);
+            ASSERT_EQ(leg.first, enc.first) << "LF range first mismatch pos=[" << first << "," << second << "] sym=" << (char)sym;
+            ASSERT_EQ(leg.second, enc.second) << "LF range second mismatch pos=[" << first << "," << second << "] sym=" << (char)sym;
+        }
+    }
+}
 
+TEST(RINDEX_Test, EncodedVsLegacy_LF_Range_Medium) {
+    const char* rlbwt = "../test_data/med_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_med.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    std::mt19937 rng(1002);
+    for (size_t t = 0; t < 300; ++t) {
+        size_t first = n ? (rng() % n) : 0;
+        size_t second = n ? (rng() % n) : 0;
+        if (first > second) std::swap(first, second);
+        for (unsigned char sym : {'A', 'C', 'G', 'T'}) {
+            gbwt::range_type leg = legacy.LF({first, second}, sym);
+            gbwt::range_type enc = encoded.LF_encoded({first, second}, sym);
+            ASSERT_EQ(leg.first, enc.first) << "LF range first mismatch sym=" << (char)sym;
+            ASSERT_EQ(leg.second, enc.second) << "LF range second mismatch sym=" << (char)sym;
+        }
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_LF_Range_NTest) {
+    const char* rlbwt = "../test_data/N_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_N.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    std::mt19937 rng(1003);
+    for (size_t t = 0; t < 200; ++t) {
+        size_t first = n ? (rng() % n) : 0;
+        size_t second = n ? (rng() % n) : 0;
+        if (first > second) std::swap(first, second);
+        for (unsigned char sym : {'A', 'C', 'G', 'T', 'N'}) {
+            gbwt::range_type leg = legacy.LF({first, second}, sym);
+            gbwt::range_type enc = encoded.LF_encoded({first, second}, sym);
+            ASSERT_EQ(leg.first, enc.first) << "LF range first mismatch sym=" << (char)sym;
+            ASSERT_EQ(leg.second, enc.second) << "LF range second mismatch sym=" << (char)sym;
+        }
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_RankAt_Small) {
+    const char* rlbwt = "../test_data/small_test_nl.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_small.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    std::mt19937 rng(2001);
+    for (size_t t = 0; t < 300; ++t) {
+        size_t pos = n ? (rng() % (n + 1)) : 0;  // 0..n inclusive (rank at n = total count)
+        for (unsigned char sym : {'A', 'C', 'G', 'T'}) {
+            size_t r_leg = legacy.rankAt(pos, sym);
+            size_t r_enc = encoded.rankAt(pos, sym);
+            ASSERT_EQ(r_leg, r_enc) << "rankAt mismatch pos=" << pos << " sym=" << (char)sym;
+        }
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_RankAt_Medium) {
+    const char* rlbwt = "../test_data/med_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_med.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    std::mt19937 rng(2002);
+    for (size_t t = 0; t < 400; ++t) {
+        size_t pos = n ? (rng() % (n + 1)) : 0;
+        for (unsigned char sym : {'A', 'C', 'G', 'T'}) {
+            ASSERT_EQ(legacy.rankAt(pos, sym), encoded.rankAt(pos, sym))
+                << "rankAt pos=" << pos << " sym=" << (char)sym;
+        }
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_RunIdAndGetSample_Small) {
+    const char* rlbwt = "../test_data/small_test_nl.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_small.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    const size_t num_runs = legacy.tot_runs();
+    for (size_t run_id = 0; run_id < num_runs; ++run_id) {
+        ASSERT_EQ(legacy.getSample(run_id), encoded.getSample(run_id))
+            << "getSample mismatch run_id=" << run_id;
+    }
+    std::mt19937 rng(3001);
+    for (size_t t = 0; t < 200; ++t) {
+        size_t pos = n ? (rng() % n) : 0;
+        size_t run_leg, run_enc, off_leg, off_enc;
+        legacy.run_id_and_offset_at(pos, run_leg, off_leg);
+        encoded.run_id_and_offset_at(pos, run_enc, off_enc);
+        ASSERT_EQ(run_leg, run_enc) << "run_id_and_offset_at run_id mismatch pos=" << pos;
+        ASSERT_EQ(off_leg, off_enc) << "run_id_and_offset_at offset mismatch pos=" << pos;
+        ASSERT_EQ(legacy.getSample(run_leg), encoded.getSample(run_enc)) << "getSample at pos=" << pos;
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_RunIdAndGetSample_Medium) {
+    const char* rlbwt = "../test_data/med_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_med.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    const size_t num_runs = legacy.tot_runs();
+    for (size_t run_id = 0; run_id < num_runs; ++run_id) {
+        ASSERT_EQ(legacy.getSample(run_id), encoded.getSample(run_id)) << "run_id=" << run_id;
+    }
+    std::mt19937 rng(3002);
+    for (size_t t = 0; t < 400; ++t) {
+        size_t pos = n ? (rng() % n) : 0;
+        size_t run_leg, run_enc, off_leg, off_enc;
+        legacy.run_id_and_offset_at(pos, run_leg, off_leg);
+        encoded.run_id_and_offset_at(pos, run_enc, off_enc);
+        ASSERT_EQ(run_leg, run_enc);
+        ASSERT_EQ(off_leg, off_enc);
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_SingleLF_Small) {
+    const char* rlbwt = "../test_data/small_test_nl.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_small.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    std::mt19937 rng(4001);
+    for (size_t t = 0; t < 200; ++t) {
+        size_t pos = n ? (rng() % n) : 0;
+        size_t next_leg = legacy.LF(pos);
+        size_t next_enc = encoded.LF(pos);
+        ASSERT_EQ(next_leg, next_enc) << "LF(idx) mismatch at pos=" << pos;
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_SingleLF_Medium) {
+    const char* rlbwt = "../test_data/med_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_med.ri", legacy, encoded);
+    const size_t n = legacy.bwt_size();
+    std::mt19937 rng(4002);
+    for (size_t t = 0; t < 500; ++t) {
+        size_t pos = n ? (rng() % n) : 0;
+        ASSERT_EQ(legacy.LF(pos), encoded.LF(pos)) << "pos=" << pos;
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_DecompressDA_Small) {
+    const char* rlbwt = "../test_data/small_test_nl.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_small.ri", legacy, encoded);
+    auto da_leg = legacy.decompressDA();
+    auto da_enc = encoded.decompressDA();
+    ASSERT_EQ(da_leg.size(), da_enc.size());
+    for (size_t i = 0; i < da_leg.size(); ++i) {
+        ASSERT_EQ(da_leg[i], da_enc[i]) << "decompressDA mismatch at i=" << i;
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_DecompressDA_Medium) {
+    const char* rlbwt = "../test_data/med_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_med.ri", legacy, encoded);
+    auto da_leg = legacy.decompressDA();
+    auto da_enc = encoded.decompressDA();
+    ASSERT_EQ(da_leg.size(), da_enc.size());
+    for (size_t i = 0; i < da_leg.size(); ++i) {
+        ASSERT_EQ(da_leg[i], da_enc[i]) << "i=" << i;
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_DecompressDA_NTest) {
+    const char* rlbwt = "../test_data/N_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_N.ri", legacy, encoded);
+    auto da_leg = legacy.decompressDA();
+    auto da_enc = encoded.decompressDA();
+    ASSERT_EQ(da_leg.size(), da_enc.size());
+    for (size_t i = 0; i < da_leg.size(); ++i) {
+        ASSERT_EQ(da_leg[i], da_enc[i]) << "i=" << i;
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_BackwardExtend_StepByStep_Small) {
+    const char* rlbwt = "../test_data/small_test_nl.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_small.ri", legacy, encoded);
+    std::string pattern = "ACGTACGT";
+    panindexer::FastLocate::bi_interval b_leg = {0, 0, legacy.bwt_size()};
+    panindexer::FastLocate::bi_interval b_enc = {0, 0, encoded.bwt_size()};
+    for (char c : pattern) {
+        b_leg = legacy.backward_extend(b_leg, static_cast<size_t>(c));
+        b_enc = encoded.backward_extend_encoded(b_enc, static_cast<size_t>(c));
+        ASSERT_EQ(b_leg.forward, b_enc.forward) << "backward_extend forward after '" << c << "'";
+        ASSERT_EQ(b_leg.reverse, b_enc.reverse) << "backward_extend reverse after '" << c << "'";
+        ASSERT_EQ(b_leg.size, b_enc.size) << "backward_extend size after '" << c << "'";
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_BackwardExtend_StepByStep_Medium) {
+    const char* rlbwt = "../test_data/med_test.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_med.ri", legacy, encoded);
+    std::mt19937 rng(5001);
+    const char alphabet[] = "ACGT";
+    for (size_t trial = 0; trial < 100; ++trial) {
+        std::string pattern;
+        for (int i = 0; i < 15; ++i) pattern += alphabet[rng() % 4];
+        panindexer::FastLocate::bi_interval b_leg = {0, 0, legacy.bwt_size()};
+        panindexer::FastLocate::bi_interval b_enc = {0, 0, encoded.bwt_size()};
+        for (char c : pattern) {
+            b_leg = legacy.backward_extend(b_leg, static_cast<size_t>(c));
+            b_enc = encoded.backward_extend_encoded(b_enc, static_cast<size_t>(c));
+            if (b_leg.size == 0) break;
+            ASSERT_EQ(b_leg.forward, b_enc.forward);
+            ASSERT_EQ(b_leg.reverse, b_enc.reverse);
+            ASSERT_EQ(b_leg.size, b_enc.size);
+        }
+    }
+}
+
+TEST(RINDEX_Test, EncodedVsLegacy_Count_BigTest) {
+    const char* rlbwt = "../test_data/big_test/merged_info.rl_bwt";
+    FastLocate legacy, encoded;
+    load_legacy_and_encoded(rlbwt, "./tmp_parity_big.ri", legacy, encoded);
+    std::ifstream in("../test_data/big_test/merged_info");
+    ASSERT_TRUE(in.is_open());
+    std::string full_text, line;
+    while (std::getline(in, line)) { if (!line.empty()) full_text += line; }
+    in.close();
+    ASSERT_GE(full_text.size(), 50u);
+    std::mt19937 rng(6001);
+    for (size_t t = 0; t < 100; ++t) {
+        size_t pos = rng() % (full_text.size() - 20);
+        std::string pat = full_text.substr(pos, 10 + (rng() % 10));
+        auto r_leg = legacy.count(pat);
+        auto r_enc = encoded.count_encoded(pat);
+        ASSERT_EQ(r_leg.first, r_enc.first) << "count start pattern '" << pat << "'";
+        ASSERT_EQ(r_leg.second, r_enc.second) << "count end pattern '" << pat << "'";
+    }
+}
 
 TEST(FMDINDEX_Test, BackwardExtensionMatchesLF) {
     std::string rlbwt_file = "../test_data/big_test/merged_info.rl_bwt";
@@ -609,6 +927,140 @@ TEST(FMDINDEX_Test, CompareSampledKmersNoN_Bidirectional) {
         ASSERT_EQ(int_kmer.reverse, int_rc.forward) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
         ASSERT_EQ(int_kmer.size, int_rc.size) << "FMD symmetry violated between '" << kmer << "' and '" << revcomp << "'";
     }
+}
+
+TEST(RINDEX_Test, Samples_Offset_From_End) {
+    std::string filename = "../test_data/small_test_nl.txt";
+    std::ifstream file(filename);
+    ASSERT_TRUE(file.is_open()) << "Could not open " << filename;
+
+    std::string line;
+    std::string concatenatedString;
+    std::vector<int> seq_indices;
+    int sequence_number = 0;
+    char added_char = '$';
+
+    while (std::getline(file, line)) {
+        for (size_t i = 0; i < line.size(); ++i) {
+            seq_indices.push_back(sequence_number);
+        }
+        seq_indices.push_back(sequence_number);
+        concatenatedString += line;
+        concatenatedString += added_char;
+        added_char += 1;
+        ++sequence_number;
+    }
+    file.close();
+
+    std::cout << "[Samples_Offset_From_End] Input file: " << filename << std::endl;
+    std::cout << "[Samples_Offset_From_End] Concatenated string length: " << concatenatedString.size()
+              << " (\"" << concatenatedString << "\")" << std::endl;
+    std::cout << "[Samples_Offset_From_End] Number of sequences: " << sequence_number << std::endl;
+
+    ASSERT_GE(concatenatedString.size(), 1u) << "Empty or invalid test file";
+
+    auto [bwt, result_indices, expected_sa] = createBWTWithSA(concatenatedString, seq_indices);
+    ASSERT_EQ(expected_sa.size(), concatenatedString.size()) << "SA size mismatch";
+
+    int n_seq = sequence_number;
+    std::vector<size_t> seq_start(n_seq), seq_length(n_seq);
+    for (int s = 0; s < n_seq; ++s) {
+        seq_start[s] = 0;
+        for (int t = 0; t < s; ++t) {
+            size_t count = 0;
+            for (int idx : seq_indices) { if (idx == t) ++count; }
+            seq_start[s] += count;
+        }
+        seq_length[s] = 0;
+        for (int idx : seq_indices) { if (idx == s) ++seq_length[s]; }
+    }
+
+    std::cout << "[Samples_Offset_From_End] Sequence boundaries:" << std::endl;
+    for (int s = 0; s < n_seq; ++s) {
+        std::cout << "  seq_id=" << s << " start=" << seq_start[s] << " length=" << seq_length[s] << std::endl;
+    }
+
+    std::string rlbwt_file = "../test_data/small_test_nl.rl_bwt";
+    std::cout << "[Samples_Offset_From_End] Loading r-index: " << rlbwt_file << std::endl;
+    FastLocate r_index(rlbwt_file);
+
+    std::vector<panindexer::FastLocate::size_type> r_index_sa = r_index.decompressSA();
+    ASSERT_EQ(r_index_sa.size(), expected_sa.size()) << "r-index SA size mismatch with expected";
+
+    std::cout << "[Samples_Offset_From_End] BWT size: " << r_index_sa.size() << std::endl;
+    std::cout << "[Samples_Offset_From_End] Comparing stored samples vs expected (offset-from-start vs offset-from-end):" << std::endl;
+
+    // Detect whether samples use offset-from-START or offset-from-END
+    bool matches_offset_from_end = true;
+    bool matches_offset_from_start = true;
+    for (size_t i = 0; i < r_index_sa.size(); ++i) {
+        size_t packed = r_index_sa[i];
+        size_t seq_id = r_index.seqId(packed);
+        size_t seq_offset = r_index.seqOffset(packed);
+
+        size_t text_pos = expected_sa[i];
+        size_t expected_seq_id = static_cast<size_t>(seq_indices[text_pos]);
+        size_t offset_in_seq = text_pos - seq_start[expected_seq_id];
+        size_t seq_len = seq_length[expected_seq_id];
+        size_t expected_offset_from_end = (seq_len - 1) - offset_in_seq;
+
+        std::cout << "  i=" << i << " text_pos=" << text_pos << " char='" << (text_pos < concatenatedString.size() ? concatenatedString[text_pos] : '?')
+                  << "' stored(seq_id=" << seq_id << ", seq_offset=" << seq_offset << ")"
+                  << " expected_seq_id=" << expected_seq_id
+                  << " offset_from_start=" << offset_in_seq << " offset_from_end=" << expected_offset_from_end
+                  << " seq_len=" << seq_len
+                  << " match_start?=" << (seq_offset == offset_in_seq ? "yes" : "no")
+                  << " match_end?=" << (seq_offset == expected_offset_from_end ? "yes" : "no") << std::endl;
+
+        if (seq_id != expected_seq_id) {
+            matches_offset_from_end = false;
+            matches_offset_from_start = false;
+            break;
+        }
+        if (seq_offset != expected_offset_from_end) matches_offset_from_end = false;
+        if (seq_offset != offset_in_seq) matches_offset_from_start = false;
+    }
+
+    std::cout << "[Samples_Offset_From_End] Result: matches_offset_from_end=" << (matches_offset_from_end ? "YES" : "no")
+              << " matches_offset_from_start=" << (matches_offset_from_start ? "YES" : "no") << std::endl;
+
+    ASSERT_TRUE(matches_offset_from_end || matches_offset_from_start)
+        << "Stored sample offsets match neither offset-from-start nor offset-from-end (SA/seq_id mismatch?)";
+
+    // r-index (as built/loaded) uses offset-from-START; assert that and document it
+    ASSERT_TRUE(matches_offset_from_start)
+        << "Head/tail samples do not match offset-from-start (SA/seq_id or ordering mismatch?)";
+    std::cout << "[Samples_Offset_From_End] Assertion: r-index samples use offset-from-START (beginning of sequence)." << std::endl;
+
+    // Verify every position: stored seq_offset should equal offset_from_start
+    for (size_t i = 0; i < r_index_sa.size(); ++i) {
+        size_t packed = r_index_sa[i];
+        size_t seq_id = r_index.seqId(packed);
+        size_t seq_offset = r_index.seqOffset(packed);
+
+        size_t text_pos = expected_sa[i];
+        size_t expected_seq_id = static_cast<size_t>(seq_indices[text_pos]);
+        size_t offset_in_seq = text_pos - seq_start[expected_seq_id];
+
+        ASSERT_EQ(seq_id, expected_seq_id) << "At BWT position i=" << i << ": seq_id mismatch";
+        ASSERT_EQ(seq_offset, offset_in_seq)
+            << "At BWT position i=" << i << ": seq_offset should be offset-from-START (got " << seq_offset
+            << ", expected offset_from_start=" << offset_in_seq << ")";
+    }
+
+    size_t n_runs = r_index.tot_runs();
+    std::cout << "[Samples_Offset_From_End] Head samples (tot_runs=" << n_runs << "):" << std::endl;
+    for (size_t run_id = 0; run_id < n_runs; ++run_id) {
+        size_t head_packed = r_index.getSample(run_id);
+        size_t head_seq_id = r_index.seqId(head_packed);
+        size_t head_offset = r_index.seqOffset(head_packed);
+
+        std::cout << "  run_id=" << run_id << " head(seq_id=" << head_seq_id << ", seq_offset=" << head_offset << ")" << std::endl;
+
+        ASSERT_LT(head_seq_id, static_cast<size_t>(n_seq)) << "Invalid head sample seq_id at run " << run_id;
+        ASSERT_LT(head_offset, r_index.header.max_length) << "Invalid head sample offset at run " << run_id;
+    }
+    std::cout << "[Samples_Offset_From_End] Done." << std::endl;
 }
 
 TEST(FMDINDEX_Test, CompareSampledKmersNoN_Bidirectional_Encoded) {
