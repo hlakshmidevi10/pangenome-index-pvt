@@ -146,7 +146,6 @@ namespace panindexer {
                 if (i + 1 < values.size() && values[i + 1] != 0) {
                     // Insert gap run at the start position of next run (zero-length gap)
                     bwt_starts.push_back(starts[i + 1]);
-                    std::cerr << "Inserting gap run at the start position of next run (zero-length gap) " << starts[i + 1] << std::endl;
                 }
             }
         }

@@ -62,6 +62,21 @@ struct FragmentInfo {
     vector<size_t> anchor_offsets; // Anchor offsets where this fragment aligns
 };
 
+// Optional timing breakdown for find_tags_in_interval (used with --benchmark)
+struct FindTagsInIntervalTiming {
+    size_t num_lf_before_phase1 = 0;     // number of LF steps in initial skip loop (text_pos_x - text_pos_j)
+    double init_skip_lf_ms = 0;          // time spent in initial skip loop (LF until current_text_pos <= text_pos_j)
+    size_t phase1_lf_count = 0;        // number of r_index.LF() calls in phase1
+    double phase1_lf_ms = 0;            // time spent in r_index.LF() in phase1
+    double phase1_tag_lookup_ms = 0;     // sampled.run_id_at() and sampled.run_value()
+    double phase1_position_lookup_ms = 0; // r_index.seqId() and r_index.seqOffset()
+    double phase1_tag_map_ms = 0;        // tag_map find/insert/push_back operations
+    double phase1_fast_path_ms = 0;      // fast path: decode_tag, decompressSA, loops
+    bool used_fast_path = false;         // true if fast path was enabled (gbwt + graph + target + bidirectional)
+    bool found_last_common = false;     // true if we stopped at last common node and broke out of phase1 loop
+    size_t last_common_source_base = 0;  // source sequence offset (base position) where last common node was found; 0 if not found
+};
+
 // Parse interval string like "1000..2000"
 static pair<size_t, size_t> parse_interval(const string& interval_str) {
     size_t dot_pos = interval_str.find("..");
@@ -380,6 +395,9 @@ static void usage(const char* prog) {
     cerr << "       --target-sample GRCh38 --target-contig chr1 --interval 1000..2000 --gbz graph.gbz" << endl;
 }
 
+// Forward declaration for helper used by find_tags_in_interval
+pair<int64_t, bool> decode_tag(uint64_t tag_code);
+
 // Recover packed text position (SA value) at a given BWT position using r-index.
 // Used to verify that (text_pos, bwt_pos) pairs maintained during LF iteration are correct.
 static size_t recover_text_pos_from_bwt(FastLocate& r_index, size_t bwt_pos) {
@@ -392,12 +410,21 @@ static size_t recover_text_pos_from_bwt(FastLocate& r_index, size_t bwt_pos) {
     return packed;
 }
 
-// Find all tags (nodes) visited by the source haplotype in the given interval
+// Find all tags (nodes) visited by the source haplotype in the given interval.
+// Optional fast path: when gbwt_index, gbwt_fast_locate, graph, and target_seq_id are provided
+// and the GBWT is bidirectional, stops at the last common node with the target haplotype and
+// completes the interval using GBWT inverseLF (backward walk) instead of r-index LF.
 vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& sampled,
-                                       size_t source_seq_id, size_t seq_start, size_t seq_end) {
+                                       size_t source_seq_id, size_t seq_start, size_t seq_end,
+                                       const gbwt::GBWT* gbwt_index = nullptr,
+                                       const gbwt::FastLocate* gbwt_fast_locate = nullptr,
+                                       const gbwtgraph::GBWTGraph* graph = nullptr,
+                                       size_t target_seq_id = numeric_limits<size_t>::max(),
+                                       FindTagsInIntervalTiming* out_timing = nullptr) {
+    auto t_find_tags_start = high_resolution_clock::now();
     vector<TagInfo> tags;
     unordered_map<uint64_t, TagInfo> tag_map;
-    
+
     // Convert sequence interval to packed text positions
     size_t text_pos_i = r_index.pack(source_seq_id, seq_start);
     size_t text_pos_j = r_index.pack(source_seq_id, seq_end);
@@ -407,11 +434,9 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
              << "] (text positions [" << text_pos_i << ", " << text_pos_j << "])" << endl;
     }
     
-    
     auto successor_result = r_index.last_successor(text_pos_j);
     size_t text_pos_x = successor_result.first;
     size_t rank_x = successor_result.second;
-    
 
     if (debug) {
         cerr << "rank_x=" << rank_x << ", last_to_run.size()=" << r_index.last_to_run.size() << endl;
@@ -421,8 +446,6 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     size_t run_id = 0;
     if (rank_x < r_index.last_to_run.size()) {
         run_id = r_index.last_to_run[rank_x];
-        // last_to_run is int_vector with width = bits for (tot_runs-1); reading into size_t can sign-extend
-        // if the stored value had the high bit set (e.g. corrupt or wrong type during build).
         if (r_index.last_to_run.width() < 64 && (run_id >> r_index.last_to_run.width()) != 0) {
             run_id &= (1ULL << r_index.last_to_run.width()) - 1;
         }
@@ -440,14 +463,13 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     }
     
     // Check if text_pos_x is after the sequence end
-    size_t bwt_seq_end = source_seq_id;  // BWT position of $ at end of sequence source_seq_id
+    size_t bwt_seq_end = source_seq_id;
     size_t text_pos_seq_end;
     {
         size_t rindex_run_id = 0;
         size_t run_start_pos = 0;
         r_index.run_id_and_offset_at(bwt_seq_end, rindex_run_id, run_start_pos);
         text_pos_seq_end = r_index.getSample(rindex_run_id);
-        // Navigate from run start to bwt_seq_end
         for (size_t p = run_start_pos; p < bwt_seq_end; ++p) {
             text_pos_seq_end = r_index.locateNext(text_pos_seq_end);
         }
@@ -458,28 +480,34 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
              << ", text_pos_seq_end=" << text_pos_seq_end << " (BWT[" << bwt_seq_end << "])" << endl;
     }
     
-    // Check if text_pos_x (BWT rank from last array) is greater than sequence end
     if (text_pos_x > text_pos_seq_end) {
         cerr << "Error: BWT rank calculated from last array (text_pos_x=" << text_pos_x 
              << ") is greater than sequence end (text_pos_seq_end=" << text_pos_seq_end << ")" << endl;
-        return tags;  // Return empty tags vector
+        return tags;
     }
     
-    // Iterate backwards through the interval
     size_t current_text_pos = text_pos_x;
     size_t current_bwt_pos = bwt_pos_x;
-    
-    // Skip positions after the interval end (we only want tags within and before the interval)
+
+    // Number of LF steps required before phase1 (skip from text_pos_x down to text_pos_j)
+    if (out_timing) {
+        out_timing->num_lf_before_phase1 = (text_pos_x > text_pos_j) ? (text_pos_x - text_pos_j) : 0;
+    }
+
+    // Skip positions after the interval end
+    auto t_init_skip_start = high_resolution_clock::now();
     while (current_text_pos > text_pos_j) {
         current_text_pos--;
         current_bwt_pos = r_index.LF(current_bwt_pos);
     }
-    
+    if (out_timing) {
+        out_timing->init_skip_lf_ms = duration_cast<microseconds>(high_resolution_clock::now() - t_init_skip_start).count() / 1000.0;
+    }
+
     if (debug) {
         cerr << "    is_first_run_gap=" << sampled.is_first_run_gap() << endl;
     }
-    
-    // When debug: pick a few text positions in [text_pos_i, text_pos_j] to verify (text_pos, bwt_pos) correctness
+
     unordered_set<size_t> verify_text_positions;
     if (debug && text_pos_j >= text_pos_i) {
         const size_t num_verify = 10;
@@ -491,19 +519,39 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
              << " positions (recover text_pos from bwt_pos via r-index)" << endl;
     }
     
-    // Now process the interval itself
+    // Determine if we can use the fast path: GBWT inverseLF from last common node backward
+    const bool use_fast_path = (gbwt_index != nullptr && gbwt_fast_locate != nullptr && graph != nullptr
+                                && target_seq_id != numeric_limits<size_t>::max()
+                                && gbwt_index->bidirectional());
+    if (out_timing) {
+        out_timing->used_fast_path = use_fast_path;
+    }
+
+    if (debug) {
+        cerr << "use_fast_path=" << use_fast_path << endl;
+    }
+    
+    // Last common node state (used only in fast path)
+    bool found_last_common = false;
+    gbwt::node_type last_common_node = gbwt::ENDMARKER;
+    size_t last_common_source_base = 0;
+    gbwt::edge_type source_gbwt_edge = { gbwt::ENDMARKER, 0 };  // sentinel for "not set"
+    
+    // ----- Phase 1: Traverse with r_index.last + LF backward, collect TAGs, stop at last common if fast path -----
     while (current_text_pos >= text_pos_i) {
         if (current_text_pos <= text_pos_j) {
-            // Get tag for current BWT position
+            auto t_tag_lookup_start = high_resolution_clock::now();
             size_t sampled_run_id = sampled.run_id_at(current_bwt_pos);
             uint64_t tag_val = sampled.run_value(sampled_run_id);
+            if (out_timing) {
+                out_timing->phase1_tag_lookup_ms += duration_cast<microseconds>(high_resolution_clock::now() - t_tag_lookup_start).count() / 1000.0;
+            }
 
             if (debug) {
                 cerr << "  Text pos " << current_text_pos << " -> BWT pos " << current_bwt_pos 
                      << " -> tag=" << tag_val << " -> run_id=" << sampled_run_id << endl;
             }
             
-            // Verify (text_pos, bwt_pos) for a few sample positions: recover text pos from BWT pos
             if (debug && verify_text_positions.count(current_text_pos)) {
                 size_t recovered = recover_text_pos_from_bwt(r_index, current_bwt_pos);
                 bool ok = (recovered == current_text_pos);
@@ -512,14 +560,17 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
             }
             
             if (tag_val != 0) {
-                // Unpack to get offset
+                auto t_pos_lookup_start = high_resolution_clock::now();
                 size_t seq_id_found = r_index.seqId(current_text_pos);
                 size_t offset_from_start = r_index.seqOffset(current_text_pos);
+                if (out_timing) {
+                    out_timing->phase1_position_lookup_ms += duration_cast<microseconds>(high_resolution_clock::now() - t_pos_lookup_start).count() / 1000.0;
+                }
                 
-                // Only process positions in our source sequence and interval
                 if (seq_id_found == source_seq_id && 
                     offset_from_start >= seq_start && offset_from_start <= seq_end) {
                     
+                    auto t_tag_map_start = high_resolution_clock::now();
                     if (tag_map.find(tag_val) == tag_map.end()) {
                         tag_map[tag_val] = TagInfo{tag_val, {}, {}, {}};
                     }
@@ -527,96 +578,214 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
                     tag_map[tag_val].source_offsets.push_back(offset_from_start);
                     tag_map[tag_val].source_bwt_positions.push_back(current_bwt_pos);
                     tag_map[tag_val].source_packed_positions.push_back(current_text_pos);
+                    if (out_timing) {
+                        out_timing->phase1_tag_map_ms += duration_cast<microseconds>(high_resolution_clock::now() - t_tag_map_start).count() / 1000.0;
+                    }
+                }
+                
+                // Fast path: check if this TAG is the last common node (target haplotype also passes)
+                if (use_fast_path) {
+                    auto t_fast_path_start = high_resolution_clock::now();
+                    auto [node_id, is_rev] = decode_tag(tag_val);
+                    gbwt::node_type node = gbwt::Node::encode(node_id, is_rev);
+                    std::vector<gbwt::size_type> sa_values = gbwt_fast_locate->decompressSA(node);
+                    bool target_passes = false;
+                    for (size_t i = 0; i < sa_values.size(); ++i) {
+                        if (gbwt_fast_locate->seqId(sa_values[i]) == target_seq_id) {
+                            target_passes = true;
+                            break;
+                        }
+                    }
+                    if (target_passes) {
+                        // This is the last common node (first common we hit when walking backward from end)
+                        found_last_common = true;
+                        last_common_node = node;
+                        last_common_source_base = r_index.seqOffset(current_text_pos);
+                        
+                        // Find GBWT handle for source haplotype on this node (same as check_common_node for last common):
+                        // decompressSA(node) gives all visits; for last common we want source visit with SMALLEST
+                        // GBWT seq_offset (latest in path). The index i in that array is the offset within node's record.
+                        gbwt::size_type source_offset_in_node = gbwt::invalid_offset();
+                        gbwt::size_type min_seq_offset = gbwt::invalid_offset();  // smallest = latest in path
+                        for (size_t i = 0; i < sa_values.size(); ++i) {
+                            if (gbwt_fast_locate->seqId(sa_values[i]) == source_seq_id) {
+                                gbwt::size_type so = gbwt_fast_locate->seqOffset(sa_values[i]);
+                                if (min_seq_offset == gbwt::invalid_offset() || so < min_seq_offset) {
+                                    min_seq_offset = so;
+                                    source_offset_in_node = i;
+                                }
+                            }
+                        }
+                        if (source_offset_in_node != gbwt::invalid_offset()) {
+                            source_gbwt_edge = gbwt::edge_type(node, source_offset_in_node);
+                        }
+                        // Always break out of the while when we found the last common node (target_passes),
+                        // so we stop the expensive LF walk. Phase 2 (inverseLF) runs only when source_gbwt_edge is set.
+                        if (out_timing) {
+                            out_timing->found_last_common = true;
+                            out_timing->last_common_source_base = last_common_source_base;
+                        }
+                        if (debug) {
+                            cerr << "  [fast path] Last common node: tag_code=" << tag_val
+                                 << " (node_id=" << node_id << ", is_rev=" << is_rev << ")"
+                                 << ", last_common_source_base=" << last_common_source_base
+                                 << ", source_gbwt_edge=(" << source_gbwt_edge.first << "," << source_gbwt_edge.second << ")" << endl;
+                        }
+                        if (out_timing) {
+                            out_timing->phase1_fast_path_ms += duration_cast<microseconds>(high_resolution_clock::now() - t_fast_path_start).count() / 1000.0;
+                        }
+                        break;
+                    }
+                    if (out_timing) {
+                        out_timing->phase1_fast_path_ms += duration_cast<microseconds>(high_resolution_clock::now() - t_fast_path_start).count() / 1000.0;
+                    }
                 }
             }
         }
         
-        // Move to previous text position
+        if (found_last_common) break;
+        
         if (current_text_pos > text_pos_i) {
             current_text_pos--;
+            auto t_lf_start = high_resolution_clock::now();
             current_bwt_pos = r_index.LF(current_bwt_pos);
+            if (out_timing) {
+                out_timing->phase1_lf_count++;
+                out_timing->phase1_lf_ms += duration_cast<microseconds>(high_resolution_clock::now() - t_lf_start).count() / 1000.0;
+            }
         } else {
             break;
         }
     }
-    
-    // Continue backward past the interval start to find one more non-empty tag
-    // This helps find a common node when the interval starts with empty tags
-    size_t text_pos_haplotype_start = r_index.pack(source_seq_id, 0);
-    bool found_tag_before_interval = false;
-    
-    if (debug) {
-        cerr << "Looking for first tag before interval start (text_pos_i=" << text_pos_i 
-             << ", haplotype_start=" << text_pos_haplotype_start << ")" << endl;
+
+    // Fast path was enabled but no last common node found: source and target share no node in this interval; no mapping possible
+    if (use_fast_path && !found_last_common) {
+        auto elapsed_ms = duration_cast<milliseconds>(high_resolution_clock::now() - t_find_tags_start).count();
+        cerr << "No last common node found between source and target in interval [" << seq_start << ", " << seq_end
+             << "]; no mapping possible. (total time: " << elapsed_ms << " ms)" << endl;
+        return {};
     }
-    
-    // Move one step back from interval start to begin searching before the interval
-    if (current_text_pos > text_pos_haplotype_start) {
-        current_text_pos--;
-        current_bwt_pos = r_index.LF(current_bwt_pos);
+
+    // ----- Phase 2 (fast path only): From last common node, walk backward with GBWT inverseLF until offset < seq_start -----
+    if (use_fast_path && found_last_common && source_gbwt_edge.first != gbwt::ENDMARKER) {
+        size_t current_base = last_common_source_base;
+        gbwt::edge_type current_edge = source_gbwt_edge;
         
-        while (current_text_pos >= text_pos_haplotype_start && !found_tag_before_interval) {
-            // Get tag for current BWT position
-            size_t sampled_run_id = sampled.run_id_at(current_bwt_pos);
-            uint64_t tag_val = sampled.run_value(sampled_run_id);
-            
-            if (debug) {
-                cerr << "  [before interval] Text pos " << current_text_pos << " -> BWT pos " 
-                     << current_bwt_pos << " -> tag=" << tag_val << endl;
-            }
-            
-            if (tag_val != 0) {
-                // Found a non-empty tag before the interval
-                size_t seq_id_found = r_index.seqId(current_text_pos);
-                size_t offset_from_start = r_index.seqOffset(current_text_pos);
-                
-                if (seq_id_found == source_seq_id) {
-                    if (tag_map.find(tag_val) == tag_map.end()) {
-                        tag_map[tag_val] = TagInfo{tag_val, {}, {}, {}};
-                    }
-                    
-                    tag_map[tag_val].source_offsets.push_back(offset_from_start);
-                    tag_map[tag_val].source_bwt_positions.push_back(current_bwt_pos);
-                    tag_map[tag_val].source_packed_positions.push_back(current_text_pos);
-                    
-                    found_tag_before_interval = true;
-                    
-                    if (debug) {
-                        cerr << "  Found tag before interval: tag_code=" << tag_val 
-                             << " at offset=" << offset_from_start << endl;
-                    }
-                }
-            }
-            
-            // Move to previous text position
-            if (current_text_pos > text_pos_haplotype_start && !found_tag_before_interval) {
-                current_text_pos--;
-                current_bwt_pos = r_index.LF(current_bwt_pos);
-            } else {
+        if (debug) {
+            cerr << "  [fast path] Walking backward with inverseLF from base=" << current_base << endl;
+        }
+        
+        while (true) {
+            gbwt::edge_type prev_edge = gbwt_index->inverseLF(current_edge);
+            if (prev_edge.first == gbwt::ENDMARKER) {
+                if (debug) cerr << "  [fast path] inverseLF returned ENDMARKER, stopping" << endl;
                 break;
             }
+            
+            gbwtgraph::handle_t prev_handle = graph->get_handle(gbwt::Node::id(prev_edge.first), gbwt::Node::is_reverse(prev_edge.first));
+            size_t prev_node_len = graph->get_length(prev_handle);
+            if (current_base < prev_node_len) {
+                if (debug) cerr << "  [fast path] current_base=" << current_base << " < prev_node_len=" << prev_node_len << ", underflow, stopping" << endl;
+                break;
+            }
+            size_t new_base = current_base - prev_node_len;
+            
+            int64_t prev_node_id = gbwt::Node::id(prev_edge.first);
+            bool prev_is_rev = gbwt::Node::is_reverse(prev_edge.first);
+            uint64_t prev_tag_code = SampledTagArray::encode_value(prev_node_id, prev_is_rev);
+            
+            if (tag_map.find(prev_tag_code) == tag_map.end()) {
+                tag_map[prev_tag_code] = TagInfo{prev_tag_code, {}, {}, {}};
+            }
+            tag_map[prev_tag_code].source_offsets.push_back(new_base);
+            tag_map[prev_tag_code].source_bwt_positions.push_back(0);
+            tag_map[prev_tag_code].source_packed_positions.push_back(0);
+            
+            if (debug) {
+                cerr << "  [fast path] prev node id=" << prev_node_id << " rev=" << prev_is_rev
+                     << " tag_code=" << prev_tag_code << " new_base=" << new_base << endl;
+            }
+            
+            if (new_base < seq_start) {
+                if (debug) cerr << "  [fast path] new_base < seq_start, stopping backward walk" << endl;
+                break;
+            }
+            
+            current_base = new_base;
+            current_edge = prev_edge;
+        }
+    } else {
+        // ----- No fast path: continue backward past interval start for one more tag (legacy behavior) -----
+        size_t text_pos_haplotype_start = r_index.pack(source_seq_id, 0);
+        bool found_tag_before_interval = false;
+        
+        if (debug) {
+            cerr << "Looking for first tag before interval start (text_pos_i=" << text_pos_i 
+                 << ", haplotype_start=" << text_pos_haplotype_start << ")" << endl;
+        }
+        
+        if (current_text_pos > text_pos_haplotype_start) {
+            current_text_pos--;
+            current_bwt_pos = r_index.LF(current_bwt_pos);
+            
+            while (current_text_pos >= text_pos_haplotype_start && !found_tag_before_interval) {
+                size_t sampled_run_id = sampled.run_id_at(current_bwt_pos);
+                uint64_t tag_val = sampled.run_value(sampled_run_id);
+                
+                if (debug) {
+                    cerr << "  [before interval] Text pos " << current_text_pos << " -> BWT pos " 
+                         << current_bwt_pos << " -> tag=" << tag_val << endl;
+                }
+                
+                if (tag_val != 0) {
+                    size_t seq_id_found = r_index.seqId(current_text_pos);
+                    size_t offset_from_start = r_index.seqOffset(current_text_pos);
+                    
+                    if (seq_id_found == source_seq_id) {
+                        if (tag_map.find(tag_val) == tag_map.end()) {
+                            tag_map[tag_val] = TagInfo{tag_val, {}, {}, {}};
+                        }
+                        
+                        tag_map[tag_val].source_offsets.push_back(offset_from_start);
+                        tag_map[tag_val].source_bwt_positions.push_back(current_bwt_pos);
+                        tag_map[tag_val].source_packed_positions.push_back(current_text_pos);
+                        
+                        found_tag_before_interval = true;
+                        
+                        if (debug) {
+                            cerr << "  Found tag before interval: tag_code=" << tag_val 
+                                 << " at offset=" << offset_from_start << endl;
+                        }
+                    }
+                }
+                
+                if (current_text_pos > text_pos_haplotype_start && !found_tag_before_interval) {
+                    current_text_pos--;
+                    current_bwt_pos = r_index.LF(current_bwt_pos);
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        if (debug && !found_tag_before_interval) {
+            cerr << "  No tag found before interval (reached haplotype start)" << endl;
         }
     }
-    
-    if (debug && !found_tag_before_interval) {
-        cerr << "  No tag found before interval (reached haplotype start)" << endl;
-    }
-    
+
     // Convert map to vector and sort by first source offset (earliest in interval)
     for (auto& kv : tag_map) {
         tags.push_back(kv.second);
     }
     
-    // Sort by first source offset (prefer nodes near start of interval)
     sort(tags.begin(), tags.end(), [](const TagInfo& a, const TagInfo& b) {
         if (a.source_offsets.empty() || b.source_offsets.empty()) return false;
         return a.source_offsets[0] < b.source_offsets[0];
     });
-    
+
     if (debug) {
         cerr << "Found " << tags.size() << " unique tags in source interval" << endl;
     }
-    // print all the tags
     if (debug) {
         cerr << "Tags found in source interval:" << endl;
         for (const auto& tag : tags) {
@@ -2051,7 +2220,7 @@ int main(int argc, char** argv) {
     size_t target_seq_id = target_spec.seq_id;
     if (benchmark_mode) {
         source_seq_id = 0;
-        target_seq_id = 2;
+        target_seq_id = 10;
     }
     
     if (debug) {
@@ -2123,14 +2292,17 @@ int main(int argc, char** argv) {
         const int num_runs_per_interval = 5;
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_int_distribution<size_t> dist(100000, 100000000);
-        cout << "scale\tinterval_len\trun\tnum_tags\tfind_tags_ms\tfind_common_ms\ttrace_gbwt_ms\ttotal_ms" << endl;
+        std::uniform_int_distribution<size_t> dist(100000, 50000000);
+        cout << "scale\tinterval_len\trun\tnum_tags\tfind_tags_ms\tused_fast_path\tfound_last_common\tlast_common_source_base\tnum_lf_before_phase1\tphase1_lf_count\tinit_skip_lf_ms\tfind_tags_lf_ms\tfind_tags_tag_lookup_ms\tfind_tags_position_lookup_ms\tfind_tags_tag_map_ms\tfind_tags_fast_path_ms\tfind_common_ms\ttrace_gbwt_ms\ttotal_ms" << endl;
         for (size_t L : lengths) {
             for (int run_id = 0; run_id < num_runs_per_interval; run_id++) {
                 size_t run_start = dist(gen);
                 size_t run_end = run_start + L;
+                FindTagsInIntervalTiming find_timing;
                 auto t0 = high_resolution_clock::now();
-                vector<TagInfo> run_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, run_start, run_end);
+                vector<TagInfo> run_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, run_start, run_end,
+                                                                  gbwt_index_ptr, gbwt_rindex_ptr.get(), &graph, target_seq_id,
+                                                                  &find_timing);
                 auto t1 = high_resolution_clock::now();
                 if (run_tags.empty()) {
                     cerr << "Benchmark: no tags in interval [" << run_start << "," << run_end << "), skipping" << endl;
@@ -2156,7 +2328,17 @@ int main(int argc, char** argv) {
                 auto d_total = duration_cast<milliseconds>(t3 - t0).count();
                 string scale = (L >= 1000000) ? "megabase" : "gene";
                 cout << scale << "\t" << L << "\t" << (run_id + 1) << "\t" << run_tags.size() << "\t"
-                     << d_find << "\t" << d_common << "\t" << d_trace << "\t" << d_total << endl;
+                     << d_find << "\t"
+                     << (find_timing.used_fast_path ? 1 : 0) << "\t"
+                     << (find_timing.found_last_common ? 1 : 0) << "\t"
+                     << find_timing.last_common_source_base << "\t"
+                     << find_timing.num_lf_before_phase1 << "\t" << find_timing.phase1_lf_count << "\t"
+                     << fixed << setprecision(3)
+                     << find_timing.init_skip_lf_ms << "\t" << find_timing.phase1_lf_ms << "\t"
+                     << find_timing.phase1_tag_lookup_ms << "\t" << find_timing.phase1_position_lookup_ms << "\t"
+                     << find_timing.phase1_tag_map_ms << "\t" << find_timing.phase1_fast_path_ms << "\t"
+                     << setprecision(0)
+                     << d_common << "\t" << d_trace << "\t" << d_total << endl;
             }
         }
         return 0;
@@ -2164,7 +2346,8 @@ int main(int argc, char** argv) {
     
     // Step 1: Find all tags in source interval (using RLBWT r-index)
     auto start_find_tags = high_resolution_clock::now();
-    vector<TagInfo> source_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, seq_start, seq_end);
+    vector<TagInfo> source_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, seq_start, seq_end,
+                                                        gbwt_index_ptr, gbwt_rindex_ptr.get(), &graph, target_seq_id);
     auto end_find_tags = high_resolution_clock::now();
     auto duration_find_tags = duration_cast<milliseconds>(end_find_tags - start_find_tags);
     

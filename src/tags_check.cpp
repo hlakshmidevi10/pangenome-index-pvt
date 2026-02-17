@@ -22,6 +22,9 @@
 #include <string>
 #include <cstring>
 #include <random>
+#include <limits>
+#include <tuple>
+#include <vector>
 
 
 #ifndef TIME
@@ -1066,7 +1069,118 @@ static void usage_verify_rindex_encoded_vs_legacy(const char* prog) {
               << std::endl;
 }
 
+// Print statistics for compact tag array: total runs, BWT size, first few tags, and node_id range
+static int print_tags_stats(const std::string& compact_tags_file, size_t num_first_tags = 10) {
+    using namespace panindexer;
+    std::cerr << "Loading compact tag array: " << compact_tags_file << std::endl;
+    TagArray tag_array;
+    {
+        std::ifstream tin(compact_tags_file, std::ios::binary);
+        if (!tin) {
+            std::cerr << "Cannot open compact tags file: " << compact_tags_file << std::endl;
+            return 1;
+        }
+        tag_array.load_compressed_tags_compact(tin);
+    }
+
+    size_t bwt_size = tag_array.bwt_size();
+    size_t total_runs = 0;
+    size_t total_tag_length = 0;
+    size_t gap_runs = 0;
+    size_t gap_length = 0;
+    
+    int64_t min_node_id = std::numeric_limits<int64_t>::max();
+    int64_t max_node_id = std::numeric_limits<int64_t>::min();
+    bool has_valid_node = false;
+
+    std::vector<std::tuple<handlegraph::pos_t, uint64_t, size_t, size_t>> first_tags;
+
+    tag_array.for_each_run_compact_with_bwt([&](handlegraph::pos_t p, uint64_t len,
+                                                 size_t bwt_start, size_t bwt_end) {
+        total_runs++;
+        total_tag_length += len;
+        
+        int64_t node_id = gbwtgraph::id(p);
+        bool is_rev = gbwtgraph::is_rev(p);
+        size_t offset = gbwtgraph::offset(p);
+        
+        // Track node_id range for all tags with valid node_id
+        if (node_id > 0) {
+            has_valid_node = true;
+            if (node_id < min_node_id) min_node_id = node_id;
+            if (node_id > max_node_id) max_node_id = node_id;
+        }
+        
+        if (node_id == 0 || offset != 0) {
+            // Gap or invalid tag
+            gap_runs++;
+            gap_length += len;
+        } else {
+            // Valid tag (node_id > 0 and offset == 0)
+            if (first_tags.size() < num_first_tags) {
+                first_tags.push_back({p, len, bwt_start, bwt_end});
+            }
+        }
+    });
+
+    // Print statistics
+    std::cout << "# Compact Tag Array Statistics\n";
+    std::cout << "# File: " << compact_tags_file << "\n";
+    std::cout << "# BWT size: " << bwt_size << "\n";
+    std::cout << "# Total runs: " << total_runs << "\n";
+    std::cout << "# Total tag length: " << total_tag_length << "\n";
+    std::cout << "# Gap runs: " << gap_runs << " (length: " << gap_length << ")\n";
+    std::cout << "# Non-gap runs: " << (total_runs - gap_runs) << " (length: " << (total_tag_length - gap_length) << ")\n";
+    
+    if (has_valid_node) {
+        std::cout << "# Node ID range: [" << min_node_id << ", " << max_node_id << "]\n";
+    } else {
+        std::cout << "# Node ID range: [no valid nodes found]\n";
+    }
+    
+    std::cout << "\n# First " << first_tags.size() << " tags:\n";
+    std::cout << "# run_index\tbwt_start\tbwt_end\tlen\tnode_id\tis_rev\toffset\n";
+    
+    for (size_t i = 0; i < first_tags.size(); ++i) {
+        auto [p, len, bwt_start, bwt_end] = first_tags[i];
+        int64_t node_id = gbwtgraph::id(p);
+        bool is_rev = gbwtgraph::is_rev(p);
+        size_t offset = gbwtgraph::offset(p);
+        
+        std::cout << i << "\t" << bwt_start << "\t" << bwt_end << "\t" << len << "\t";
+        if (node_id == 0 || offset != 0) {
+            std::cout << "-\t-\t-\n";
+        } else {
+            std::cout << node_id << "\t" << (is_rev ? 1 : 0) << "\t" << offset << "\n";
+        }
+    }
+    
+    std::cerr << "Statistics printed successfully." << std::endl;
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && std::strcmp(argv[1], "--tags-stats") == 0) {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0] << " --tags-stats <compact_tags.tags> [--num-first N]\n"
+                      << "  Print statistics for compact tag array:\n"
+                      << "    - Total runs, BWT size, gap statistics\n"
+                      << "    - First N tags (default: 10)\n"
+                      << "    - Node ID range (min, max)\n"
+                      << "Options:\n"
+                      << "  --num-first N  Number of first tags to print (default: 10)\n";
+            return 1;
+        }
+        std::string compact_tags_file = argv[2];
+        size_t num_first = 10;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--num-first") == 0 && i + 1 < argc) {
+                num_first = static_cast<size_t>(std::stoull(argv[++i]));
+            }
+        }
+        return print_tags_stats(compact_tags_file, num_first);
+    }
+
     if (argc >= 3 && std::strcmp(argv[1], "--print-sampled-tags") == 0) {
         std::string sampled_tags_file = argv[2];
         return print_sampled_tag_array(sampled_tags_file);
@@ -1152,6 +1266,7 @@ int main(int argc, char **argv) {
 
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0] << " <gbz_graph> <r_index.ri> <tag_array_index_dir>\n"
+                  << "   Or: " << argv[0] << " --tags-stats <compact_tags.tags> [--num-first N]\n"
                   << "   Or: " << argv[0] << " --print-sampled-tags <sampled.tags>\n"
                   << "   Or: " << argv[0] << " --verify-sampled-vs-tags <compressed_tags.tags> <sampled.tags>\n"
                   << "   Or: " << argv[0] << " --verify-rindex-encoded-vs-legacy <legacy.ri> <encoded.ri> [--trials N]\n"
