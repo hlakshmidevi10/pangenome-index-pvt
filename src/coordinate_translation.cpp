@@ -2220,7 +2220,7 @@ int main(int argc, char** argv) {
     size_t target_seq_id = target_spec.seq_id;
     if (benchmark_mode) {
         source_seq_id = 0;
-        target_seq_id = 10;
+        target_seq_id = 2;
     }
     
     if (debug) {
@@ -2289,7 +2289,7 @@ int main(int argc, char** argv) {
         if (lengths.empty()) {
             lengths = { 5000, 10000, 1000000 };  // gene scale (5kb, 10kb), megabase (1Mb)
         }
-        const int num_runs_per_interval = 5;
+        const int num_runs_per_interval = 20;
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<size_t> dist(100000, 50000000);
