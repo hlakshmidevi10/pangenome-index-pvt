@@ -340,7 +340,7 @@ grlbwt-cli -t 8 graph_info
 
 **Usage**:
 ```bash
-./bin/find_mems <r_index.ri> <compressed_tags.tags> <reads.txt> <min_mem_length> <min_occurrences> [output_file] [--debug-stats]
+./bin/find_mems <r_index.ri> <compressed_tags.tags> <reads.txt> <min_mem_length> <min_occurrences> [output_file] [--debug-stats] [--verbose]
 ```
 
 **Parameters**:
@@ -348,6 +348,7 @@ grlbwt-cli -t 8 graph_info
 - `min_occurrences`: Minimum number of occurrences in the pangenome
 - `output_file` (optional): File to write results to (otherwise prints to stdout)
 - `--debug-stats` (optional): Enable detailed duplicate statistics reporting
+- `--verbose` or `--debug` (optional): Enable verbose debug output (read sequences, MEM details)
 
 **Example**:
 ```bash
@@ -356,6 +357,12 @@ grlbwt-cli -t 8 graph_info
 
 # With output file and debug statistics
 ./bin/find_mems output.ri compressed.tags reads.txt 30 1 results --debug-stats
+
+# With verbose debug output for profiling
+./bin/find_mems output.ri compressed.tags reads.txt 30 1 results --verbose
+
+# With both debug flags
+./bin/find_mems output.ri compressed.tags reads.txt 30 1 results --debug-stats --verbose
 
 # Real example from your usage
 ./bin/find_mems s28cc_flo1_chr1_186000_214000.ri s28cc_flo1_chr1_186000_214000_compressed.tags s28cc_flo1_chr1_186000_214000_N500_R1_200_reads.txt 30 1 s28cc_flo1_chr1_186000_214000_N500_R1_200
@@ -465,7 +472,7 @@ Note: query_tags requires the compressed tag arrays format. If you built tags di
 
 1. **`.tags` files**: Binary tag arrays index files (algorithm format from build_tags)
 2. **`_compressed.tags` files**: Compressed tag arrays (from compress_tags or convert_tags)
-3. **`.ri` files**: R-index data files
+3. **`.ri` ufiles**: R-index data files
 4. **`.tsv` files**: Tab-separated MEM results from find_mems
 5. **`.paths` files**: Path name lists from path_extract
 6. **Console output**: MEM results, query results, validation reports, graph statistics
