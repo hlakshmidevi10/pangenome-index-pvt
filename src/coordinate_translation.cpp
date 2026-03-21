@@ -1,5 +1,6 @@
 #include "pangenome_index/r-index.hpp"
 #include "pangenome_index/sampled_tag_array.hpp"
+#include "pangenome_index/translation_tables.hpp"
 #include <sdsl/wavelet_trees.hpp>
 #include <sdsl/simple_sds.hpp>
 #include <gbwt/gbwt.h>
@@ -26,6 +27,12 @@ using namespace std::chrono;
 // Use explicit namespace for panindexer types to avoid conflict with gbwt::FastLocate
 using panindexer::FastLocate;
 using panindexer::SampledTagArray;
+using panindexer::TranslationTable1;
+using panindexer::TranslationTable2;
+using panindexer::PathInterval;
+using panindexer::SubpathInfo;
+using panindexer::TargetInterval;
+using panindexer::IntervalMapping;
 
 static bool debug = false;
 
@@ -374,6 +381,12 @@ static void usage(const char* prog) {
     cerr << "  --interval START..END   Interval on source haplotype (base offsets; not required if --benchmark)" << endl;
     cerr << "  --gbz FILE              GBZ file (.gbz); contains GBWT index + GBWTGraph (required)" << endl;
     cerr << endl;
+    cerr << "Table-driven mode (use together; can be combined with --benchmark):" << endl;
+    cerr << "  --table1 FILE           Translation Table 1 (path name + global interval -> path_id, local interval)" << endl;
+    cerr << "  --table2 FILE           Translation Table 2 (src_path_id, tgt haplotype -> tgt_path_ids)" << endl;
+    cerr << "  --source-haplotype-name NAME   Source haplotype name (e.g. GRCh38#0); interval is in its global coords" << endl;
+    cerr << "  --target-haplotype-name NAME   Target haplotype name (e.g. HG002#1)" << endl;
+    cerr << endl;
     cerr << "Other options:" << endl;
     cerr << "  --benchmark             Run benchmark: translate seq 0->2 at gene/megabase scales (excludes load time)" << endl;
     cerr << "  --benchmark-intervals L1,L2,...  Comma-separated interval lengths (default: 5000,10000,1000000)" << endl;
@@ -393,6 +406,43 @@ static void usage(const char* prog) {
     cerr << "  # Using metadata" << endl;
     cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --source-sample HG002 --source-contig chr1 --source-haplotype 1 \\" << endl;
     cerr << "       --target-sample GRCh38 --target-contig chr1 --interval 1000..2000 --gbz graph.gbz" << endl;
+    cerr << endl;
+    cerr << "  # Table-driven mode (haplotype names + translation tables)" << endl;
+    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --table1 t1.bin --table2 t2.bin \\" << endl;
+    cerr << "       --source-haplotype-name GRCh38#0 --target-haplotype-name HG002#1 --interval 1000..2000 --gbz graph.gbz" << endl;
+    cerr << endl;
+    cerr << "  # Benchmark with translation tables (random global intervals, no --interval needed)" << endl;
+    cerr << "  " << prog << " idx.ri gbwt.ri tags.stags --benchmark --table1 t1.bin --table2 t2.bin \\" << endl;
+    cerr << "       --source-haplotype-name GRCh38#0 --target-haplotype-name HG002#1 --gbz graph.gbz" << endl;
+}
+
+/// Build path_id -> (path_name, subpath_start) from Table 1 for converting path-local offsets to haplotype (global) coordinates.
+static unordered_map<size_t, pair<string, size_t>> build_path_id_to_global(const TranslationTable1& t1) {
+    unordered_map<size_t, pair<string, size_t>> out;
+    vector<string> names = t1.names();
+    for (const string& name : names) {
+        vector<SubpathInfo> subpaths = t1.subpaths(name);
+        for (const SubpathInfo& sp : subpaths) {
+            out[sp.path_id] = {name, sp.subpath_start};
+        }
+    }
+    return out;
+}
+
+/// Return path names in Table 1 whose base name starts with haplotype_prefix (e.g. "GRCh38#0" -> "GRCh38#0#chr1", ...).
+static vector<string> path_names_for_haplotype(const TranslationTable1& t1, const string& haplotype_prefix) {
+    vector<string> names = t1.names();
+    vector<string> result;
+    string prefix = haplotype_prefix;
+    if (prefix.empty() || prefix.back() != '#') {
+        prefix += '#';
+    }
+    for (const string& name : names) {
+        if (name.size() >= prefix.size() && name.compare(0, prefix.size(), prefix) == 0) {
+            result.push_back(name);
+        }
+    }
+    return result;
 }
 
 // Forward declaration for helper used by find_tags_in_interval
@@ -2018,7 +2068,11 @@ int main(int argc, char** argv) {
     string gbz_file = "";
     bool benchmark_mode = false;
     string benchmark_interval_lengths_str = "";  // e.g. "5000,10000,1000000"
-    
+    string table1_file = "";
+    string table2_file = "";
+    string source_haplotype_name = "";
+    string target_haplotype_name = "";
+
     for (int i = 4; i < argc; i++) {
         string arg = argv[i];
         if (arg == "--interval" && i + 1 < argc) {
@@ -2070,6 +2124,14 @@ int main(int argc, char** argv) {
             benchmark_mode = true;
         } else if (arg == "--benchmark-intervals" && i + 1 < argc) {
             benchmark_interval_lengths_str = argv[++i];
+        } else if (arg == "--table1" && i + 1 < argc) {
+            table1_file = argv[++i];
+        } else if (arg == "--table2" && i + 1 < argc) {
+            table2_file = argv[++i];
+        } else if (arg == "--source-haplotype-name" && i + 1 < argc) {
+            source_haplotype_name = argv[++i];
+        } else if (arg == "--target-haplotype-name" && i + 1 < argc) {
+            target_haplotype_name = argv[++i];
         } else if (arg == "--debug") {
             debug = true;
         } else if (arg == "--no-debug") {
@@ -2084,31 +2146,36 @@ int main(int argc, char** argv) {
         }
     }
     
+    bool table_mode = (!table1_file.empty() && !table2_file.empty() &&
+                       !source_haplotype_name.empty() && !target_haplotype_name.empty());
+
     if (benchmark_mode) {
         source_spec.seq_id = 0;
         target_spec.seq_id = 2;
     }
     
-    // Validate source specification
-    if (!source_spec.validate("source")) {
-        usage(argv[0]);
-        return 1;
-    }
-    if (!source_spec.is_specified()) {
-        cerr << "Error: Source haplotype must be specified (--source-id, --source-path-name, or --source-sample/--source-contig)" << endl;
-        usage(argv[0]);
-        return 1;
-    }
-    
-    // Validate target specification
-    if (!target_spec.validate("target")) {
-        usage(argv[0]);
-        return 1;
-    }
-    if (!target_spec.is_specified()) {
-        cerr << "Error: Target haplotype must be specified (--target-id, --target-path-name, or --target-sample/--target-contig)" << endl;
-        usage(argv[0]);
-        return 1;
+    // Validate source/target specification (not required in table-driven mode)
+    if (!table_mode) {
+        if (!source_spec.validate("source")) {
+            usage(argv[0]);
+            return 1;
+        }
+        if (!source_spec.is_specified()) {
+            cerr << "Error: Source haplotype must be specified (--source-id, --source-path-name, or --source-sample/--source-contig)"
+                 << " or use table mode (--table1 --table2 --source-haplotype-name --target-haplotype-name)" << endl;
+            usage(argv[0]);
+            return 1;
+        }
+        if (!target_spec.validate("target")) {
+            usage(argv[0]);
+            return 1;
+        }
+        if (!target_spec.is_specified()) {
+            cerr << "Error: Target haplotype must be specified (--target-id, --target-path-name, or --target-sample/--target-contig)"
+                 << " or use table mode (--table1 --table2 --source-haplotype-name --target-haplotype-name)" << endl;
+            usage(argv[0]);
+            return 1;
+        }
     }
     
     if (!has_interval && !benchmark_mode) {
@@ -2199,9 +2266,8 @@ int main(int argc, char** argv) {
         if (debug) cerr << "  FastLocate associated with GBWT index" << endl;
     }
     
-    // Resolve source and target path specifications to sequence IDs
-    // This requires the GBWT index to be loaded
-    if (!source_spec.use_seq_id() || !target_spec.use_seq_id()) {
+    // Resolve source and target path specifications to sequence IDs (skip in table-driven mode)
+    if (!table_mode && (!source_spec.use_seq_id() || !target_spec.use_seq_id())) {
         if (!gbwt_index_ptr) {
             cerr << "Error: GBWT index is required for path name resolution" << endl;
             return 1;
@@ -2216,8 +2282,8 @@ int main(int argc, char** argv) {
         }
     }
     
-    size_t source_seq_id = source_spec.seq_id;
-    size_t target_seq_id = target_spec.seq_id;
+    size_t source_seq_id = table_mode ? 0 : source_spec.seq_id;
+    size_t target_seq_id = table_mode ? 0 : target_spec.seq_id;
     if (benchmark_mode) {
         source_seq_id = 0;
         target_seq_id = 2;
@@ -2272,8 +2338,168 @@ int main(int argc, char** argv) {
     }
     
     auto start_after_load = high_resolution_clock::now();
-    
-    // Benchmark mode: run translation at gene and megabase scales (excluding load time)
+
+    // Table-driven mode (single run): use Table 1 + Table 2, then translate and convert to haplotype coords
+    if (table_mode && !benchmark_mode) {
+        TranslationTable1 t1;
+        TranslationTable2 t2;
+        {
+            ifstream t1in(table1_file, ios::binary);
+            if (!t1in) { cerr << "Error: Cannot open Table 1 file: " << table1_file << endl; return 1; }
+            t1.load(t1in);
+            ifstream t2in(table2_file, ios::binary);
+            if (!t2in) { cerr << "Error: Cannot open Table 2 file: " << table2_file << endl; return 1; }
+            t2.load(t2in);
+        }
+        unordered_map<size_t, pair<string, size_t>> path_to_global = build_path_id_to_global(t1);
+        vector<string> source_path_names = path_names_for_haplotype(t1, source_haplotype_name);
+        // Optional: further restrict to a specific contig (e.g. chr10) if provided via --source-contig.
+        if (source_spec.has_contig) {
+            string suffix = "#" + source_spec.contig_name;
+            vector<string> filtered;
+            for (const string& name : source_path_names) {
+                if (name.size() >= suffix.size() &&
+                    name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    filtered.push_back(name);
+                }
+            }
+            source_path_names.swap(filtered);
+        }
+        if (source_path_names.empty()) {
+            cerr << "Error: No path names in Table 1 for source haplotype '" << source_haplotype_name << "'";
+            if (source_spec.has_contig) {
+                cerr << " (contig='" << source_spec.contig_name << "')";
+            }
+            cerr << endl;
+            return 1;
+        }
+        // Restrict to the input interval only: Table 1 returns (path_id, local_interval) for the exact
+        // overlap of [global_start, global_end] with each subpath; Table 2 and translation use that same interval.
+        size_t global_start = interval.first;
+        size_t global_end = interval.second;  // user interval is [start, end] inclusive
+        vector<PathInterval> source_intervals;
+        for (const string& name : source_path_names) {
+            vector<PathInterval> pis = t1.lookup(name, global_start, global_end + 1);  // Table 1 uses [start, end) exclusive
+            for (PathInterval& pi : pis) {
+                source_intervals.push_back(pi);
+            }
+        }
+        if (source_intervals.empty()) {
+            cerr << "Error: No path intervals in Table 1 for source haplotype '" << source_haplotype_name
+                 << "' and interval [" << global_start << ".." << global_end << "]" << endl;
+            return 1;
+        }
+        struct HaplotypeTranslation {
+            size_t source_haplotype_offset = 0;
+            size_t target_haplotype_offset = 0;
+            size_t target_path_id = 0;
+        };
+        vector<HaplotypeTranslation> all_results;
+        for (const PathInterval& pi : source_intervals) {
+            size_t src_path_id = pi.path_id;
+            size_t local_start = pi.start;
+            size_t local_end = pi.end;  // exclusive
+            if (local_end <= local_start) continue;
+            size_t seq_start_incl = local_start;
+            size_t seq_end_incl = local_end - 1;
+            vector<TargetInterval> tgt_intervals = t2.lookup(src_path_id, target_haplotype_name, local_start, local_end);
+            cerr << "Table2 (single-run): src_path_id=" << src_path_id
+                 << " local_interval=[" << local_start << "," << local_end << ")"
+                 << " target_haplotype=\"" << target_haplotype_name << "\" -> "
+                 << tgt_intervals.size() << " target path(s)";
+            if (!tgt_intervals.empty()) {
+                cerr << " {";
+                size_t max_print = std::min<size_t>(tgt_intervals.size(), 8);
+                for (size_t i = 0; i < max_print; i++) {
+                    if (i > 0) cerr << ",";
+                    cerr << tgt_intervals[i].tgt_path_id;
+                }
+                if (tgt_intervals.size() > max_print) cerr << ",...";
+                cerr << "}";
+            }
+            cerr << endl;
+            if (tgt_intervals.empty()) continue;
+            size_t src_seq_id = 2 * src_path_id;  // forward strand
+            auto it_src = path_to_global.find(src_path_id);
+            if (it_src == path_to_global.end()) continue;
+            size_t src_subpath_start = it_src->second.second;
+            // Filter by contig (if any) and deduplicate by tgt_path_id (Table 2 returns one per segment).
+            unordered_set<size_t> distinct_tgt_paths;
+            for (const TargetInterval& ti : tgt_intervals) {
+                size_t tgt_path_id = ti.tgt_path_id;
+                if (target_spec.has_contig) {
+                    auto it_tgt = path_to_global.find(tgt_path_id);
+                    if (it_tgt == path_to_global.end()) continue;
+                    const string& tgt_name = it_tgt->second.first;
+                    string suffix = "#" + target_spec.contig_name;
+                    if (tgt_name.size() < suffix.size() ||
+                        tgt_name.compare(tgt_name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                        continue;
+                    }
+                }
+                distinct_tgt_paths.insert(tgt_path_id);
+            }
+            // Compute Table 2 extent per target (min..max of overlapping segments); use it to limit find_tags and trace.
+            vector<IntervalMapping> segs_single = t2.segments(src_path_id, target_haplotype_name);
+            for (size_t tgt_path_id : distinct_tgt_paths) {
+                // Extent = [min_start, max_end) of Table 2 segments for this target overlapping the query.
+                size_t extent_start = local_end, extent_end = local_start;
+                for (const IntervalMapping& m : segs_single) {
+                    if (m.tgt_path_id != tgt_path_id) continue;
+                    size_t overlap_start = std::max(local_start, m.src_start);
+                    size_t overlap_end = std::min(local_end, m.src_end);
+                    if (overlap_start >= overlap_end) continue;
+                    extent_start = std::min(extent_start, overlap_start);
+                    extent_end = std::max(extent_end, overlap_end);
+                }
+                if (extent_start >= extent_end) continue;  // no overlapping segment
+                size_t extent_start_incl = extent_start;
+                size_t extent_end_incl = extent_end - 1;
+                size_t tgt_seq_id = 2 * tgt_path_id;
+                vector<TagInfo> tags = find_tags_in_interval(rlbwt_rindex, sampled, src_seq_id, extent_start_incl, extent_end_incl,
+                                                             gbwt_index_ptr, gbwt_rindex_ptr.get(), &graph, tgt_seq_id);
+                if (tags.empty()) continue;
+                CommonNodes common = find_first_and_last_common_nodes_gbwt(*gbwt_rindex_ptr, rlbwt_rindex, sampled, tags, src_seq_id, tgt_seq_id);
+                if (!common.found) continue;
+                vector<TranslationResult> trans = trace_coordinates_gbwt(
+                    *gbwt_index_ptr, *gbwt_rindex_ptr, graph, src_seq_id, extent_start_incl, extent_end_incl,
+                    tgt_seq_id, common.first_source_offset, common.first_target_offset,
+                    common.first_source_base, common.first_target_base, common.first_tag_code,
+                    common.last_source_base, common.last_target_base, common.last_tag_code);
+                auto it_tgt = path_to_global.find(tgt_path_id);
+                if (it_tgt == path_to_global.end()) continue;
+                size_t tgt_subpath_start = it_tgt->second.second;
+                for (const TranslationResult& tr : trans) {
+                    if (tr.target_offset == 0) continue;
+                    HaplotypeTranslation ht;
+                    ht.source_haplotype_offset = src_subpath_start + tr.source_offset;
+                    ht.target_haplotype_offset = tgt_subpath_start + tr.target_offset;
+                    ht.target_path_id = tgt_path_id;
+                    all_results.push_back(ht);
+                }
+            }
+        }
+        cout << "Coordinate Translation Results (table-driven, haplotype coordinates):" << endl;
+        cout << "Source haplotype: " << source_haplotype_name << endl;
+        cout << "Target haplotype: " << target_haplotype_name << endl;
+        cout << "Interval (global): " << global_start << ".." << global_end << endl;
+        cout << endl;
+        cout << "Source_haplotype_offset\tTarget_haplotype_offset\tTarget_path_id" << endl;
+        std::sort(all_results.begin(), all_results.end(),
+                  [](const HaplotypeTranslation& a, const HaplotypeTranslation& b) {
+                      if (a.source_haplotype_offset != b.source_haplotype_offset)
+                          return a.source_haplotype_offset < b.source_haplotype_offset;
+                      if (a.target_haplotype_offset != b.target_haplotype_offset)
+                          return a.target_haplotype_offset < b.target_haplotype_offset;
+                      return a.target_path_id < b.target_path_id;
+                  });
+        for (const HaplotypeTranslation& ht : all_results) {
+            cout << ht.source_haplotype_offset << "\t" << ht.target_haplotype_offset << "\t" << ht.target_path_id << endl;
+        }
+        return 0;
+    }
+
+    // Benchmark mode: run translation at gene/megabase scales (excluding load time). Supports table-driven mode.
     if (benchmark_mode) {
         vector<size_t> lengths;
         if (!benchmark_interval_lengths_str.empty()) {
@@ -2293,52 +2519,246 @@ int main(int argc, char** argv) {
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<size_t> dist(100000, 50000000);
-        cout << "scale\tinterval_len\trun\tnum_tags\tfind_tags_ms\tused_fast_path\tfound_last_common\tlast_common_source_base\tnum_lf_before_phase1\tphase1_lf_count\tinit_skip_lf_ms\tfind_tags_lf_ms\tfind_tags_tag_lookup_ms\tfind_tags_position_lookup_ms\tfind_tags_tag_map_ms\tfind_tags_fast_path_ms\tfind_common_ms\ttrace_gbwt_ms\ttotal_ms" << endl;
-        for (size_t L : lengths) {
-            for (int run_id = 0; run_id < num_runs_per_interval; run_id++) {
-                size_t run_start = dist(gen);
-                size_t run_end = run_start + L;
-                FindTagsInIntervalTiming find_timing;
-                auto t0 = high_resolution_clock::now();
-                vector<TagInfo> run_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, run_start, run_end,
-                                                                  gbwt_index_ptr, gbwt_rindex_ptr.get(), &graph, target_seq_id,
-                                                                  &find_timing);
-                auto t1 = high_resolution_clock::now();
-                if (run_tags.empty()) {
-                    cerr << "Benchmark: no tags in interval [" << run_start << "," << run_end << "), skipping" << endl;
-                    continue;
+
+        if (table_mode) {
+            // Table-driven benchmark: load tables, resolve random global intervals via Table 1/2, time each translation
+            TranslationTable1 t1;
+            TranslationTable2 t2;
+            {
+                ifstream t1in(table1_file, ios::binary);
+                if (!t1in) { cerr << "Error: Cannot open Table 1 file: " << table1_file << endl; return 1; }
+                t1.load(t1in);
+                ifstream t2in(table2_file, ios::binary);
+                if (!t2in) { cerr << "Error: Cannot open Table 2 file: " << table2_file << endl; return 1; }
+                t2.load(t2in);
+            }
+            unordered_map<size_t, pair<string, size_t>> path_to_global = build_path_id_to_global(t1);
+            vector<string> source_path_names = path_names_for_haplotype(t1, source_haplotype_name);
+            // Optional contig restriction (e.g. chr10) from --source-contig.
+            if (source_spec.has_contig) {
+                string suffix = "#" + source_spec.contig_name;
+                vector<string> filtered;
+                for (const string& name : source_path_names) {
+                    if (name.size() >= suffix.size() &&
+                        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                        filtered.push_back(name);
+                    }
                 }
-                CommonNodes run_common;
-                if (gbwt_index_ptr && gbwt_rindex_ptr) {
-                    run_common = find_first_and_last_common_nodes_gbwt(*gbwt_rindex_ptr, rlbwt_rindex, sampled, run_tags, source_seq_id, target_seq_id);
+                source_path_names.swap(filtered);
+            }
+            if (source_path_names.empty()) {
+                cerr << "Error: No path names in Table 1 for source haplotype '" << source_haplotype_name << "'";
+                if (source_spec.has_contig) {
+                    cerr << " (contig='" << source_spec.contig_name << "')";
                 }
-                auto t2 = high_resolution_clock::now();
-                vector<TranslationResult> run_translations;
-                if (run_common.found && gbwt_index_ptr && gbwt_rindex_ptr) {
-                    run_translations = trace_coordinates_gbwt(
-                        *gbwt_index_ptr, *gbwt_rindex_ptr, graph, source_seq_id, run_start, run_end,
-                        target_seq_id, run_common.first_source_offset, run_common.first_target_offset,
-                        run_common.first_source_base, run_common.first_target_base, run_common.first_tag_code,
-                        run_common.last_source_base, run_common.last_target_base, run_common.last_tag_code);
+                cerr << endl;
+                return 1;
+            }
+            cout << "scale\tinterval_len\trun\tnum_source_intervals\tnum_source_path_ids\tnum_translations\tfind_tags_ms\tfind_common_ms\ttrace_gbwt_ms\ttotal_ms\tno_mapping_reason" << endl;
+            for (size_t L : lengths) {
+                for (int run_id = 0; run_id < num_runs_per_interval; run_id++) {
+                    size_t global_start = dist(gen);
+                    size_t global_end = global_start + L;
+                    vector<PathInterval> source_intervals;
+                    for (const string& name : source_path_names) {
+                        vector<PathInterval> pis = t1.lookup(name, global_start, global_end + 1);
+                        for (PathInterval& pi : pis) {
+                            source_intervals.push_back(pi);
+                        }
+                    }
+                    if (source_intervals.empty()) {
+                        cerr << "Benchmark (table): SKIP L=" << L << " run=" << (run_id + 1)
+                             << " global=[" << global_start << "," << global_end << "): no mapping — Table 1 returned 0 path intervals for source haplotype '"
+                             << source_haplotype_name << "' (interval does not overlap any subpath). Using Table 1." << endl;
+                        continue;
+                    }
+                    int64_t total_find_ms = 0, total_common_ms = 0, total_trace_ms = 0;
+                    int num_translations = 0;
+                    int num_src_with_t2_targets = 0;
+                    int num_t2_targets_total = 0;
+                    int num_t2_targets_after_contig = 0;
+                    int num_skipped_no_tags = 0, num_skipped_no_common = 0;
+                    // Count distinct source path_ids we will potentially consider
+                    std::unordered_set<size_t> distinct_src_paths;
+                    for (const PathInterval& pi : source_intervals) {
+                        distinct_src_paths.insert(pi.path_id);
+                    }
+                    cerr << "Benchmark (table): L=" << L << " run=" << (run_id + 1)
+                         << " global=[" << global_start << "," << global_end << ")"
+                         << " -> " << source_intervals.size() << " source interval(s) on "
+                         << distinct_src_paths.size() << " distinct source path_id(s) from Table 1." << endl;
+                    for (const PathInterval& pi : source_intervals) {
+                        size_t src_path_id = pi.path_id;
+                        size_t local_start = pi.start;
+                        size_t local_end = pi.end;
+                        if (local_end <= local_start) continue;
+                        size_t seq_start_incl = local_start;
+                        size_t seq_end_incl = local_end - 1;
+                        vector<TargetInterval> tgt_intervals = t2.lookup(src_path_id, target_haplotype_name, local_start, local_end);
+                        cerr << "Table2 (benchmark): src_path_id=" << src_path_id
+                             << " local_interval=[" << local_start << "," << local_end << ")"
+                             << " target_haplotype=\"" << target_haplotype_name << "\" -> "
+                             << tgt_intervals.size() << " target path(s) (before contig filter)" << endl;
+                        if (tgt_intervals.empty()) continue;
+                        num_src_with_t2_targets++;
+                        num_t2_targets_total += static_cast<int>(tgt_intervals.size());
+                        size_t src_seq_id = 2 * src_path_id;
+                        // First, fully filter target paths by contig (if any), then deduplicate by tgt_path_id
+                        // (Table 2 returns one entry per overlapping segment; many segments can map to the same path).
+                        std::unordered_set<size_t> filtered_tgt_path_set;
+                        for (const TargetInterval& ti : tgt_intervals) {
+                            size_t tgt_path_id = ti.tgt_path_id;
+                            if (target_spec.has_contig) {
+                                auto it_tgt_name = path_to_global.find(tgt_path_id);
+                                if (it_tgt_name == path_to_global.end()) continue;
+                                const string& tgt_name = it_tgt_name->second.first;
+                                string suffix = "#" + target_spec.contig_name;
+                                if (tgt_name.size() < suffix.size() ||
+                                    tgt_name.compare(tgt_name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                                    continue;
+                                }
+                            }
+                            filtered_tgt_path_set.insert(tgt_path_id);
+                        }
+                        std::vector<size_t> filtered_tgt_paths(filtered_tgt_path_set.begin(), filtered_tgt_path_set.end());
+                        if (target_spec.has_contig) {
+                            num_t2_targets_after_contig += static_cast<int>(filtered_tgt_paths.size());
+                            cerr << "Table2 (benchmark): src_path_id=" << src_path_id
+                                 << " local_interval=[" << local_start << "," << local_end << ")"
+                                 << " target_haplotype=\"" << target_haplotype_name << "\" -> "
+                                 << filtered_tgt_paths.size() << " distinct target path(s) (after contig='"
+                                 << target_spec.contig_name << "' filter, deduplicated). Names: {";
+                            bool first = true;
+                            for (size_t tgt_path_id : filtered_tgt_paths) {
+                                auto it_tgt_name = path_to_global.find(tgt_path_id);
+                                if (it_tgt_name == path_to_global.end()) continue;
+                                if (!first) cerr << ", ";
+                                cerr << it_tgt_name->second.first << " (id=" << tgt_path_id << ")";
+                                first = false;
+                            }
+                            cerr << "}" << endl;
+                        }
+                        // Table 2 segments: compute extent per target; run find_tags/trace on extent only.
+                        vector<IntervalMapping> segs_bench = t2.segments(src_path_id, target_haplotype_name);
+                        // Run translation once per distinct target path, using Table 2 extent only.
+                        for (size_t tgt_path_id : filtered_tgt_paths) {
+                            // Extent = [min_start, max_end) of Table 2 segments for this target overlapping the query.
+                            size_t extent_start = local_end, extent_end = local_start;
+                            for (const IntervalMapping& m : segs_bench) {
+                                if (m.tgt_path_id != tgt_path_id) continue;
+                                size_t overlap_start = std::max(local_start, m.src_start);
+                                size_t overlap_end = std::min(local_end, m.src_end);
+                                if (overlap_start >= overlap_end) continue;
+                                extent_start = std::min(extent_start, overlap_start);
+                                extent_end = std::max(extent_end, overlap_end);
+                            }
+                            if (extent_start >= extent_end) continue;
+                            size_t extent_start_incl = extent_start;
+                            size_t extent_end_incl = extent_end - 1;
+                            size_t tgt_seq_id = 2 * tgt_path_id;
+                            auto t0 = high_resolution_clock::now();
+                            vector<TagInfo> tags = find_tags_in_interval(rlbwt_rindex, sampled, src_seq_id, extent_start_incl, extent_end_incl,
+                                                                         gbwt_index_ptr, gbwt_rindex_ptr.get(), &graph, tgt_seq_id);
+                            auto t1 = high_resolution_clock::now();
+                            if (tags.empty()) {
+                                num_skipped_no_tags++;
+                                continue;
+                            }
+                            CommonNodes common = find_first_and_last_common_nodes_gbwt(*gbwt_rindex_ptr, rlbwt_rindex, sampled, tags, src_seq_id, tgt_seq_id);
+                            auto t2 = high_resolution_clock::now();
+                            if (!common.found) {
+                                num_skipped_no_common++;
+                                continue;
+                            }
+                            (void) trace_coordinates_gbwt(
+                                *gbwt_index_ptr, *gbwt_rindex_ptr, graph, src_seq_id, extent_start_incl, extent_end_incl,
+                                tgt_seq_id, common.first_source_offset, common.first_target_offset,
+                                common.first_source_base, common.first_target_base, common.first_tag_code,
+                                common.last_source_base, common.last_target_base, common.last_tag_code);
+                            auto t3 = high_resolution_clock::now();
+                            total_find_ms += duration_cast<milliseconds>(t1 - t0).count();
+                            total_common_ms += duration_cast<milliseconds>(t2 - t1).count();
+                            total_trace_ms += duration_cast<milliseconds>(t3 - t2).count();
+                            num_translations++;
+                        }
+                    }
+                    if (num_translations == 0) {
+                        cerr << "Benchmark (table): SKIP L=" << L << " run=" << (run_id + 1)
+                             << " global=[" << global_start << "," << global_end << "): no mapping — Table 1 gave "
+                             << source_intervals.size() << " source interval(s); Table 2 gave " << num_t2_targets_total
+                             << " target path(s) in " << num_src_with_t2_targets << " interval(s). Of those: "
+                             << num_skipped_no_tags << " had no tags (find_tags), " << num_skipped_no_common
+                             << " had no common nodes. ";
+                        if (target_spec.has_contig) {
+                            cerr << "After applying target contig filter ('" << target_spec.contig_name << "'), "
+                                 << num_t2_targets_after_contig << " candidate target path(s) remained. ";
+                        }
+                        cerr << "Tables only indicate which (path,interval)×target to try; "
+                             << "coordinate translation (find_tags/common_nodes) is the authority — no mapping possible for this run." << endl;
+                        continue;
+                    }
+                    int64_t total_ms = total_find_ms + total_common_ms + total_trace_ms;
+                    string scale = (L >= 1000000) ? "megabase" : "gene";
+                    cout << scale << "\t" << L << "\t" << (run_id + 1) << "\t" << source_intervals.size()
+                         << "\t" << distinct_src_paths.size() << "\t" << num_translations << "\t"
+                         << total_find_ms << "\t" << total_common_ms << "\t" << total_trace_ms << "\t" << total_ms << "\t-"
+                         << endl;
                 }
-                auto t3 = high_resolution_clock::now();
-                auto d_find = duration_cast<milliseconds>(t1 - t0).count();
-                auto d_common = duration_cast<milliseconds>(t2 - t1).count();
-                auto d_trace = duration_cast<milliseconds>(t3 - t2).count();
-                auto d_total = duration_cast<milliseconds>(t3 - t0).count();
-                string scale = (L >= 1000000) ? "megabase" : "gene";
-                cout << scale << "\t" << L << "\t" << (run_id + 1) << "\t" << run_tags.size() << "\t"
-                     << d_find << "\t"
-                     << (find_timing.used_fast_path ? 1 : 0) << "\t"
-                     << (find_timing.found_last_common ? 1 : 0) << "\t"
-                     << find_timing.last_common_source_base << "\t"
-                     << find_timing.num_lf_before_phase1 << "\t" << find_timing.phase1_lf_count << "\t"
-                     << fixed << setprecision(3)
-                     << find_timing.init_skip_lf_ms << "\t" << find_timing.phase1_lf_ms << "\t"
-                     << find_timing.phase1_tag_lookup_ms << "\t" << find_timing.phase1_position_lookup_ms << "\t"
-                     << find_timing.phase1_tag_map_ms << "\t" << find_timing.phase1_fast_path_ms << "\t"
-                     << setprecision(0)
-                     << d_common << "\t" << d_trace << "\t" << d_total << endl;
+            }
+        } else {
+            // Single-path benchmark (original behaviour); not using translation tables
+            cout << "scale\tinterval_len\trun\tnum_tags\tfind_tags_ms\tused_fast_path\tfound_last_common\tlast_common_source_base\tnum_lf_before_phase1\tphase1_lf_count\tinit_skip_lf_ms\tfind_tags_lf_ms\tfind_tags_tag_lookup_ms\tfind_tags_position_lookup_ms\tfind_tags_tag_map_ms\tfind_tags_fast_path_ms\tfind_common_ms\ttrace_gbwt_ms\ttotal_ms\tno_mapping_reason" << endl;
+            for (size_t L : lengths) {
+                for (int run_id = 0; run_id < num_runs_per_interval; run_id++) {
+                    size_t run_start = dist(gen);
+                    size_t run_end = run_start + L;
+                    FindTagsInIntervalTiming find_timing;
+                    auto t0 = high_resolution_clock::now();
+                    vector<TagInfo> run_tags = find_tags_in_interval(rlbwt_rindex, sampled, source_seq_id, run_start, run_end,
+                                                                      gbwt_index_ptr, gbwt_rindex_ptr.get(), &graph, target_seq_id,
+                                                                      &find_timing);
+                    auto t1 = high_resolution_clock::now();
+                    if (run_tags.empty()) {
+                        cerr << "Benchmark (single-path): SKIP L=" << L << " run=" << (run_id + 1)
+                             << " interval=[" << run_start << "," << run_end << "): no mapping — find_tags returned 0 tags. "
+                             << "Not using translation tables. Interval is path-local on source path (source_seq_id="
+                             << source_seq_id << ", target_seq_id=" << target_seq_id << "). "
+                             << "If tables report a mapping for this range, they use global coords and different path(s); use --table1/--table2 benchmark to compare." << endl;
+                        continue;
+                    }
+                    CommonNodes run_common;
+                    if (gbwt_index_ptr && gbwt_rindex_ptr) {
+                        run_common = find_first_and_last_common_nodes_gbwt(*gbwt_rindex_ptr, rlbwt_rindex, sampled, run_tags, source_seq_id, target_seq_id);
+                    }
+                    auto t2 = high_resolution_clock::now();
+                    vector<TranslationResult> run_translations;
+                    if (run_common.found && gbwt_index_ptr && gbwt_rindex_ptr) {
+                        run_translations = trace_coordinates_gbwt(
+                            *gbwt_index_ptr, *gbwt_rindex_ptr, graph, source_seq_id, run_start, run_end,
+                            target_seq_id, run_common.first_source_offset, run_common.first_target_offset,
+                            run_common.first_source_base, run_common.first_target_base, run_common.first_tag_code,
+                            run_common.last_source_base, run_common.last_target_base, run_common.last_tag_code);
+                    }
+                    auto t3 = high_resolution_clock::now();
+                    auto d_find = duration_cast<milliseconds>(t1 - t0).count();
+                    auto d_common = duration_cast<milliseconds>(t2 - t1).count();
+                    auto d_trace = duration_cast<milliseconds>(t3 - t2).count();
+                    auto d_total = duration_cast<milliseconds>(t3 - t0).count();
+                    string scale = (L >= 1000000) ? "megabase" : "gene";
+                    cout << scale << "\t" << L << "\t" << (run_id + 1) << "\t" << run_tags.size() << "\t"
+                         << d_find << "\t"
+                         << (find_timing.used_fast_path ? 1 : 0) << "\t"
+                         << (find_timing.found_last_common ? 1 : 0) << "\t"
+                         << find_timing.last_common_source_base << "\t"
+                         << find_timing.num_lf_before_phase1 << "\t" << find_timing.phase1_lf_count << "\t"
+                         << fixed << setprecision(3)
+                         << find_timing.init_skip_lf_ms << "\t" << find_timing.phase1_lf_ms << "\t"
+                         << find_timing.phase1_tag_lookup_ms << "\t" << find_timing.phase1_position_lookup_ms << "\t"
+                         << find_timing.phase1_tag_map_ms << "\t" << find_timing.phase1_fast_path_ms << "\t"
+                         << setprecision(0)
+                         << d_common << "\t" << d_trace << "\t" << d_total << "\t-"
+                         << endl;
+                }
             }
         }
         return 0;

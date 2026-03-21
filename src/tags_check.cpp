@@ -6,6 +6,8 @@
 #include "pangenome_index/algorithm.hpp"
 #include "pangenome_index/tag_arrays.hpp"
 #include "pangenome_index/sampled_tag_array.hpp"
+#include "pangenome_index/translation_tables.hpp"
+#include <sdsl/simple_sds.hpp>
 #include <gbwtgraph/utils.h>
 #include <gbwt/gbwt.h>
 #include <gbwtgraph/gbwtgraph.h>
@@ -24,6 +26,7 @@
 #include <random>
 #include <limits>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 
@@ -1031,6 +1034,166 @@ static int verify_compact_tags_against_gbwt(const std::string& r_index_file,
     return mismatches > 0 ? 1 : 0;
 }
 
+// --- Translation tables verification ---
+
+static int verify_translation_tables(const std::string& gbz_file,
+                                    const std::string& table1_file,
+                                    const std::string& table2_file,
+                                    size_t trials,
+                                    uint64_t seed) {
+    using namespace panindexer;
+    std::cerr << "Loading GBZ: " << gbz_file << std::endl;
+    gbwtgraph::GBZ gbz;
+    sdsl::simple_sds::load_from(gbz, gbz_file);
+    const gbwt::GBWT& gbwt_index = gbz.index;
+    const gbwtgraph::GBWTGraph& graph = gbz.graph;
+
+    std::cerr << "Loading Translation Table 1: " << table1_file << std::endl;
+    TranslationTable1 t1;
+    {
+        std::ifstream in(table1_file, std::ios::binary);
+        if (!in) { std::cerr << "Cannot open " << table1_file << std::endl; return 1; }
+        t1.load(in);
+    }
+    std::cerr << "Loading Translation Table 2: " << table2_file << std::endl;
+    TranslationTable2 t2;
+    {
+        std::ifstream in(table2_file, std::ios::binary);
+        if (!in) { std::cerr << "Cannot open " << table2_file << std::endl; return 1; }
+        t2.load(in);
+    }
+
+    std::mt19937 rng(static_cast<std::mt19937::result_type>(seed));
+    size_t t1_ok = 0, t1_fail = 0;
+    size_t t2_ok = 0, t2_fail = 0;
+
+    // --- Table 1 verification ---
+    std::vector<std::string> names = t1.names();
+    if (names.empty()) {
+        std::cerr << "Table 1 has no names; skipping Table 1 checks." << std::endl;
+    } else {
+        std::cerr << "Table 1: " << names.size() << " names, " << trials << " random trials." << std::endl;
+        for (size_t tr = 0; tr < trials; ++tr) {
+            const std::string& name = names[rng() % names.size()];
+            std::vector<panindexer::SubpathInfo> subpaths = t1.subpaths(name);
+            if (subpaths.empty()) continue;
+            const auto& sp = subpaths[rng() % subpaths.size()];
+            size_t global_end = sp.subpath_start + sp.length;
+            if (sp.length == 0) continue;
+            size_t global_start = sp.subpath_start + (sp.length > 1 ? (rng() % (sp.length - 1)) : 0);
+            size_t global_end_q = global_start + 1 + (rng() % (global_end - global_start));
+            if (global_end_q > global_end) global_end_q = global_end;
+
+            std::vector<panindexer::PathInterval> result = t1.lookup(name, global_start, global_end_q);
+            std::vector<panindexer::PathInterval> expected;
+            for (const auto& s : subpaths) {
+                size_t seg_end = s.subpath_start + s.length;
+                size_t ov_start = std::max(global_start, s.subpath_start);
+                size_t ov_end   = std::min(global_end_q, seg_end);
+                if (ov_start < ov_end) {
+                    expected.push_back({ s.path_id, ov_start - s.subpath_start, ov_end - s.subpath_start });
+                }
+            }
+            bool match = (result.size() == expected.size());
+            if (match) {
+                for (size_t i = 0; i < result.size(); ++i) {
+                    if (result[i].path_id != expected[i].path_id ||
+                        result[i].start != expected[i].start ||
+                        result[i].end != expected[i].end) {
+                        match = false; break;
+                    }
+                }
+            }
+            if (match) ++t1_ok; else ++t1_fail;
+            if (!match) {
+                std::cerr << "  T1 FAIL name=\"" << name << "\" global[" << global_start << "," << global_end_q
+                          << ") got " << result.size() << " intervals, expected " << expected.size() << std::endl;
+            }
+        }
+        std::cerr << "Table 1: " << t1_ok << " ok, " << t1_fail << " fail." << std::endl;
+    }
+
+    // --- Table 2 verification ---
+    // Table 2: src[a,b] -> tgt_path_id only. Verify lookup returns correct tgt_path_ids
+    // for overlapping segments, and that each tgt_path_id is valid.
+    std::vector<std::pair<size_t, std::string>> t2_keys = t2.keys();
+    size_t num_paths = gbwt_index.hasMetadata() ? gbwt_index.metadata.paths() : 0;
+    if (t2_keys.empty()) {
+        std::cerr << "Table 2 has no entries; skipping Table 2 checks." << std::endl;
+    } else {
+        std::cerr << "Table 2: " << t2_keys.size() << " keys, " << trials << " random trials." << std::endl;
+        for (size_t tr = 0; tr < trials; ++tr) {
+            const auto& [src_path_id, tgt_haplotype] = t2_keys[rng() % t2_keys.size()];
+            std::vector<panindexer::IntervalMapping> segs = t2.segments(src_path_id, tgt_haplotype);
+            if (segs.empty()) continue;
+            const auto& seg = segs[rng() % segs.size()];
+            size_t src_start = seg.src_start;
+            size_t src_end   = seg.src_end;
+            if (src_end <= src_start + 1) continue;
+            src_start = src_start + (rng() % (src_end - src_start - 1));
+            src_end   = src_start + 1 + (rng() % (src_end - src_start));
+            if (src_end > seg.src_end) src_end = seg.src_end;
+
+            std::vector<panindexer::TargetInterval> result = t2.lookup(src_path_id, tgt_haplotype, src_start, src_end);
+
+            // Expected: all segments overlapping [src_start, src_end), each contributes tgt_path_id
+            std::vector<size_t> expected;
+            for (const auto& s : segs) {
+                if (s.src_start < src_end && s.src_end > src_start) {
+                    expected.push_back(s.tgt_path_id);
+                }
+            }
+            std::sort(expected.begin(), expected.end());
+
+            std::vector<size_t> actual;
+            for (const auto& ti : result) {
+                actual.push_back(ti.tgt_path_id);
+            }
+            std::sort(actual.begin(), actual.end());
+
+            bool match = (expected.size() == actual.size());
+            if (match) {
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    if (expected[i] != actual[i]) { match = false; break; }
+                }
+            }
+
+            // Verify each tgt_path_id is valid (exists in GBWT)
+            bool paths_valid = true;
+            if (num_paths > 0) {
+                for (const auto& ti : result) {
+                    if (ti.tgt_path_id >= num_paths) {
+                        paths_valid = false;
+                        break;
+                    }
+                }
+            }
+
+            if (match && paths_valid) {
+                ++t2_ok;
+            } else {
+                ++t2_fail;
+                if (!match) {
+                    std::cerr << "  T2 FAIL src_pid=" << src_path_id << " tgt_hap=\"" << tgt_haplotype
+                              << "\" src[" << src_start << "," << src_end << ") expected " << expected.size()
+                              << " tgt_path_ids, got " << actual.size() << std::endl;
+                }
+                if (!paths_valid) {
+                    std::cerr << "  T2 FAIL src_pid=" << src_path_id << " tgt_hap=\"" << tgt_haplotype
+                              << "\" invalid tgt_path_id in result (num_paths=" << num_paths << ")" << std::endl;
+                }
+            }
+        }
+        std::cerr << "Table 2: " << t2_ok << " ok, " << t2_fail << " fail." << std::endl;
+    }
+
+    int exit_code = 0;
+    if (t1_fail > 0) { std::cerr << "Translation Table 1 had " << t1_fail << " failure(s)." << std::endl; exit_code = 1; }
+    if (t2_fail > 0) { std::cerr << "Translation Table 2 had " << t2_fail << " failure(s)." << std::endl; exit_code = 1; }
+    if (exit_code == 0) std::cerr << "All translation table checks passed." << std::endl;
+    return exit_code;
+}
+
 static void usage_verify(const char* prog) {
     std::cerr << "Usage: " << prog << " --verify-sampled <r_index.ri> <sampled.tags> --gbz <graph.gbz> [options]\n"
               << "  Verify that the sampled tag array matches the GBWT path at node starts only.\n"
@@ -1066,6 +1229,18 @@ static void usage_verify_rindex_encoded_vs_legacy(const char* prog) {
               << "  LF(range,sym), rankAt, run_id_and_offset_at, LF(pos), bwt_end_position_of_run, decompressDA,\n"
               << "  and block runs (Blocks vs EncodedBlock: same runs per block).\n"
               << "  --trials N  number of random positions/ranges for LF/rank/run_id checks (default: 500)\n"
+              << std::endl;
+}
+
+static void usage_verify_translation_tables(const char* prog) {
+    std::cerr << "Usage: " << prog << " --verify-translation-tables <graph.gbz> <table1.t1> <table2.t2> [options]\n"
+              << "  Randomly verify Translation Table 1 and Table 2 against the graph.\n"
+              << "  Table 1: random (path_name, global_interval) lookups; check result matches subpath geometry.\n"
+              << "  Table 2: random (src_path_id, tgt_haplotype, local_interval) lookups; check mapped intervals\n"
+              << "           correspond to the same node sequence on source and target paths.\n"
+              << "Options:\n"
+              << "  --trials N   Total random trials per table (default: 200)\n"
+              << "  --seed S     Random seed (default: 42)\n"
               << std::endl;
 }
 
@@ -1264,6 +1439,29 @@ int main(int argc, char **argv) {
                                                 gbz_file, path_id, sample_every);
     }
 
+    if (argc >= 2 && std::strcmp(argv[1], "--verify-translation-tables") == 0) {
+        std::string gbz_file, table1_file, table2_file;
+        size_t trials = 200;
+        uint64_t seed = 42;
+        for (int i = 2; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--trials") == 0 && i + 1 < argc) {
+                trials = static_cast<size_t>(std::stoull(argv[++i]));
+                if (trials == 0) trials = 200;
+            } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+                seed = static_cast<uint64_t>(std::stoull(argv[++i]));
+            } else if (argv[i][0] != '-') {
+                if (gbz_file.empty()) gbz_file = argv[i];
+                else if (table1_file.empty()) table1_file = argv[i];
+                else if (table2_file.empty()) table2_file = argv[i];
+            }
+        }
+        if (gbz_file.empty() || table1_file.empty() || table2_file.empty()) {
+            usage_verify_translation_tables(argv[0]);
+            return 1;
+        }
+        return verify_translation_tables(gbz_file, table1_file, table2_file, trials, seed);
+    }
+
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0] << " <gbz_graph> <r_index.ri> <tag_array_index_dir>\n"
                   << "   Or: " << argv[0] << " --tags-stats <compact_tags.tags> [--num-first N]\n"
@@ -1271,7 +1469,8 @@ int main(int argc, char **argv) {
                   << "   Or: " << argv[0] << " --verify-sampled-vs-tags <compressed_tags.tags> <sampled.tags>\n"
                   << "   Or: " << argv[0] << " --verify-rindex-encoded-vs-legacy <legacy.ri> <encoded.ri> [--trials N]\n"
                   << "   Or: " << argv[0] << " --verify-sampled <r_index.ri> <sampled.tags> --gbz <graph.gbz> [--path-id N] [--sample-every N]\n"
-                  << "   Or: " << argv[0] << " --verify-compact-vs-gbwt <r_index.ri> <compact_tags.tags> --gbz <graph.gbz> [--path-id N] [--sample-every N]\n";
+                  << "   Or: " << argv[0] << " --verify-compact-vs-gbwt <r_index.ri> <compact_tags.tags> --gbz <graph.gbz> [--path-id N] [--sample-every N]\n"
+                  << "   Or: " << argv[0] << " --verify-translation-tables <graph.gbz> <table1.t1> <table2.t2> [--trials N] [--seed S]\n";
         return 1;
     }
 

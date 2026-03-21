@@ -1,0 +1,199 @@
+#ifndef PANGENOME_INDEX_TRANSLATION_TABLES_HPP
+#define PANGENOME_INDEX_TRANSLATION_TABLES_HPP
+
+/**
+ * Translation Table 1: Named path + global interval → (path_id, local interval)
+ *
+ * Many reference paths in the graph are split into subpaths with different
+ * start coordinates and lengths. For example, GRCh38#0#chr10 might appear as:
+ *
+ *   GRCh38#0#chr10[13060]      length 38515470  →  covers [13060, 38528540)
+ *   GRCh38#0#chr10[38573338]   length 994246    →  covers [38573338, 39567584)
+ *   GRCh38#0#chr10[42099786]   length 5680582   →  covers [42099786, 47780368)
+ *   GRCh38#0#chr10[47881464]   length 85785427  →  covers [47881464, 133666891)
+ *
+ * "Global" coordinates for that name are these reference intervals. A query
+ * like GRCh38#0#chr10[1234567-1300000] is in global coords; 1234567 lies
+ * in the first subpath [13060, 38528540), so it maps to path_id of that
+ * subpath with local interval [1234567 - 13060, 1300000 - 13060].
+ *
+ * Table 1 stores, for each named path (e.g. "GRCh38#0#chr10"), the list of
+ * subpaths (path_id, subpath_start, length). Lookup(name, start, end) returns
+ * all (path_id, local_start, local_end) pairs for subpaths overlapping [start,end].
+ *
+ * Translation Table 2: (source_path_id, target_haplotype) → sorted interval segment mappings
+ *
+ * For each (source_path_id, target_haplotype_name) pair that shares at least one
+ * graph node, Table 2 stores a sorted list of IntervalMapping entries describing
+ * which source intervals map to which target_path_id. Source intervals can overlap
+ * and map to different target paths (e.g. src[0,100]->77, src[10,90]->78).
+ *
+ * Example:
+ *   (source_path_id=12, "HG002#1") → [
+ *     { src=[0, 38000),   tgt_path_id=77 },
+ *     { src=[10, 90),     tgt_path_id=78 },  // overlaps
+ *     { src=[45000, 110000), tgt_path_id=78 },
+ *   ]
+ *
+ * Lookup returns tgt_path_id for each segment whose source interval overlaps
+ * the query [local_start, local_end).
+ */
+
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+#include <map>
+#include <utility>
+#include <iosfwd>
+
+namespace panindexer {
+
+/// One subpath: GBWT path id and its extent in global coordinates [subpath_start, subpath_start + length).
+struct SubpathInfo {
+    size_t path_id = 0;         ///< GBWT sequence/path id for this subpath
+    size_t subpath_start = 0;  ///< Start position in global (reference) coordinates
+    size_t length = 0;         ///< Length of this subpath in bases
+
+    size_t end() const { return subpath_start + length; }
+};
+
+/// One (path_id, local interval) result from Table 1 lookup. Interval is [start, end) (end exclusive).
+struct PathInterval {
+    size_t path_id = 0;
+    size_t start = 0;  ///< Start offset within the path (local coordinates)
+    size_t end = 0;    ///< End offset within the path (exclusive)
+};
+
+/**
+ * Translation Table 1: converts (named path, global interval) to (path_id, local interval) list.
+ *
+ * - Keys: named path (e.g. "GRCh38#0#chr10"). Each name has a list of SubpathInfo.
+ * - Lookup: given (path_name, global_start, global_end), returns all PathInterval for
+ *   subpaths overlapping that range, with coordinates in local path space.
+ */
+class TranslationTable1 {
+public:
+    TranslationTable1() = default;
+
+    /// Add a subpath for a named path. Subpaths for the same name should be added in order of subpath_start.
+    void add_subpath(const std::string& path_name, size_t path_id, size_t subpath_start, size_t length);
+
+    /// Lookup: (path_name, global_start, global_end) → list of (path_id, local_start, local_end).
+    /// Global interval is [global_start, global_end) (end exclusive).
+    /// Returns empty if path_name is unknown or interval does not overlap any subpath.
+    std::vector<PathInterval> lookup(const std::string& path_name,
+                                    size_t global_start,
+                                    size_t global_end) const;
+
+    /// Lookup by name id (index into names()). Use when you have already resolved name → id.
+    std::vector<PathInterval> lookup_by_name_id(size_t name_id,
+                                               size_t global_start,
+                                               size_t global_end) const;
+
+    /// Number of named paths (path names) in the table.
+    size_t num_names() const { return name_to_subpaths_.size(); }
+
+    /// All path names; order matches name_id (index) used by lookup_by_name_id.
+    std::vector<std::string> names() const;
+
+    /// Get subpath list for a path name (for inspection/debug). Empty if unknown.
+    std::vector<SubpathInfo> subpaths(const std::string& path_name) const;
+
+    /// Serialize to a binary stream (format: version, then name→subpaths).
+    void serialize(std::ostream& out) const;
+
+    /// Load from a binary stream.
+    void load(std::istream& in);
+
+private:
+    /// Path names in order of first add (used for lookup_by_name_id and stable serialize).
+    std::vector<std::string> names_;
+    /// path_name → list of subpaths
+    std::map<std::string, std::vector<SubpathInfo>> name_to_subpaths_;
+};
+
+/**
+ * One segment entry in Table 2.
+ * States: source local interval [src_start, src_end) on source_path_id maps to
+ *         target path tgt_path_id (no target coordinates stored).
+ * Source intervals can overlap: e.g. src[0,100]->i and src[10,90]->j.
+ * Segments are stored sorted by src_start within each (src_path_id, tgt_haplotype) key.
+ */
+struct IntervalMapping {
+    size_t src_start   = 0;  ///< Start on source path (local, inclusive)
+    size_t src_end     = 0;  ///< End on source path   (local, exclusive)
+    size_t tgt_path_id = 0;  ///< GBWT path_id of the target subpath
+
+    size_t src_len() const { return src_end - src_start; }
+};
+
+/// Result of a Table 2 lookup: target path_id only (no target coordinates).
+struct TargetInterval {
+    size_t tgt_path_id = 0;
+};
+
+/**
+ * Translation Table 2: (source_path_id, target_haplotype_name) → sorted IntervalMapping list.
+ *
+ * Sparse: only pairs that share at least one graph node are stored.
+ * Within each key the list is sorted by src_start for binary-search lookup.
+ */
+class TranslationTable2 {
+public:
+    TranslationTable2() = default;
+
+    /// Add one interval mapping for (src_path_id, tgt_haplotype).
+    /// Mappings need not be added in sorted order; call finalize() when done.
+    void add_mapping(size_t src_path_id,
+                     const std::string& tgt_haplotype,
+                     const IntervalMapping& mapping);
+
+    /// Sort all segment lists by src_start. Must be called before lookup or serialize.
+    void finalize();
+
+    /**
+     * Lookup: (src_path_id, tgt_haplotype, local_start, local_end) →
+     *         list of TargetInterval (tgt_path_id only) for each overlapping segment.
+     * Returns empty if no entry or no overlap.
+     * finalize() must have been called first.
+     */
+    std::vector<TargetInterval> lookup(size_t src_path_id,
+                                       const std::string& tgt_haplotype,
+                                       size_t local_start,
+                                       size_t local_end) const;
+
+    /// Number of (src_path_id, tgt_haplotype) pairs stored.
+    size_t num_entries() const { return entries_.size(); }
+
+    /// Total number of IntervalMapping segments across all keys.
+    size_t total_segments() const;
+
+    /// All (src_path_id, tgt_haplotype) keys.
+    std::vector<std::pair<size_t, std::string>> keys() const;
+
+    /// Segment list for a specific key (for inspection/debug).
+    std::vector<IntervalMapping> segments(size_t src_path_id,
+                                          const std::string& tgt_haplotype) const;
+
+    /// Serialize to binary stream.
+    void serialize(std::ostream& out) const;
+
+    /// Load from binary stream.
+    void load(std::istream& in);
+
+private:
+    struct Key {
+        size_t      src_path_id;
+        std::string tgt_haplotype;
+        bool operator<(const Key& o) const {
+            if (src_path_id != o.src_path_id) return src_path_id < o.src_path_id;
+            return tgt_haplotype < o.tgt_haplotype;
+        }
+    };
+    std::map<Key, std::vector<IntervalMapping>> entries_;
+};
+
+} // namespace panindexer
+
+#endif // PANGENOME_INDEX_TRANSLATION_TABLES_HPP
