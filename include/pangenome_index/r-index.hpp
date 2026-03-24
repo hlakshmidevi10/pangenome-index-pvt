@@ -718,6 +718,20 @@ namespace panindexer {
             return complement_table[symbol];
         }
 
+        // Print the count of each character in the BWT (including N when present).
+        // For encoded r-index, N count is 0 when encoded_has_N is false.
+        void print_character_counts(std::ostream& out) const;
+
+        // Get list of runs in a block as (symbol_byte, length). For comparing Blocks vs EncodedBlock.
+        // Legacy: from Run_blocks; encoded: decoded from EncodedBlock. Symbol is the byte value (e.g. 'A').
+        void get_block_runs(size_t block_id, std::vector<std::pair<size_t, size_t>>& runs_out) const;
+
+        // Number of blocks (run blocks). Legacy: blocks.size(); encoded: blocks_encoded_start_bits.size().
+        size_t num_blocks() const {
+            if (!this->blocks.empty()) return this->blocks.size();
+            return this->blocks_encoded_start_bits.size();
+        }
+
     private:
         void copy(const FastLocate &source);
 

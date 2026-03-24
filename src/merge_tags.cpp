@@ -21,6 +21,7 @@
 #include <thread>
 #include <utility>
 #include <stdexcept>
+#include <algorithm>
 
 
 #ifndef TIME
@@ -437,7 +438,7 @@ int main(int argc, char **argv) {
 #endif
 
 
-    int threads = 8;
+    int threads = 64;
     omp_set_num_threads(threads);
 
     std::string gbz_graph = std::string(argv[1]);
@@ -481,7 +482,7 @@ int main(int argc, char **argv) {
     std::vector<int> comp_to_file(number_of_file);
 
     std::cerr << "Initializing the reader" << std::endl;
-    FileReader reader(files, threads, 1000000);
+    FileReader reader(files, threads, 50000000);
     std::cerr << "Creating the mapping from comp to tag files" << std::endl;
     // for each tag block files, we read the first block and read the first node
     for (auto i = 0; i < number_of_file; i++) {
@@ -594,7 +595,7 @@ int main(int argc, char **argv) {
 
 
     // ############################################## variables to change
-    size_t run_per_thread = 500;
+    size_t run_per_thread = 5000;
     int encoded_start_every_k_run = 10;
 
 
@@ -617,12 +618,18 @@ int main(int argc, char **argv) {
     std::vector<std::pair<pos_t, uint16_t>> temp_tag_runs;
 
     // have to calculate the number of ENDMARKERS at the beginning of the r-index and put special value 0 for them
+    // Store in multiple runs so each run length fits in uint16_t (max 65535)
     auto num_endmarkers = total_strings;
-//    std::vector<std::pair<pos_t, uint16_t>> endmarkers = {std::make_pair(pos_t{0, 0, 0}, num_endmarkers)};
-    temp_tag_runs.push_back(std::make_pair(pos_t{0, 0, 0}, num_endmarkers));
-//    tag_array.serialize_run_by_run(out, endmarkers);
+    constexpr uint16_t max_run_len = 65535;
+    pos_t endmarker_pos = pos_t{0, 0, 0};
+    size_t remaining = num_endmarkers;
+    while (remaining > 0) {
+        uint16_t chunk = static_cast<uint16_t>(std::min(remaining, static_cast<size_t>(max_run_len)));
+        temp_tag_runs.push_back(std::make_pair(endmarker_pos, chunk));
+        remaining -= chunk;
+    }
     tag_count += num_endmarkers;
-    tag_run_count++;
+    tag_run_count += temp_tag_runs.size();
 
 
 
@@ -684,6 +691,8 @@ int main(int argc, char **argv) {
     }
 
     std::cerr << "Writing " << temp_tag_runs.size() << " tags before running actual jobs" << std::endl;
+    // total size of the tags before running actual jobs
+    std::cerr << "Total size of the tags before running actual jobs is " << tag_count << std::endl;
 
     tag_run_count += temp_tag_runs.size();
 
@@ -822,6 +831,10 @@ int main(int argc, char **argv) {
         }
 
 
+    }
+    // When there are no jobs, the main thread's last run was popped into previous_last_run and never written.
+    if (number_of_jobs == 0) {
+        tag_array.append_compact_run_streamed(previous_last_run.first, previous_last_run.second, out_encoded_starts, out_bwt_intervals);
     }
     for (auto &thread: threads_list) {
         if (thread.joinable()) {

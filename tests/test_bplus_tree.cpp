@@ -29,7 +29,7 @@ namespace {
             size_t first = i * 10;
 
 
-            panindexer::Run current_run = {first, gbwtgraph::Position::encode(current_pos)};
+            panindexer::Run current_run = {first, gbwtgraph::Position(current_pos)};
 
             bptree.insert(current_run, 1);
         }
@@ -48,7 +48,7 @@ namespace {
         // Insert in randomized order
         for (int i : indices) {
             pos_t current_pos = pos_t{1, false, 0};
-            panindexer::Run current_run = {static_cast<size_t>(i), gbwtgraph::Position::encode(current_pos)};
+            panindexer::Run current_run = {static_cast<size_t>(i), gbwtgraph::Position(current_pos)};
 //            std::cerr << "Inserting " << i << std::endl;
             bptree.insert(current_run, 1);
 //            bptree.print_whole_tree();
@@ -59,8 +59,8 @@ namespace {
             runs.push_back(current_item);
         }
         vector<panindexer::Run> results;
-        panindexer::Run run1 = {0, gbwtgraph::Position::encode(current_pos)};
-        panindexer::Run run2 = {test_nums * 10 - 1, gbwtgraph::Position::no_value()};
+        panindexer::Run run1 = {0, gbwtgraph::Position(current_pos)};
+        panindexer::Run run2 = {test_nums * 10 - 1, gbwtgraph::Position::no_pos()};
         results.push_back(run1);
         results.push_back(run2);
         ASSERT_EQ(runs, results) << "Invalid BPlusTree results";
