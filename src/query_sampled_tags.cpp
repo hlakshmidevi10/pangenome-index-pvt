@@ -85,16 +85,19 @@ static size_t find_sequence_id_by_path_name(const gbwt::GBWT& gbwt_index,
         }
         
         if (!matching_paths.empty()) {
+            size_t gbwt_path_id = matching_paths[0];
             if (matching_paths.size() > 1) {
                 cerr << "Warning: Multiple paths (" << matching_paths.size() 
                      << ") found for contig '" << path_name_str << "'. Using first match (path_id=" 
-                     << matching_paths[0] << ")" << endl;
+                     << gbwt_path_id << ")" << endl;
             }
-            
+            // RLBWT seq 2i = forward strand of GBWT path i (see coordinate_translation PathSpec::resolve).
+            size_t rlbwt_seq_id = 2 * gbwt_path_id;
             if (debug_output) {
-                cerr << "Resolved path name '" << path_name_str << "' to sequence ID: " << matching_paths[0] << endl;
+                cerr << "Resolved path name '" << path_name_str << "': GBWT path_id=" << gbwt_path_id
+                     << " -> RLBWT seq_id=" << rlbwt_seq_id << " (forward)" << endl;
             }
-            return matching_paths[0];
+            return rlbwt_seq_id;
         }
     }
     
@@ -184,19 +187,19 @@ static size_t find_sequence_id_from_metadata(const gbwt::GBWT& gbwt_index,
         return numeric_limits<size_t>::max();
     }
     
+    size_t gbwt_path_id = matching_paths[0];
     if (matching_paths.size() > 1) {
         cerr << "Warning: Multiple paths (" << matching_paths.size() 
              << ") found matching the criteria. Using first match (path_id=" 
-             << matching_paths[0] << ")" << endl;
+             << gbwt_path_id << ")" << endl;
     }
     
-    // The path_id in GBWT metadata corresponds to the sequence ID
-    // In GBWT, paths are stored as bidirectional paths, so we need to get the correct sequence ID
-    // The sequence ID is typically 2 * path_id for forward orientation
-    size_t seq_id = matching_paths[0];
+    // GBWT metadata path_id i maps to RLBWT forward sequence 2*i (reverse is 2*i+1).
+    size_t seq_id = 2 * gbwt_path_id;
     
     if (debug_output) {
-        cerr << "Resolved to sequence ID: " << seq_id << endl;
+        cerr << "Resolved: GBWT path_id=" << gbwt_path_id
+             << " -> RLBWT seq_id=" << seq_id << " (forward)" << endl;
     }
     
     return seq_id;
@@ -206,7 +209,7 @@ static void usage(const char* prog) {
     cerr << "Usage: " << prog << " <r_index.ri> <sampled.tags> [options]" << endl;
     cerr << endl;
     cerr << "Path specification (choose one):" << endl;
-    cerr << "  --seq-id ID                  Direct sequence ID" << endl;
+    cerr << "  --seq-id ID                  Direct RLBWT sequence ID (GBWT path i forward = 2*i)" << endl;
     cerr << "  --gbz FILE --path-name NAME  Specify path by name (for generic paths like 'x', 'chr1')" << endl;
     cerr << "  --gbz FILE --sample NAME --contig NAME [--haplotype N]" << endl;
     cerr << "                               Specify path by metadata (for haplotype paths)" << endl;

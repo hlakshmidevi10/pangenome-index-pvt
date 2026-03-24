@@ -1036,22 +1036,16 @@ namespace panindexer {
 
         }
 
-        std::cerr << "endmarker runs size " << endmarker_runs.size() << std::endl;
-//        // printing the endmarker runs
-       for (size_t i = 0; i < endmarker_runs.size(); i++) {
-           std::cerr << endmarker_runs[i] << " ";
-       }
-
-
         // Extract the samples from each sequence.
         double extract_start = readTimer();
         if (Verbosity::level >= Verbosity::FULL) {
             std::cerr << "FastLocate::FastLocate(): Extracting head/tail samples" << std::endl;
         }
 
-        // running with how many threads
-        std::cerr << omp_get_max_threads() << std::endl;
-// #pragma omp parallel for schedule(dynamic, 1)
+        if (Verbosity::level >= Verbosity::FULL) {
+            std::cerr << "FastLocate::FastLocate(): OpenMP max threads " << omp_get_max_threads() << std::endl;
+        }
+#pragma omp parallel for schedule(dynamic, 1)
         for (size_type i = 0; i < n_seq; i++) {
 
 //            std::cerr << "Starting a sub job for seq" << i << std::endl;
@@ -1070,10 +1064,6 @@ namespace panindexer {
             range_type run(0, 0);
 
             while (curr.first != NENDMARKER) {
-                // printing sequence id and offset
-                std::cerr << "Sequence id " << i << " offset " << seq_offset << std::endl;
-
-
 //                auto next1 = this->psi(curr.second); // TODO: make a function that does these two lines at once
 //                range_type run1(0, 0);
 //                size_type run_id1 = 0;
@@ -1106,7 +1096,7 @@ namespace panindexer {
                 curr = next;
                 seq_offset++;
 
-                if (seq_offset % 100000000 == 0) {
+                if (Verbosity::level >= Verbosity::FULL && seq_offset % 100000000 == 0) {
                     std::cerr << "seq " << i << " offset " << seq_offset << std::endl;
                 }
             }

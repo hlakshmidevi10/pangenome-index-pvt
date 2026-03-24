@@ -349,6 +349,10 @@ struct PathSpec {
     }
 };
 
+// Single-path --benchmark (without tables): fixed RLBWT pair — forward strand of GBWT path 0 vs path 1.
+constexpr size_t kBenchmarkSourceSeqId = 0;
+constexpr size_t kBenchmarkTargetSeqId = 2;
+
 static void usage(const char* prog) {
     cerr << "Usage: " << prog << " <rlbwt_rindex.ri> <gbwt_rindex.ri> <sampled.tags> [options]" << endl;
     cerr << endl;
@@ -2149,13 +2153,8 @@ int main(int argc, char** argv) {
     bool table_mode = (!table1_file.empty() && !table2_file.empty() &&
                        !source_haplotype_name.empty() && !target_haplotype_name.empty());
 
-    if (benchmark_mode) {
-        source_spec.seq_id = 0;
-        target_spec.seq_id = 2;
-    }
-    
-    // Validate source/target specification (not required in table-driven mode)
-    if (!table_mode) {
+    // Validate source/target specification (not required in table-driven or single-path benchmark mode)
+    if (!table_mode && !benchmark_mode) {
         if (!source_spec.validate("source")) {
             usage(argv[0]);
             return 1;
@@ -2267,7 +2266,8 @@ int main(int argc, char** argv) {
     }
     
     // Resolve source and target path specifications to sequence IDs (skip in table-driven mode)
-    if (!table_mode && (!source_spec.use_seq_id() || !target_spec.use_seq_id())) {
+    if (!table_mode && !benchmark_mode &&
+        (!source_spec.use_seq_id() || !target_spec.use_seq_id())) {
         if (!gbwt_index_ptr) {
             cerr << "Error: GBWT index is required for path name resolution" << endl;
             return 1;
@@ -2282,11 +2282,17 @@ int main(int argc, char** argv) {
         }
     }
     
-    size_t source_seq_id = table_mode ? 0 : source_spec.seq_id;
-    size_t target_seq_id = table_mode ? 0 : target_spec.seq_id;
-    if (benchmark_mode) {
+    size_t source_seq_id;
+    size_t target_seq_id;
+    if (table_mode) {
         source_seq_id = 0;
-        target_seq_id = 2;
+        target_seq_id = 0;
+    } else if (benchmark_mode) {
+        source_seq_id = kBenchmarkSourceSeqId;
+        target_seq_id = kBenchmarkTargetSeqId;
+    } else {
+        source_seq_id = source_spec.seq_id;
+        target_seq_id = target_spec.seq_id;
     }
     
     if (debug) {
