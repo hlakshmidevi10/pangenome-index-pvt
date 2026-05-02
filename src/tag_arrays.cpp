@@ -923,7 +923,7 @@ namespace panindexer {
         // Handle the last BWT pos
         decc = gbwt::ByteCode::read(this->encoded_runs, bit_location);
         decoded_run = decode_run(decc);
-        decoded_run.second = (bwt_end - end_run_bwt_index);
+        decoded_run.second = (bwt_end - end_run_bwt_index) + 1;
         decoded_runs.push_back(decoded_run);
     }
 

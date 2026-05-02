@@ -30,13 +30,29 @@ double get_memory_usage_mb() {
 #endif
 }
 
+std::string format_number(size_t n) {
+    if (n >= 1000000000) {
+        return std::to_string(n / 1000000000) + "." + std::to_string((n % 1000000000) / 100000000) + "B";
+    } else if (n >= 1000000) {
+        return std::to_string(n / 1000000) + "." + std::to_string((n % 1000000) / 100000) + "M";
+    } else if (n >= 1000) {
+        return std::to_string(n / 1000) + "." + std::to_string((n % 1000) / 100) + "K";
+    }
+    return std::to_string(n);
+}
+
 // Profiling structure for per-MEM statistics
 struct MEMProfilingStats {
     double tag_query_time = 0.0;
     double locate_time = 0.0;
-    double write_time = 0.0;
-    double file_write_time = 0.0;  // Time spent specifically on file I/O
-    size_t unique_runs = 0;
+    double first_locate_time = 0.0;    // Time for initial locate_sa_value call
+    double locate_next_time = 0.0;     // Aggregated time for all locateNext calls
+    double file_write_time = 0.0;
+    size_t tag_runs = 0;
+    size_t locate_operations = 0;
+    size_t first_locate_calls = 0;     // Number of locate_sa_value calls (1 per MEM)
+    size_t locate_next_calls = 0;      // Number of locateNext calls
+    size_t entries_written = 0;
 };
 
 // Global profiling structure
@@ -54,6 +70,7 @@ struct ProfilingData {
     double total_reads_processing_time = 0.0;
     size_t total_mems_outputted = 0;
     double total_mem_finding_time = 0.0;
+    double total_mem_processing_time = 0.0;  // Time spent processing all MEMs (tag queries + locate + write)
     
     // MEM statistics
     size_t total_mem_length = 0;      // Sum of all MEM lengths
@@ -63,9 +80,14 @@ struct ProfilingData {
     // Per-MEM operations (aggregated)
     double total_tag_query_time = 0.0;
     double total_locate_time = 0.0;
-    double total_write_time = 0.0;
-    double total_file_write_time = 0.0;  // Time spent specifically on file I/O
-    size_t total_unique_runs = 0;
+    double total_first_locate_time = 0.0;   // Aggregated time for initial locate_sa_value calls
+    double total_locate_next_time = 0.0;    // Aggregated time for all locateNext calls
+    double total_file_write_time = 0.0;
+    size_t total_tag_runs = 0;
+    size_t total_locate_operations = 0;
+    size_t total_first_locate_calls = 0;    // Total number of locate_sa_value calls
+    size_t total_locate_next_calls = 0;     // Total number of locateNext calls
+    size_t total_entries_written = 0;
     
     // Sorting
     double total_sort_time = 0.0;
@@ -82,7 +104,59 @@ struct ProfilingData {
 //  4. Encode all entries in bytes instead of csv
 //  5. Filtering: Order runs by length, this will far spurious matches are not picked
 
-// Helper function to dump MEM information
+// // Helper function to locate sequence ID for a single BWT position
+// // This is optimized for single-position queries to avoid vector allocation overhead
+// // Returns the sequence ID for the given BWT position
+// inline size_type locate_single_position(const FastLocate& r_index, size_type bwt_pos) {
+//     size_type first = r_index.NO_POSITION;
+//     size_type offset_of_first = bwt_pos;
+//
+//     // Find the nearest run start and get the sample
+//     auto iter = r_index.blocks_start_pos.predecessor(bwt_pos);
+//     size_type run_id = 0;
+//     size_t cur_pos = 0;
+//
+//     auto run_num = r_index.blocks[iter->first].run_id_at(bwt_pos - iter->second, cur_pos);
+//     run_id = iter->first * r_index.block_size + run_num;
+//     offset_of_first = iter->second + cur_pos;
+//     first = r_index.getSample(run_id);
+//
+//     // Iterate until the exact position
+//     while (offset_of_first < bwt_pos) {
+//         first = r_index.locateNext(first);
+//         offset_of_first++;
+//     }
+//
+//     // Return just the sequence ID
+//     return r_index.seqId(first);
+// }
+
+// Helper function to get the SA value (not seq_id) for a single BWT position
+// Returns the packed SA value that can be used with locateNext()
+inline size_type locate_sa_value(const FastLocate& r_index, size_type bwt_pos) {
+    size_type first = r_index.NO_POSITION;
+    size_type offset_of_first = bwt_pos;
+    
+    // Find the nearest run start and get the sample
+    auto iter = r_index.blocks_start_pos.predecessor(bwt_pos);
+    size_t cur_pos = 0;
+    
+    auto run_num = r_index.blocks[iter->first].run_id_at(bwt_pos - iter->second, cur_pos);
+    size_type run_id = iter->first * r_index.block_size + run_num;
+    offset_of_first = iter->second + cur_pos;
+    first = r_index.getSample(run_id);
+    
+    // Iterate until the exact position
+    while (offset_of_first < bwt_pos) {
+        first = r_index.locateNext(first);
+        offset_of_first++;
+    }
+    
+    return first;
+}
+
+// Helper function to dump MEM information (Original Algorithm)
+// Locates SA entries for ALL BWT positions in the MEM interval
 void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastLocate& r_index,
     vector<size_t> &seq_id_counter, MEMProfilingStats& mem_stats,
     std::ofstream* output_file = nullptr, bool debug_stats = false) {
@@ -90,6 +164,7 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
     // Get BWT range for this MEM
     size_t bwt_start = mem.bwt_start;
     size_t bwt_end = mem.bwt_start + mem.size - 1;
+    size_t mem_length = mem.end - mem.start;
 
 #if TIME
     auto tag_query_start = chrono::high_resolution_clock::now();
@@ -103,7 +178,7 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
     auto tag_query_end = chrono::high_resolution_clock::now();
     std::chrono::duration<double> tag_query_duration = tag_query_end - tag_query_start;
     mem_stats.tag_query_time = tag_query_duration.count();
-    mem_stats.unique_runs = decoded_runs.size();
+    mem_stats.tag_runs = decoded_runs.size();
 #endif
 
 #if TIME
@@ -112,7 +187,10 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
 
     // Get sequence IDs from r_index.locate()
     gbwt::range_type range(bwt_start, bwt_end);
-    std::vector<size_type> sa_values = r_index.locate(range);   // TODO: Address this expensive operation
+    std::vector<size_type> sa_values = r_index.locate(range);
+    
+    // Track number of locate operations (one batch locate for the entire range)
+    mem_stats.locate_operations = sa_values.size();
 
 #if TIME
     auto locate_end = chrono::high_resolution_clock::now();
@@ -162,6 +240,7 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
             if (inserted) {
                 seq_id_counter[seq_id]++;
                 unique_seq_ids++;
+                mem_stats.entries_written++;
 
 #if TIME
                 auto file_write_start = chrono::high_resolution_clock::now();
@@ -171,7 +250,7 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
                                         std::to_string(node_id) + SEPARATOR +
                                         std::to_string(offset) + SEPARATOR +
                                         std::to_string(is_reverse) + SEPARATOR +
-                                        std::to_string(mem.end - mem.start) + SEPARATOR +
+                                        std::to_string(mem_length) + SEPARATOR +
                                         std::to_string(mem.start) + SEPARATOR +
                                         std::to_string(read_id);
 
@@ -194,12 +273,6 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
         }
     }
 
-#if TIME
-    auto write_end = chrono::high_resolution_clock::now();
-    std::chrono::duration<double> write_duration = write_end - write_start;
-    mem_stats.write_time = write_duration.count();
-#endif
-
     // Print statistics when debug is enabled
     if (debug_stats && (duplicate_occurrences > 0 || total_positions != unique_seq_ids)) {
         std::cerr << "=== MEM DUPLICATE STATISTICS ===" << std::endl;
@@ -217,6 +290,215 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
             if (pair.second > 1) {
                 std::cerr << "  seq_id=" << pair.first << " appeared " << pair.second << " times" << std::endl;
             }
+        }
+        std::cerr << "=================================" << std::endl;
+    }
+}
+
+// Helper function to dump MEM information (Optimized Algorithm)
+// Only locates SA entries for the START of each unique tag run
+// Uses amortized locate traversal but avoids allocating array for all positions
+void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_array, FastLocate& r_index,
+    vector<size_t> &seq_id_counter, MEMProfilingStats& mem_stats,
+    std::ofstream* output_file = nullptr, bool debug_stats = false) {
+
+    // Get BWT range for this MEM
+    size_t bwt_start = mem.bwt_start;
+    size_t bwt_end = mem.bwt_start + mem.size - 1;
+    size_t mem_length = mem.end - mem.start;
+
+#if TIME
+    auto tag_query_start = chrono::high_resolution_clock::now();
+#endif
+
+    // Query tag array to get the runs for this BWT interval
+    std::vector<std::pair<pos_t, uint16_t>> decoded_runs;
+    tag_array.query_compressed_decoded_runs(mem.bwt_start, mem.bwt_start + mem.size - 1, decoded_runs);
+
+#if TIME
+    auto tag_query_end = chrono::high_resolution_clock::now();
+    std::chrono::duration<double> tag_query_duration = tag_query_end - tag_query_start;
+    mem_stats.tag_query_time = tag_query_duration.count();
+    mem_stats.tag_runs = decoded_runs.size();
+#endif
+
+    if (decoded_runs.empty()) {
+        return;
+    }
+
+#if TIME
+    auto first_locate_start = chrono::high_resolution_clock::now();
+#endif
+
+    // Initialize locate traversal: get SA value at bwt_start
+    size_type sa_value = locate_sa_value(r_index, bwt_start);
+    mem_stats.first_locate_calls = 1;
+
+#if TIME
+    auto first_locate_end = chrono::high_resolution_clock::now();
+    std::chrono::duration<double> first_locate_duration = first_locate_end - first_locate_start;
+    mem_stats.first_locate_time = first_locate_duration.count();
+#endif
+
+    // Track unique graph positions to avoid duplicates
+    std::unordered_set<pos_t> seen_graph_positions;
+    
+    // Statistics tracking when debug is enabled
+    std::unordered_map<size_type, size_t> seq_id_occurrence_count;
+    size_t total_runs_from_query = decoded_runs.size();
+    size_t total_unique_positions = 0;
+    size_t total_seq_ids_output = 0;
+    size_t duplicate_positions_skipped = 0;
+    
+    // Track unique vs total node IDs from unique tag runs (for debug stats)
+    std::unordered_set<int64_t> unique_node_ids;
+    size_t total_node_ids_from_tag_runs = 0;
+    
+    // Track graph_pos -> total occurrence (sum of run lengths) when debug is enabled
+    std::unordered_map<pos_t, size_t> graph_pos_occurrence_count;
+
+    // Iterate through BWT interval, tracking position within current tag run
+    size_t run_idx = 0;
+    uint16_t pos_in_run = 0;
+    
+    for (size_t i = bwt_start; i <= bwt_end && run_idx < decoded_runs.size(); i++) {
+        pos_t graph_pos = decoded_runs[run_idx].first;
+        uint16_t run_length = decoded_runs[run_idx].second;
+
+        // TODO: 05/01: calculate average run length
+        
+        // Process only at the START of each tag run (pos_in_run == 0)
+        if (pos_in_run == 0) {
+            if (debug_stats) {
+                // std::cerr << "[DEBUG] run_idx=" << run_idx << " graph_pos=" << graph_pos << " run_length=" << run_length << std::endl;
+                graph_pos_occurrence_count[graph_pos] += run_length;
+            }
+            // Check if we've already seen this graph position
+            auto [set_it, inserted] = seen_graph_positions.insert(graph_pos);
+            if (!inserted) {
+                // Duplicate graph position, skip it
+                if (debug_stats) {
+                    duplicate_positions_skipped++;
+                }
+            } else {
+                total_unique_positions++;
+                
+                // Get seq_id for this position
+                size_type seq_id = r_index.seqId(sa_value);
+                
+                // Extract node_id, offset, strand from pos_t
+                int64_t node_id = id(graph_pos);
+                size_t offset = gbwtgraph::offset(graph_pos);
+                bool is_reverse = is_rev(graph_pos);
+                
+                // Statistics collection when debug is enabled
+                if (debug_stats) {
+                    seq_id_occurrence_count[seq_id]++;
+                    unique_node_ids.insert(node_id);
+                    total_node_ids_from_tag_runs++;
+                }
+
+                // Output for this unique graph position
+                seq_id_counter[seq_id]++;
+                total_seq_ids_output++;
+                mem_stats.entries_written++;
+
+#if TIME
+                auto file_write_start = chrono::high_resolution_clock::now();
+#endif
+                // Create output string
+                std::string output_line = std::to_string(seq_id) + SEPARATOR +
+                                        std::to_string(node_id) + SEPARATOR +
+                                        std::to_string(offset) + SEPARATOR +
+                                        std::to_string(is_reverse) + SEPARATOR +
+                                        std::to_string(mem_length) + SEPARATOR +
+                                        std::to_string(mem.start) + SEPARATOR +
+                                        std::to_string(read_id);
+
+                // Output to file if provided
+                if (output_file && output_file->is_open()) {
+                    *output_file << output_line << '\n';
+                } else {
+                    // Output to stdout
+                    std::cout << output_line << std::endl;
+                }
+
+#if TIME
+                auto file_write_end = chrono::high_resolution_clock::now();
+                std::chrono::duration<double> file_write_duration = file_write_end - file_write_start;
+                mem_stats.file_write_time += file_write_duration.count();
+#endif
+            }
+        }
+        
+        // Advance position within current run
+        pos_in_run++;
+        
+        // If we've reached the end of this run, move to the next run
+        if (pos_in_run >= run_length) {
+            run_idx++;
+            pos_in_run = 0;
+        }
+        
+#if TIME
+        auto locate_next_start = chrono::high_resolution_clock::now();
+#endif
+        sa_value = r_index.locateNext(sa_value);
+        mem_stats.locate_next_calls++;
+#if TIME
+        auto locate_next_end = chrono::high_resolution_clock::now();
+        std::chrono::duration<double> locate_next_duration = locate_next_end - locate_next_start;
+        mem_stats.locate_next_time += locate_next_duration.count();
+#endif
+    }
+    
+    // Compute total locate time and operations
+    mem_stats.locate_time = mem_stats.first_locate_time + mem_stats.locate_next_time;
+    mem_stats.locate_operations = mem_stats.first_locate_calls + mem_stats.locate_next_calls;
+
+    // Print statistics when debug is enabled
+    if (debug_stats) {
+        std::cerr << "=== MEM STATISTICS (Unique Tag Runs Algorithm) ===" << std::endl;
+        std::cerr << "Read ID: " << read_id << std::endl;
+        std::cerr << "MEM: start=" << mem.start << ", end=" << mem.end
+                  << ", size(no. of matches)=" << (mem.size)
+        << ", length(len of mem)=" << (mem_length) << std::endl;
+        std::cerr << "BWT interval: [" << bwt_start << ", " << bwt_end
+                  << "], size=" << mem.size << std::endl;
+        std::cerr << "Total tag runs from query: " << total_runs_from_query << std::endl;
+        std::cerr << "Duplicate graph positions skipped: " << duplicate_positions_skipped << std::endl;
+        std::cerr << "Unique graph positions processed: " << total_unique_positions << std::endl;
+        std::cerr << "Total seq_ids output: " << total_seq_ids_output << std::endl;
+        if (total_node_ids_from_tag_runs != unique_node_ids.size()) {
+            std::cerr << "Total node IDs (from unique tag runs): " << total_node_ids_from_tag_runs << std::endl;
+            std::cerr << "Unique node IDs: " << unique_node_ids.size() << std::endl;
+        }
+
+        // Count unique seq_ids
+        std::cerr << "Unique sequence IDs: " << seq_id_occurrence_count.size() << std::endl;
+        
+        // Show seq_ids that appear multiple times (same seq_id with different graph positions)
+        bool has_duplicates = false;
+        for (const auto& pair : seq_id_occurrence_count) {
+            if (pair.second > 1) {
+                has_duplicates = true;
+                break;
+            }
+        }
+        
+        if (has_duplicates) {
+            std::cerr << "Sequences appearing in multiple unique graph positions:" << std::endl;
+            for (const auto& pair : seq_id_occurrence_count) {
+                if (pair.second > 1) {
+                    std::cerr << "  seq_id=" << pair.first << " appears in " << pair.second << " unique positions" << std::endl;
+                }
+            }
+        }
+        
+        // Output graph_pos -> total occurrence (sum of run lengths)
+        std::cerr << "Graph position occurrence counts (sum of run lengths):" << std::endl;
+        for (const auto& pair : graph_pos_occurrence_count) {
+            std::cerr << "  graph_pos=" << pair.first << " total_occurrence=" << pair.second << std::endl;
         }
         std::cerr << "=================================" << std::endl;
     }
@@ -359,6 +641,20 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Print run parameters for logging
+    std::cerr << "========================================" << std::endl;
+    std::cerr << "find_mems - Run Parameters" << std::endl;
+    std::cerr << "========================================" << std::endl;
+    std::cerr << "R-index file:      " << r_index_file << std::endl;
+    std::cerr << "Tag array index:   " << tag_array_index << std::endl;
+    std::cerr << "Reads file:        " << reads_file << std::endl;
+    std::cerr << "MEM length:        " << mem_length << std::endl;
+    std::cerr << "Min occurrences:   " << min_occ << std::endl;
+    std::cerr << "Output file:       " << (output_file_name.empty() ? "(stdout)" : output_file_name) << std::endl;
+    std::cerr << "Debug stats:       " << (debug_stats ? "enabled" : "disabled") << std::endl;
+    std::cerr << "Verbose mode:      " << (verbose ? "enabled" : "disabled") << std::endl;
+    std::cerr << "========================================" << std::endl;
+
     // Initialize profiling data
     ProfilingData profiling;
     double initial_memory_mb = get_memory_usage_mb();
@@ -446,6 +742,10 @@ int main(int argc, char **argv) {
         
         profiling.total_mems_outputted += mems.size();
         
+#if TIME
+        auto mem_processing_start = chrono::high_resolution_clock::now();
+#endif
+
         for (const auto& mem : mems) {
 #if DEBUG
             if (verbose) {
@@ -463,22 +763,39 @@ int main(int argc, char **argv) {
             // Per-MEM profiling
             MEMProfilingStats mem_stats;
             
-            dump_mem_info(mem, i, tag_array, r_index, seq_id_counter, mem_stats,
+            // Choose algorithm:
+            // Option 1: Original - locates ALL BWT positions (slower, more SA lookups)
+            // dump_mem_info(mem, i, tag_array, r_index, seq_id_counter, mem_stats,
+            //     output_file.is_open() ? &output_file : nullptr, debug_stats);
+            
+            // // Option 2: Optimized - locates only START of each unique tag run (faster, fewer SA lookups)
+            dump_mem_info_unique_runs(mem, i, tag_array, r_index, seq_id_counter, mem_stats,
                 output_file.is_open() ? &output_file : nullptr, debug_stats);
 
             // Aggregate per-MEM stats
             profiling.total_tag_query_time += mem_stats.tag_query_time;
             profiling.total_locate_time += mem_stats.locate_time;
-            profiling.total_write_time += mem_stats.write_time;
+            profiling.total_first_locate_time += mem_stats.first_locate_time;
+            profiling.total_locate_next_time += mem_stats.locate_next_time;
+            profiling.total_locate_operations += mem_stats.locate_operations;
+            profiling.total_first_locate_calls += mem_stats.first_locate_calls;
+            profiling.total_locate_next_calls += mem_stats.locate_next_calls;
             profiling.total_file_write_time += mem_stats.file_write_time;
-            profiling.total_unique_runs += mem_stats.unique_runs;
+            profiling.total_tag_runs += mem_stats.tag_runs;
+            profiling.total_entries_written += mem_stats.entries_written;
             
             // Calculate n/r ratio (n = mem.size, r = number of decoded runs)
-            if (mem_stats.unique_runs > 0) {
-                double n_over_r = (double)mem.size / mem_stats.unique_runs;
+            if (mem_stats.tag_runs > 0) {
+                double n_over_r = (double)mem.size / mem_stats.tag_runs;
                 profiling.total_n_over_r_ratio += n_over_r;
             }
         }
+        
+#if TIME
+        auto mem_processing_end = chrono::high_resolution_clock::now();
+        std::chrono::duration<double> mem_processing_duration = mem_processing_end - mem_processing_start;
+        profiling.total_mem_processing_time += mem_processing_duration.count();
+#endif
         
 #if DEBUG
         if (verbose && !mems.empty()) {
@@ -504,7 +821,7 @@ int main(int argc, char **argv) {
         output_file.close();
     }
 
-    if (argc > 6) {
+    if (!output_file_name.empty()) {
 #if TIME
         auto sort_start = chrono::high_resolution_clock::now();
 #endif
@@ -532,9 +849,9 @@ int main(int argc, char **argv) {
     std::cout << "   Memory usage: " << profiling.tag_index_load_memory_mb << " MB" << std::endl;
     
     std::cout << "\n3. READS:" << std::endl;
-    std::cout << "   Total number of reads: " << profiling.total_reads << std::endl;
+    std::cout << "   Total number of reads: " << format_number(profiling.total_reads) << std::endl;
     std::cout << "   Time taken to process all reads: " << profiling.total_reads_processing_time << " seconds" << std::endl;
-    std::cout << "   Total number of MEMs outputted: " << profiling.total_mems_outputted << std::endl;
+    std::cout << "   Total number of MEMs outputted: " << format_number(profiling.total_mems_outputted) << std::endl;
     if (profiling.total_reads > 0) {
         std::cout << "   Average MEMs per read: " << (double)profiling.total_mems_outputted / profiling.total_reads << std::endl;
     }
@@ -544,26 +861,31 @@ int main(int argc, char **argv) {
         std::cout << "   Average n/r ratio (n=mem.size, r=tag runs): " << profiling.total_n_over_r_ratio / profiling.total_mems_outputted << std::endl;
     }
     std::cout << "   Time for finding all MEMs: " << profiling.total_mem_finding_time << " seconds" << std::endl;
+    std::cout << "   Time for processing all MEMs: " << profiling.total_mem_processing_time << " seconds" << std::endl;
     if (profiling.total_reads > 0) {
-        std::cout << "   Average time for finding MEMs per read: " << profiling.total_mem_finding_time / profiling.total_reads << " seconds" << std::endl;
+        // std::cout << "   Average time for finding MEMs per read: " << profiling.total_mem_finding_time / profiling.total_reads << " seconds" << std::endl;
+        // std::cout << "   Average time for processing MEMs per read: " << profiling.total_mem_processing_time / profiling.total_reads << " seconds" << std::endl;
     }
     
     std::cout << "\n4. PER-MEM OPERATIONS (aggregated across all MEMs):" << std::endl;
     std::cout << "   Total time for tag queries: " << profiling.total_tag_query_time << " seconds" << std::endl;
-    std::cout << "   Total number of unique runs: " << profiling.total_unique_runs << std::endl;
+    std::cout << "   Total number of tag runs: " << format_number(profiling.total_tag_runs) << std::endl;
     if (profiling.total_mems_outputted > 0) {
-        std::cout << "   Average unique runs per MEM: " << (double)profiling.total_unique_runs / profiling.total_mems_outputted << std::endl;
-        std::cout << "   Average tag query time per MEM: " << profiling.total_tag_query_time / profiling.total_mems_outputted << " seconds" << std::endl;
+        std::cout << "   Average tag runs per MEM: " << (double)profiling.total_tag_runs / profiling.total_mems_outputted << std::endl;
     }
     std::cout << "   Total time for locate operations: " << profiling.total_locate_time << " seconds" << std::endl;
+    std::cout << "     - First locate (locate_sa_value): " << profiling.total_first_locate_time << " seconds" << std::endl;
+    std::cout << "     - Locate next (locateNext calls): " << profiling.total_locate_next_time << " seconds" << std::endl;
+    std::cout << "   Total number of locate operations: " << format_number(profiling.total_locate_operations) << std::endl;
+    std::cout << "     - First locate calls: " << format_number(profiling.total_first_locate_calls) << std::endl;
+    std::cout << "     - Locate next calls: " << format_number(profiling.total_locate_next_calls) << std::endl;
     if (profiling.total_mems_outputted > 0) {
-        std::cout << "   Average locate time per MEM: " << profiling.total_locate_time / profiling.total_mems_outputted << " seconds" << std::endl;
+        std::cout << "   Average locate operations per MEM: " << (double)profiling.total_locate_operations / profiling.total_mems_outputted << std::endl;
     }
-    std::cout << "   Total time for writing output (overall): " << profiling.total_write_time << " seconds" << std::endl;
-    std::cout << "   Total time for file I/O only: " << profiling.total_file_write_time << " seconds" << std::endl;
+    std::cout << "   Total time for file writes: " << profiling.total_file_write_time << " seconds" << std::endl;
+    std::cout << "   Total number of entries written: " << format_number(profiling.total_entries_written) << std::endl;
     if (profiling.total_mems_outputted > 0) {
-        std::cout << "   Average write time per MEM: " << profiling.total_write_time / profiling.total_mems_outputted << " seconds" << std::endl;
-        std::cout << "   Average file I/O time per MEM: " << profiling.total_file_write_time / profiling.total_mems_outputted << " seconds" << std::endl;
+        std::cout << "   Average entries written per MEM: " << (double)profiling.total_entries_written / profiling.total_mems_outputted << std::endl;
     }
     
     std::cout << "\n5. SORTING:" << std::endl;
@@ -587,18 +909,21 @@ int main(int argc, char **argv) {
     if (profiling.total_reads_processing_time > 0) {
         std::cout << "  - MEM finding: " << profiling.total_mem_finding_time << " s (" 
                   << (profiling.total_mem_finding_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
-        std::cout << "  - Tag queries: " << profiling.total_tag_query_time << " s (" 
-                  << (profiling.total_tag_query_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
-        std::cout << "  - Locate operations: " << profiling.total_locate_time << " s (" 
-                  << (profiling.total_locate_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
-        std::cout << "  - Writing output (overall): " << profiling.total_write_time << " s (" 
-                  << (profiling.total_write_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
-        std::cout << "    - File I/O only: " << profiling.total_file_write_time << " s (" 
-                  << (profiling.total_file_write_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
+        std::cout << "  - MEM processing: " << profiling.total_mem_processing_time << " s (" 
+                  << (profiling.total_mem_processing_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
+        std::cout << "    - Tag queries: " << profiling.total_tag_query_time << " s (" 
+                  << (profiling.total_tag_query_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
+        std::cout << "    - Locate operations: " << profiling.total_locate_time << " s (" 
+                  << (profiling.total_locate_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
+        std::cout << "      - First locate: " << profiling.total_first_locate_time << " s (" 
+                  << (profiling.total_first_locate_time / profiling.total_locate_time * 100) << "%)" << std::endl;
+        std::cout << "      - Locate next: " << profiling.total_locate_next_time << " s (" 
+                  << (profiling.total_locate_next_time / profiling.total_locate_time * 100) << "%)" << std::endl;
+        std::cout << "    - File writes: " << profiling.total_file_write_time << " s (" 
+                  << (profiling.total_file_write_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
         
         double other_time = profiling.total_reads_processing_time - 
-                           (profiling.total_mem_finding_time + profiling.total_tag_query_time + 
-                            profiling.total_locate_time + profiling.total_write_time);
+                           (profiling.total_mem_finding_time + profiling.total_mem_processing_time);
         std::cout << "  - Other overhead: " << other_time << " s (" 
                   << (other_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
     }

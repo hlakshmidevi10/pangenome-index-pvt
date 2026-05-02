@@ -8,7 +8,7 @@
 namespace panindexer {
     constexpr char NENDMARKER = '\n';
 
-    const std::vector<char> nuc = {NENDMARKER, 'A', 'C', 'G', 'T', 'N'};
+    const std::vector<char> nuc = {NENDMARKER, 'A', 'C', 'G', 'N', 'T'};
 
 }
 
