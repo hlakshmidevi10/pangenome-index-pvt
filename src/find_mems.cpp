@@ -134,24 +134,17 @@ struct ProfilingData {
 // Helper function to get the SA value (not seq_id) for a single BWT position
 // Returns the packed SA value that can be used with locateNext()
 inline size_type locate_sa_value(const FastLocate& r_index, size_type bwt_pos) {
-    size_type first = r_index.NO_POSITION;
-    size_type offset_of_first = bwt_pos;
-    
-    // Find the nearest run start and get the sample
-    auto iter = r_index.blocks_start_pos.predecessor(bwt_pos);
-    size_t cur_pos = 0;
-    
-    auto run_num = r_index.blocks[iter->first].run_id_at(bwt_pos - iter->second, cur_pos);
-    size_type run_id = iter->first * r_index.block_size + run_num;
-    offset_of_first = iter->second + cur_pos;
-    first = r_index.getSample(run_id);
-    
+    size_t run_id = 0;
+    size_t offset_of_first = 0;
+    r_index.run_id_and_offset_at(bwt_pos, run_id, offset_of_first);
+    size_type first = r_index.getSample(run_id);
+
     // Iterate until the exact position
     while (offset_of_first < bwt_pos) {
         first = r_index.locateNext(first);
         offset_of_first++;
     }
-    
+
     return first;
 }
 
