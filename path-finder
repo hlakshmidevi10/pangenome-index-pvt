@@ -1,0 +1,61 @@
+
+
+
+// Algo 1: Custom BAM generation with node annotation
+Input: list of reads R: [r1, r2,...,rm], r_index ri (n haplotype sequences), tag_array T
+Output: list of read mems, grouped by hap_id and sorted by node_ids; read_id, read_st, mem_len, node_identifier, hap_id
+
+for each r in R:
+    r_mems := find_mems(r, ri)          // list of overlapping mems where each mem is represented as r_st, mem_len, bwt_int_s, bwt_int_e
+
+
+    for each mem in r_mems:
+        final_pos = {}                  // set of {haplotype_id: node_identifiers}
+        // find at most k haplotype locations corresponding to this MEM bwt interval
+        // only store one node position per haplotype; if multiple node identifiers exist for same haplotype, select node with largest run length - indicating the node is shared among multiple hap
+        for each k in range(bwt_int_s, bwt_int_e):
+            hap_id := ri.DA[ri.SA[k]]       // returns the haplotype ID for this location
+            node_identifier_k := T[k]       // node_identifier_k = {node_id, offset, strand}
+
+            final_pos.hap_id = node_identifier_k
+
+
+        for hap_id, node_id in final_pos.items():
+            out.write(f'{mem.r_st}\t{mem_len}\t{hap_id}\t{node_id}\n')
+
+
+
+// Load the out file, group by hap_ids and sort by node identifiers
+final_out --> list of read mems, grouped by hap_id and sorted by node_ids
+
+
+
+
+// Algo 2: Path finder for matched MEMs
+Input: formatted_bam fb, gfa_file gfa
+Output: GAF file
+
+read_file(in, gfa)
+seg_len = read_gfa_node_len(in)         // list of segment/node lengths
+
+for each path in gfa:
+    mem_path_fp = fb.seek(path)
+    path_fp = 0
+
+    while mem_path_fp != null:
+        curr_mem = fb[mem_path_fp]
+        if gfa[path_fp].node == curr_mem.node.id:
+            path_str, path_len := get_path_info(curr_mem.node.id, curr_mem.mem_len - curr_mem.node.offset)      // returns path string and total path_len
+
+            // construct GAF entry using path_str, path_len, curr_mem.node.offset, curr_mem.read_id, curr_mem.read_st
+            gaf.write()...
+
+            mem_path_fp += 1
+
+        else:
+            path_fp += 1
+
+
+return gaf
+
+
