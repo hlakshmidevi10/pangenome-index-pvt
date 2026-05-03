@@ -1,5 +1,5 @@
 # Path to sdsl-lite
-SDSL_DIR ?= /Users/seeskand/Documents/sdsl-lite
+SDSL_DIR ?= ../sdsl-lite
 include $(SDSL_DIR)/Make.helper
 
 # Directories
@@ -19,7 +19,7 @@ CXX_FLAGS += -Iinclude -I$(INC_DIR) -Ideps/vg -Ideps/grlBWT/include -UNDEBUG
 PARALLEL_FLAGS = -fopenmp -pthread
 
 # Libraries
-LIBS = -L$(LIB_DIR) -Ldeps/grlBWT/build -lgbwtgraph -lgbwt -lhandlegraph -lsdsl -lgrlbwt -lcrypto
+LIBS = -L$(LIB_DIR) -Ldeps/grlBWT/build -lgbwtgraph -lgbwt -lhandlegraph -lsdsl -lgrlbwt -lcrypto -lzstd
 
 # macOS-specific OpenMP & compiler handling
 ifeq ($(shell uname -s), Darwin)
