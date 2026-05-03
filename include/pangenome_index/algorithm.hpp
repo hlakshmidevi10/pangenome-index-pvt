@@ -753,7 +753,9 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
 //        do {
 //            x = find_mems_function(pattern, min_len, min_occ, x, fmd_index, mems);
 //        } while (x < len);
+#ifdef DEBUG_FIND_MEMS
         std::cerr << "[find_all_mems] total mems=" << mems.size() << std::endl;
+#endif
 
         return mems;
     }
