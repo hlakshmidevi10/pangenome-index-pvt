@@ -69,6 +69,9 @@ namespace panindexer {
         void query_compressed(size_t start, size_t end, size_t &number_of_runs);
         // Compact variant: decodes positions using decode_run_length_compact
         void query_compressed_compact(size_t start, size_t end, size_t &number_of_runs);
+        // Compact variant: return decoded (pos_t, run_length) pairs for the BWT interval,
+        // with first/last run lengths clipped to [bwt_start, bwt_end].
+        void query_compressed_decoded_runs(size_t bwt_start, size_t bwt_end, std::vector<std::pair<pos_t, uint16_t>>& decoded_runs);
         // Streaming append helper for compact runs (writes sidecar sdsl structures and appends to encoded int_vector buffer)
         void append_compact_run_streamed(pos_t value, uint16_t run_length, std::ostream &encoded_starts_file, std::ostream &bwt_intervals_file);
         // Merge sidecar files with main file (sdsl layout: [int_vector][encoded_starts_sd][bwt_intervals])
@@ -124,6 +127,7 @@ namespace panindexer {
 
         sdsl::bit_vector::select_1_type encoded_runs_starts_select;
         sdsl::sd_vector<>::rank_1_type bwt_intervals_rank;
+        sdsl::sd_vector<>::select_1_type bwt_intervals_select;
 
         vector<pair<pos_t, uint16_t>> tag_runs;
 

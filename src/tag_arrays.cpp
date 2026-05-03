@@ -759,6 +759,7 @@ namespace panindexer {
 
         this->encoded_runs_sd_starts_select = sdsl::sd_vector<>::select_1_type(&this->encoded_runs_starts_sd);
         this->bwt_intervals_rank = sdsl::sd_vector<>::rank_1_type(&this->bwt_intervals);
+        this->bwt_intervals_select = sdsl::sd_vector<>::select_1_type(&this->bwt_intervals);
 
         std::cerr << "Select and rank data structures initialized" << std::endl;
     }
@@ -774,6 +775,7 @@ namespace panindexer {
 
         this->encoded_runs_sd_starts_select = sdsl::sd_vector<>::select_1_type(&this->encoded_runs_starts_sd);
         this->bwt_intervals_rank = sdsl::sd_vector<>::rank_1_type(&this->bwt_intervals);
+        this->bwt_intervals_select = sdsl::sd_vector<>::select_1_type(&this->bwt_intervals);
     }
 
     void TagArray::print_bwt_intervals_and_rank(size_t limit, std::ostream& out) const {
@@ -902,8 +904,32 @@ namespace panindexer {
         // }
         // std::cout << std::endl;
 
-        
-        
+
+
+    }
+
+    void TagArray::query_compressed_decoded_runs(size_t bwt_start, size_t bwt_end,
+                                                 std::vector<std::pair<pos_t, uint16_t>>& decoded_runs) {
+        decoded_runs.clear();
+
+        // Map [bwt_start, bwt_end] to run indices in encoded_runs_iv via bwt_intervals.
+        size_t first_bit_index = this->bwt_intervals_rank(bwt_start + 1) - 1;
+        size_t end_bit_index   = this->bwt_intervals_rank(bwt_end + 1) - 1;
+        size_t run_nums = end_bit_index - first_bit_index + 1;
+        decoded_runs.reserve(run_nums);
+
+        // encoded_runs_sd_starts_select gives the int_vector index for every k-th run.
+        size_t current_tag_run_index = first_bit_index - (first_bit_index % this->encoded_start_every_k_run);
+        size_t move_tags = first_bit_index % this->encoded_start_every_k_run;
+        size_t item_index = this->encoded_runs_sd_starts_select(current_tag_run_index / this->encoded_start_every_k_run + 1);
+        while (move_tags > 0) { (void)this->encoded_runs_iv[item_index++]; move_tags--; }
+
+        for (size_t k = first_bit_index; k <= end_bit_index; ++k) {
+            pos_t pos = decode_run_length_compact(this->encoded_runs_iv[item_index++]);
+            size_t eff_start = (k == first_bit_index) ? bwt_start : this->bwt_intervals_select(k + 1);
+            size_t eff_end   = (k == end_bit_index)   ? bwt_end   : this->bwt_intervals_select(k + 2) - 1;
+            decoded_runs.emplace_back(pos, static_cast<uint16_t>(eff_end - eff_start + 1));
+        }
     }
 
     void TagArray::compressed_serialize_compact(std::ostream &main_out, std::ostream &encoded_starts_file, std::ostream &bwt_intervals_file, std::vector<std::pair<pos_t, uint16_t>> &tag_runs){
