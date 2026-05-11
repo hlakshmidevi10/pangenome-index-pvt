@@ -19,6 +19,27 @@ using namespace panindexer;
 
 const std::string SEPARATOR = "\t";
 
+// In-memory MEM hit; accumulated during read processing, bucket-sorted at end.
+struct PackedEntry {
+    uint32_t seq_id;
+    uint32_t node_id;
+    uint32_t offset;     // bit 31 = is_rev, bits 0..30 = node-local offset
+    uint32_t match_len;
+    uint32_t read_st;
+    uint32_t read_id;
+};
+
+// On-disk record for _path_pos.bin (consumed by gafpack). Little-endian, 24 bytes.
+struct BinRecord {
+    uint32_t node_id;
+    uint32_t offset_rev; // bit 31 = is_rev
+    uint32_t match_len;
+    uint32_t read_st;
+    uint32_t read_id;
+    uint32_t _pad;
+};
+static_assert(sizeof(BinRecord) == 24, "BinRecord must be 24 bytes");
+
 // Helper function to get current memory usage in MB
 double get_memory_usage_mb() {
     struct rusage usage;
@@ -292,8 +313,8 @@ void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastL
 // Only locates SA entries for the START of each unique tag run
 // Uses amortized locate traversal but avoids allocating array for all positions
 void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_array, FastLocate& r_index,
-    vector<size_t> &seq_id_counter, MEMProfilingStats& mem_stats,
-    std::ofstream* output_file = nullptr, bool debug_stats = false) {
+    vector<size_t> &seq_id_counter, std::vector<PackedEntry>& entries,
+    MEMProfilingStats& mem_stats, bool debug_stats = false) {
 
     // Get BWT range for this MEM
     size_t bwt_start = mem.bwt_start;
@@ -396,31 +417,14 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
                 total_seq_ids_output++;
                 mem_stats.entries_written++;
 
-#if TIME
-                auto file_write_start = chrono::high_resolution_clock::now();
-#endif
-                // Create output string
-                std::string output_line = std::to_string(seq_id) + SEPARATOR +
-                                        std::to_string(node_id) + SEPARATOR +
-                                        std::to_string(offset) + SEPARATOR +
-                                        std::to_string(is_reverse) + SEPARATOR +
-                                        std::to_string(mem_length) + SEPARATOR +
-                                        std::to_string(mem.start) + SEPARATOR +
-                                        std::to_string(read_id);
-
-                // Output to file if provided
-                if (output_file && output_file->is_open()) {
-                    *output_file << output_line << '\n';
-                } else {
-                    // Output to stdout
-                    std::cout << output_line << std::endl;
-                }
-
-#if TIME
-                auto file_write_end = chrono::high_resolution_clock::now();
-                std::chrono::duration<double> file_write_duration = file_write_end - file_write_start;
-                mem_stats.file_write_time += file_write_duration.count();
-#endif
+                entries.push_back(PackedEntry{
+                    static_cast<uint32_t>(seq_id),
+                    static_cast<uint32_t>(node_id),
+                    static_cast<uint32_t>(offset) | (is_reverse ? 0x80000000u : 0u),
+                    static_cast<uint32_t>(mem_length),
+                    static_cast<uint32_t>(mem.start),
+                    static_cast<uint32_t>(read_id)
+                });
             }
         }
         
@@ -496,103 +500,84 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
         std::cerr << "=================================" << std::endl;
     }
 }
-void sort_mem_output_by_seq_node(const std::string& input_file, const std::string& output_file,
-                                  const vector<size_t> &seq_id_counter, size_t total_mem_matches) {
-    std::cerr << "Sorting MEM output file: " << input_file << std::endl;
+// Bucket-sort entries by seq_id (using prefix sums of seq_id_counter), then sort each
+// bucket by node_id, and write _path_pos.bin (+ optional .tsv) + _seq_id_starts.out.
+void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& output_prefix,
+                          const vector<size_t>& seq_id_counter, bool emit_tsv) {
+    const size_t num_seq = seq_id_counter.size();
+    const size_t n = entries.size();
+    std::cerr << "Sorting " << n << " entries across " << num_seq << " seq_id buckets" << std::endl;
 
-    // Structure to hold parsed CSV data
-    struct MEMData {
-        size_type seq_id;
-        size_type node_id;
-        std::string line;
+    // Prefix sum -> bucket boundaries [0..num_seq]
+    std::vector<size_t> bucket_start(num_seq + 1, 0);
+    for (size_t s = 0; s < num_seq; s++) {
+        bucket_start[s + 1] = bucket_start[s] + seq_id_counter[s];
+    }
+    assert(bucket_start[num_seq] == n);
 
-        // Comparison operator for sorting
-        bool operator<(const MEMData& other) const {    // TODO: Avoid global sort; instead sort only by node_id - focusin on chunks
-            if (seq_id != other.seq_id) {
-                return seq_id < other.seq_id;
-            }
-            return node_id < other.node_id;
+    // Scatter into per-seq_id buckets (counting sort, O(n))
+    std::vector<PackedEntry> out(n);
+    {
+        std::vector<size_t> cursor(bucket_start);
+        for (const auto& e : entries) {
+            out[cursor[e.seq_id]++] = e;
         }
-    };
+    }
+    // Reclaim input buffer before per-bucket sort / write
+    entries.clear();
+    entries.shrink_to_fit();
 
-    std::ifstream input(input_file);
-    if (!input.is_open()) {
-        throw std::runtime_error("Cannot open input file: " + input_file);
+    // Per-bucket sort by node_id (gafpack requires ascending node_id within each seq_id)
+    for (size_t s = 0; s < num_seq; s++) {
+        auto first = out.begin() + bucket_start[s];
+        auto last  = out.begin() + bucket_start[s + 1];
+        std::sort(first, last, [](const PackedEntry& a, const PackedEntry& b) {
+            return a.node_id < b.node_id;
+        });
     }
 
-    std::vector<MEMData> mem_entries;
-
-    mem_entries.reserve(total_mem_matches);     // TODO: change
-
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.empty()) continue;
-
-        MEMData entry;
-
-        // Parse seq_id and node_id from CSV (first two columns)
-        size_t first_separator = line.find(SEPARATOR);
-        if (first_separator == std::string::npos) continue;
-
-        entry.line = line.substr(first_separator + 1);
-
-        size_t second_separator = line.find(SEPARATOR, first_separator + 1);
-        if (second_separator == std::string::npos) continue;
-
-        try {
-            entry.seq_id = std::stoull(line.substr(0, first_separator));
-            entry.node_id = std::stoull(line.substr(first_separator + 1, second_separator - first_separator - 1));
-            mem_entries.push_back(entry);
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: Could not parse line: " << line << std::endl;
+    // Write _path_pos.bin: contiguous 24-byte BinRecords (seq_id stripped, _pad=0)
+    {
+        std::ofstream bin(output_prefix + "_path_pos.bin", std::ios::binary);
+        if (!bin.is_open()) {
+            throw std::runtime_error("Cannot open output file: " + output_prefix + "_path_pos.bin");
+        }
+        for (const auto& e : out) {
+            BinRecord r{e.node_id, e.offset, e.match_len, e.read_st, e.read_id, 0};
+            bin.write(reinterpret_cast<const char*>(&r), sizeof(r));
         }
     }
 
-    input.close();
-    std::cerr << "Read " << mem_entries.size() << " entries" << std::endl;
-
-    // Sort the entries
-    std::cerr << "Sorting entries..." << std::endl;
-    std::sort(mem_entries.begin(), mem_entries.end());
-
-    // Write sorted entries to output file
-    std::ofstream output(output_file + "_path_pos.tsv");
-    if (!output.is_open()) {
-        throw std::runtime_error("Cannot open output file: " + output_file + "_path_pos.tsv");
+    if (emit_tsv) {
+        std::ofstream tsv(output_prefix + "_path_pos.tsv");
+        if (!tsv.is_open()) {
+            throw std::runtime_error("Cannot open output file: " + output_prefix + "_path_pos.tsv");
+        }
+        for (const auto& e : out) {
+            uint32_t off    = e.offset & 0x7FFFFFFFu;
+            uint32_t is_rev = e.offset >> 31;
+            tsv << e.node_id << '\t' << off << '\t' << is_rev << '\t'
+                << e.match_len << '\t' << e.read_st << '\t' << e.read_id << '\n';
+        }
     }
 
-    for (const auto & entry : mem_entries) {
-        output << entry.line << "\n";       // TODO: line might already contain \n?
+    // Write _seq_id_starts.out: bucket_start[0..=num_seq], one per line
+    std::ofstream starts(output_prefix + "_seq_id_starts.out");
+    if (!starts.is_open()) {
+        throw std::runtime_error("Cannot open seq_id_starts file: " + output_prefix + "_seq_id_starts.out");
     }
-
-    // Create seq_id_starts files
-    std::ofstream seq_id_starts_file(output_file + "_seq_id_starts.out");
-    if (!seq_id_starts_file.is_open()) {
-        throw std::runtime_error("Cannot open seq_id_starts file: " + output_file + "_seq_id_starts.out");
+    for (size_t s = 0; s <= num_seq; s++) {
+        starts << bucket_start[s] << '\n';
     }
+    starts.close();
 
-
-    size_t cumulative_count = 0;
-
-    for (size_t curr_seq_id = 0; curr_seq_id < seq_id_counter.size(); curr_seq_id++) {
-        // seq_id_starts_file << curr_seq_id << SEPARATOR << cumulative_count << "\n";
-        seq_id_starts_file << cumulative_count << "\n";
-        cumulative_count += seq_id_counter[curr_seq_id];
-    }
-    // n + 1
-    seq_id_starts_file << cumulative_count << "\n";
-
-    assert(cumulative_count == mem_entries.size());
-
-    output.close();
-    seq_id_starts_file.close();
-    std::cerr << "Successfully wrote " << mem_entries.size() << " sorted entries to " << output_file << std::endl;
+    std::cerr << "Successfully wrote " << n << " sorted entries to " << output_prefix << std::endl;
 }
 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_file] [--debug-stats] [--verbose]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose]" << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -601,36 +586,21 @@ int main(int argc, char **argv) {
     string reads_file = argv[3];
     size_t mem_length = std::stoi(argv[4]);
     size_t min_occ = std::stoi(argv[5]);
-    string output_file_name, tmp_file_name;
+    string output_file_name;
     bool debug_stats = false;
     bool verbose = false;
+    bool emit_tsv = false;
 
-    // Check for debug flags
     for (int i = 6; i < argc; i++) {
-        if (std::string(argv[i]) == "--debug-stats") {
+        std::string arg(argv[i]);
+        if (arg == "--debug-stats") {
             debug_stats = true;
-        }
-        if (std::string(argv[i]) == "--verbose" || std::string(argv[i]) == "--debug") {
+        } else if (arg == "--verbose" || arg == "--debug") {
             verbose = true;
-        }
-    }
-
-    // Optional output file parameter
-    std::ofstream output_file;
-    if (argc > 6) {
-        bool found_output_file = false;
-        for (int i = 6; i < argc; i++) {
-            if (std::string(argv[i]) != "--debug-stats" && std::string(argv[i]) != "--verbose" && std::string(argv[i]) != "--debug") {
-                output_file_name = argv[i];
-                tmp_file_name = output_file_name + "_tmp.tsv";
-                output_file.open(tmp_file_name);
-                if (!output_file.is_open()) {
-                    std::cerr << "Cannot open output file: " << argv[i] << std::endl;
-                    return EXIT_FAILURE;
-                }
-                found_output_file = true;
-                break;
-            }
+        } else if (arg == "--tsv") {
+            emit_tsv = true;
+        } else if (output_file_name.empty()) {
+            output_file_name = arg;
         }
     }
 
@@ -706,6 +676,7 @@ int main(int argc, char **argv) {
     int i = 0;
     vector<size_t> seq_id_counter(r_index.tot_strings(), 0);
     std::cerr << "Reserved seq_id_ctr vector of length: " << r_index.tot_strings() << std::endl;
+    std::vector<PackedEntry> entries;
     size_t total_mem_matches = 0;
 
 #if TIME
@@ -766,8 +737,8 @@ int main(int argc, char **argv) {
             //     output_file.is_open() ? &output_file : nullptr, debug_stats);
             
             // // Option 2: Optimized - locates only START of each unique tag run (faster, fewer SA lookups)
-            dump_mem_info_unique_runs(mem, i, tag_array, r_index, seq_id_counter, mem_stats,
-                output_file.is_open() ? &output_file : nullptr, debug_stats);
+            dump_mem_info_unique_runs(mem, i, tag_array, r_index, seq_id_counter, entries,
+                                      mem_stats, debug_stats);
 
             // Aggregate per-MEM stats
             profiling.total_tag_query_time += mem_stats.tag_query_time;
@@ -814,16 +785,15 @@ int main(int argc, char **argv) {
 #endif
 
     reads.close();
-    if (output_file.is_open()) {
-        output_file.close();
-    }
+    std::cerr << "Accumulated " << entries.size() << " entries in memory ("
+              << (entries.size() * sizeof(PackedEntry)) / (1024.0 * 1024.0) << " MB)" << std::endl;
 
     if (!output_file_name.empty()) {
 #if TIME
         auto sort_start = chrono::high_resolution_clock::now();
 #endif
 
-        sort_mem_output_by_seq_node(tmp_file_name, output_file_name, seq_id_counter, total_mem_matches);
+        write_sorted_entries(entries, output_file_name, seq_id_counter, emit_tsv);
 
 #if TIME
         auto sort_end = chrono::high_resolution_clock::now();
