@@ -27,6 +27,7 @@ struct PackedEntry {
     uint32_t match_len;
     uint32_t read_st;
     uint32_t read_id;
+    uint32_t path_bp;    // bp offset of hit within seq_id's text (= r_index.seqOffset(sa_value))
 };
 
 // On-disk record for _path_pos.bin (consumed by gafpack). Little-endian, 24 bytes.
@@ -36,7 +37,7 @@ struct BinRecord {
     uint32_t match_len;
     uint32_t read_st;
     uint32_t read_id;
-    uint32_t _pad;
+    uint32_t path_bp;    // bp offset within the path; disambiguates repeated nodes
 };
 static_assert(sizeof(BinRecord) == 24, "BinRecord must be 24 bytes");
 
@@ -397,9 +398,10 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
             } else {
                 total_unique_positions++;
                 
-                // Get seq_id for this position
+                // Get seq_id and bp offset within that sequence for this position
                 size_type seq_id = r_index.seqId(sa_value);
-                
+                size_type path_bp = r_index.seqOffset(sa_value);
+
                 // Extract node_id, offset, strand from pos_t
                 int64_t node_id = id(graph_pos);
                 size_t offset = gbwtgraph::offset(graph_pos);
@@ -423,7 +425,8 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
                     static_cast<uint32_t>(offset) | (is_reverse ? 0x80000000u : 0u),
                     static_cast<uint32_t>(mem_length),
                     static_cast<uint32_t>(mem.start),
-                    static_cast<uint32_t>(read_id)
+                    static_cast<uint32_t>(read_id),
+                    static_cast<uint32_t>(path_bp)
                 });
             }
         }
@@ -543,7 +546,7 @@ void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& 
             throw std::runtime_error("Cannot open output file: " + output_prefix + "_path_pos.bin");
         }
         for (const auto& e : out) {
-            BinRecord r{e.node_id, e.offset, e.match_len, e.read_st, e.read_id, 0};
+            BinRecord r{e.node_id, e.offset, e.match_len, e.read_st, e.read_id, e.path_bp};
             bin.write(reinterpret_cast<const char*>(&r), sizeof(r));
         }
     }
