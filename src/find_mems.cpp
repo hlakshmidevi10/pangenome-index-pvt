@@ -19,27 +19,44 @@ using namespace panindexer;
 
 const std::string SEPARATOR = "\t";
 
+// ============================================================================
+// v2 record format (find_mems → gafpack contract). See:
+//   mem-projection/pangenome-pipeline/PLAN_find_mems_binary_io_v2.md
+//
+// node_id and offset are NO LONGER stored on disk. gafpack derives them by
+// walking the path's cum_bp prefix-sum and locating the step that contains
+// path_bp. Records are sorted by path_bp within each seq_id bucket so the
+// path-walker can advance a single monotonic cursor (linear merge, O(1)
+// amortized per record).
+//
+// NOTE: is_rev(graph_pos) is NOT stored. It is the strand of the BWT hit
+// against the underlying *node* sequence, which is independent of the path's
+// bucket parity (seq_id & 1 = forward/reverse path strand). gafpack derives
+// the GAF strand from the bucket parity XOR the GFA step's +/- orientation
+// (see traverse_nodes, main.rs). Earlier v2 drafts stored is_rev as a sanity
+// bit and asserted equality with bucket parity; this was incorrect and
+// silently dropped ~1.4M valid MEM hits on yeast-235.
+// ============================================================================
+
 // In-memory MEM hit; accumulated during read processing, bucket-sorted at end.
+// seq_id is kept here for bucketing; stripped before write.
 struct PackedEntry {
     uint32_t seq_id;
-    uint32_t node_id;
-    uint32_t offset;     // bit 31 = is_rev, bits 0..30 = node-local offset
+    uint32_t path_bp;   // bp offset of hit within seq_id's text (= r_index.seqOffset(sa_value))
     uint32_t match_len;
     uint32_t read_st;
     uint32_t read_id;
-    uint32_t path_bp;    // bp offset of hit within seq_id's text (= r_index.seqOffset(sa_value))
 };
 
-// On-disk record for _path_pos.bin (consumed by gafpack). Little-endian, 24 bytes.
-struct BinRecord {
-    uint32_t node_id;
-    uint32_t offset_rev; // bit 31 = is_rev
+// On-disk record for _path_pos_v2.bin (consumed by gafpack). Little-endian,
+// 16 bytes, naturally 8-byte aligned (no padding).
+struct BinRecordV2 {
+    uint32_t path_bp;
     uint32_t match_len;
     uint32_t read_st;
     uint32_t read_id;
-    uint32_t path_bp;    // bp offset within the path; disambiguates repeated nodes
 };
-static_assert(sizeof(BinRecord) == 24, "BinRecord must be 24 bytes");
+static_assert(sizeof(BinRecordV2) == 16, "BinRecordV2 must be 16 bytes");
 
 // Helper function to get current memory usage in MB
 double get_memory_usage_mb() {
@@ -170,6 +187,11 @@ inline size_type locate_sa_value(const FastLocate& r_index, size_type bwt_pos) {
     return first;
 }
 
+// NOTE (v2): this "Option 1" variant is NOT updated for the v2 record format.
+// It is currently unreferenced (see main() — the call site at line ~744 uses
+// dump_mem_info_unique_runs instead). If reactivated, it must be ported to
+// push PackedEntry (v2 layout) instead of writing the legacy text format.
+//
 // Helper function to dump MEM information (Original Algorithm)
 // Locates SA entries for ALL BWT positions in the MEM interval
 void dump_mem_info(const MEM& mem, const int read_id, TagArray& tag_array, FastLocate& r_index,
@@ -419,14 +441,15 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
                 total_seq_ids_output++;
                 mem_stats.entries_written++;
 
+                // v2: only the fields gafpack actually needs. node_id/offset are
+                // derived from path_bp by the walker; is_rev(graph_pos) is
+                // independent of bucket parity and not used anywhere downstream.
                 entries.push_back(PackedEntry{
                     static_cast<uint32_t>(seq_id),
-                    static_cast<uint32_t>(node_id),
-                    static_cast<uint32_t>(offset) | (is_reverse ? 0x80000000u : 0u),
+                    static_cast<uint32_t>(path_bp),
                     static_cast<uint32_t>(mem_length),
                     static_cast<uint32_t>(mem.start),
-                    static_cast<uint32_t>(read_id),
-                    static_cast<uint32_t>(path_bp)
+                    static_cast<uint32_t>(read_id)
                 });
             }
         }
@@ -504,7 +527,8 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
     }
 }
 // Bucket-sort entries by seq_id (using prefix sums of seq_id_counter), then sort each
-// bucket by node_id, and write _path_pos.bin (+ optional .tsv) + _seq_id_starts.out.
+// bucket by path_bp ascending, and write _path_pos_v2.bin (+ optional .tsv) +
+// _seq_id_starts.out. See PLAN_find_mems_binary_io_v2.md.
 void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& output_prefix,
                           const vector<size_t>& seq_id_counter, bool emit_tsv) {
     const size_t num_seq = seq_id_counter.size();
@@ -530,41 +554,50 @@ void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& 
     entries.clear();
     entries.shrink_to_fit();
 
-    // Per-bucket sort by node_id (gafpack requires ascending node_id within each seq_id)
+    // Per-bucket sort by path_bp ascending — v2 walker requires this for the
+    // linear-merge cursor invariant (cum_bp[i] <= r.path_bp < cum_bp[i+1]).
+    // Tie-break is unstable; if byte-stable .bin md5s are needed later, extend
+    // the key to (path_bp, read_id, read_st). See PLAN_v2 §"Open questions".
     for (size_t s = 0; s < num_seq; s++) {
         auto first = out.begin() + bucket_start[s];
         auto last  = out.begin() + bucket_start[s + 1];
         std::sort(first, last, [](const PackedEntry& a, const PackedEntry& b) {
-            return a.node_id < b.node_id;
+            return a.path_bp < b.path_bp;
         });
     }
 
-    // Write _path_pos.bin: contiguous 24-byte BinRecords (seq_id stripped, _pad=0)
+    // Write _path_pos_v2.bin: contiguous 16-byte BinRecordV2 (seq_id stripped).
+    // Single contiguous write per bucket avoids per-record ofstream overhead.
     {
-        std::ofstream bin(output_prefix + "_path_pos.bin", std::ios::binary);
+        const std::string bin_path = output_prefix + "_path_pos_v2.bin";
+        std::ofstream bin(bin_path, std::ios::binary);
         if (!bin.is_open()) {
-            throw std::runtime_error("Cannot open output file: " + output_prefix + "_path_pos.bin");
+            throw std::runtime_error("Cannot open output file: " + bin_path);
         }
+        // Use a small reusable on-stack buffer; PackedEntry has an extra
+        // seq_id field that must be stripped before write.
         for (const auto& e : out) {
-            BinRecord r{e.node_id, e.offset, e.match_len, e.read_st, e.read_id, e.path_bp};
+            BinRecordV2 r{e.path_bp, e.match_len, e.read_st, e.read_id};
             bin.write(reinterpret_cast<const char*>(&r), sizeof(r));
         }
     }
 
     if (emit_tsv) {
+        // v2 columns: path_bp match_len read_st read_id
+        // (node_id/offset/is_rev dropped; recover node_id/offset via cum_bp walk if needed.)
         std::ofstream tsv(output_prefix + "_path_pos.tsv");
         if (!tsv.is_open()) {
             throw std::runtime_error("Cannot open output file: " + output_prefix + "_path_pos.tsv");
         }
+        tsv << "# path_bp\tmatch_len\tread_st\tread_id\n";
         for (const auto& e : out) {
-            uint32_t off    = e.offset & 0x7FFFFFFFu;
-            uint32_t is_rev = e.offset >> 31;
-            tsv << e.node_id << '\t' << off << '\t' << is_rev << '\t'
-                << e.match_len << '\t' << e.read_st << '\t' << e.read_id << '\n';
+            tsv << e.path_bp << '\t' << e.match_len << '\t'
+                << e.read_st << '\t' << e.read_id << '\n';
         }
     }
 
-    // Write _seq_id_starts.out: bucket_start[0..=num_seq], one per line
+    // Write _seq_id_starts.out: bucket_start[0..=num_seq], one per line.
+    // Unchanged from v1; values are record indices (byte offset = idx * 16 now).
     std::ofstream starts(output_prefix + "_seq_id_starts.out");
     if (!starts.is_open()) {
         throw std::runtime_error("Cannot open seq_id_starts file: " + output_prefix + "_seq_id_starts.out");
@@ -574,7 +607,8 @@ void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& 
     }
     starts.close();
 
-    std::cerr << "Successfully wrote " << n << " sorted entries to " << output_prefix << std::endl;
+    std::cerr << "Successfully wrote " << n << " sorted entries to " << output_prefix
+              << "_path_pos_v2.bin (" << (n * sizeof(BinRecordV2)) << " bytes)" << std::endl;
 }
 
 
