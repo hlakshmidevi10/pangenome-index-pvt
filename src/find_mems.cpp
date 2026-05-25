@@ -394,6 +394,11 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
     // Track graph_pos -> total occurrence (sum of run lengths) when debug is enabled
     std::unordered_map<pos_t, size_t> graph_pos_occurrence_count;
 
+    // Track node_id -> number of tag runs (in this MEM) whose tag starts at that node.
+    // Counted once per physical tag-run-start (i.e. per pos_in_run == 0), regardless of
+    // dedup. Lets us measure same-node repetition across non-adjacent runs within a MEM.
+    std::unordered_map<int64_t, size_t> node_id_run_count;
+
     // Iterate through BWT interval, tracking position within current tag run
     size_t run_idx = 0;
     uint16_t pos_in_run = 0;
@@ -409,6 +414,7 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
             if (debug_stats) {
                 // std::cerr << "[DEBUG] run_idx=" << run_idx << " graph_pos=" << graph_pos << " run_length=" << run_length << std::endl;
                 graph_pos_occurrence_count[graph_pos] += run_length;
+                node_id_run_count[id(graph_pos)]++;
             }
             // Check if we've already seen this graph position
             auto [set_it, inserted] = seen_graph_positions.insert(graph_pos);
@@ -522,6 +528,42 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
         std::cerr << "Graph position occurrence counts (sum of run lengths):" << std::endl;
         for (const auto& pair : graph_pos_occurrence_count) {
             std::cerr << "  graph_pos=" << pair.first << " total_occurrence=" << pair.second << std::endl;
+        }
+
+        // Per-MEM node repetition: how many tag runs start at each node_id.
+        // run_count > 1 means the same node appears as the start of multiple
+        // tag runs within this MEM (non-adjacent same-node tag-run repetition,
+        // since adjacent same-position runs are already merged into one run).
+        size_t nodes_with_repeats = 0;
+        size_t total_node_runs = 0;
+        size_t max_runs_per_node = 0;
+        for (const auto& pr : node_id_run_count) {
+            total_node_runs += pr.second;
+            if (pr.second > 1) nodes_with_repeats++;
+            if (pr.second > max_runs_per_node) max_runs_per_node = pr.second;
+        }
+        std::cerr << "Distinct node_ids: " << node_id_run_count.size()
+                  << ", nodes with >1 run: " << nodes_with_repeats
+                  << ", max runs/node: " << max_runs_per_node
+                  << ", total node-run starts: " << total_node_runs << std::endl;
+        std::cerr << "Node run-count histogram (runs_per_node count):" << std::endl;
+        std::map<size_t, size_t> hist;
+        for (const auto& pr : node_id_run_count) hist[pr.second]++;
+        for (const auto& pr : hist) {
+            std::cerr << "  " << pr.first << " run(s)/node: " << pr.second << " node(s)" << std::endl;
+        }
+        // Per-node detail for nodes appearing more than once (sorted descending).
+        if (nodes_with_repeats > 0) {
+            std::vector<std::pair<int64_t, size_t>> repeats;
+            for (const auto& pr : node_id_run_count) if (pr.second > 1) repeats.push_back(pr);
+            std::sort(repeats.begin(), repeats.end(),
+                      [](const std::pair<int64_t,size_t>& a, const std::pair<int64_t,size_t>& b){
+                          return a.second > b.second;
+                      });
+            std::cerr << "Node-run repeats (node_id: runs):" << std::endl;
+            for (const auto& pr : repeats) {
+                std::cerr << "  node_id=" << pr.first << " runs=" << pr.second << std::endl;
+            }
         }
         std::cerr << "=================================" << std::endl;
     }
