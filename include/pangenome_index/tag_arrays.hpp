@@ -105,6 +105,10 @@ namespace panindexer {
         // Returns the logical BWT size used for building bwt_intervals (sd_vector size)
         inline size_t bwt_size() const { return this->bwt_intervals.size(); }
 
+        // Const access to the bwt_intervals sd_vector. Used by LightTagIndex to
+        // build a tag-run-starts-only index from an already-loaded compact TagArray.
+        inline const sdsl::sd_vector<>& get_bwt_intervals() const { return this->bwt_intervals; }
+
         // Debug: print bwt_intervals bit and rank for positions [0, limit)
         void print_bwt_intervals_and_rank(size_t limit, std::ostream& out = std::cerr) const;
 
