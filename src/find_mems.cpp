@@ -459,8 +459,18 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
                     static_cast<uint32_t>(read_id)
                 });
             }
+
+            // Early exit: we were at the start of the LAST run this iteration,
+            // so we either just emitted or just skipped a duplicate at that
+            // run's start. Either way, no more emissions are possible; the
+            // remaining locateNext calls would advance the SA cursor through
+            // the rest of the last run's BWT positions with no downstream
+            // effect. Matches dump_mem_info_lightweight, which walks cur_bwt
+            // only up to last_rid's start. Saves ~(last_run_length − 1)
+            // locateNext calls per MEM.
+            if (run_idx == decoded_runs.size() - 1) break;
         }
-        
+
         // Advance position within current run
         pos_in_run++;
         
@@ -586,9 +596,11 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
 //   4. At each run start, read seq_id/path_bp from the current SA value and
 //      push a PackedEntry.
 //
-// Total locateNext calls per MEM = (bwt_end - bwt_start), same as the
-// unique_runs path. The savings come from skipping graph-position decoding
-// (no encoded_runs_iv reads) and the unordered_set<pos_t> allocation.
+// Total locateNext calls per MEM = (last_run_start_bwt - bwt_start). The
+// dump_mem_info_unique_runs path also stops at the last run start (after the
+// matching early-exit fix); both paths now perform the same locate work.
+// The remaining savings come from skipping graph-position decoding (no
+// encoded_runs_iv reads) and the unordered_set<pos_t> allocation.
 void dump_mem_info_lightweight(const MEM& mem, const int read_id,
                                const LightTagIndex& ltag, FastLocate& r_index,
                                vector<size_t>& seq_id_counter,
