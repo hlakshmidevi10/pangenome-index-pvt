@@ -410,7 +410,7 @@ void traverse_sequences_parallel(GBZ &gbz, BplusTree <Run> &bptree, FastLocate &
                 auto first = temp.first;
 
                 if (first == NENDMARKER) {
-                    cerr << "The end of the sequence at BWT index " << bwt_index << endl;
+                    cerr << "seq num/total_seq: " << seq_num << "/" << number_of_sequences-1 << " ;The end of the sequence at BWT index " << bwt_index << endl;
                     break;
                 }
 
