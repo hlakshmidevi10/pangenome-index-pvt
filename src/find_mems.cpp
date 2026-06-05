@@ -1097,6 +1097,7 @@ int main(int argc, char **argv) {
     std::cout << "\n4. PER-MEM OPERATIONS (aggregated across all MEMs):" << std::endl;
     std::cout << "   Total time for tag queries: " << profiling.total_tag_query_time << " seconds" << std::endl;
     std::cout << "   Total number of tag runs: " << format_number(profiling.total_tag_runs) << std::endl;
+    std::cout << "   Total occurrence/bwt poitions scanned" << format_number(profiling.total_mem_occurrences) << std::endl;
     if (profiling.total_mems_outputted > 0) {
         std::cout << "   Average tag runs per MEM: " << (double)profiling.total_tag_runs / profiling.total_mems_outputted << std::endl;
     }
