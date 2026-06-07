@@ -1085,7 +1085,7 @@ int main(int argc, char **argv) {
     if (profiling.total_mems_outputted > 0) {
         std::cout << "   Average MEM length: " << (double)profiling.total_mem_length / profiling.total_mems_outputted << " bp" << std::endl;
         std::cout << "   Average MEM occurrence (mem.size): " << (double)profiling.total_mem_occurrences / profiling.total_mems_outputted << std::endl;
-        std::cout << "   Average n/r ratio (n=mem.size, r=tag runs): " << profiling.total_n_over_r_ratio / profiling.total_mems_outputted << std::endl;
+        std::cout << "   Mean per-MEM n/r ratio (n=mem.size, r=tag runs): " << profiling.total_n_over_r_ratio / profiling.total_mems_outputted << " (mean of per-MEM ratios; see Global n/r below for volume-weighted aggregate)" << std::endl;
     }
     std::cout << "   Time for finding all MEMs: " << profiling.total_mem_finding_time << " seconds" << std::endl;
     std::cout << "   Time for processing all MEMs: " << profiling.total_mem_processing_time << " seconds" << std::endl;
@@ -1097,9 +1097,18 @@ int main(int argc, char **argv) {
     std::cout << "\n4. PER-MEM OPERATIONS (aggregated across all MEMs):" << std::endl;
     std::cout << "   Total time for tag queries: " << profiling.total_tag_query_time << " seconds" << std::endl;
     std::cout << "   Total number of tag runs: " << format_number(profiling.total_tag_runs) << std::endl;
-    std::cout << "   Total occurrence/bwt poitions scanned" << format_number(profiling.total_mem_occurrences) << std::endl;
+    std::cout << "   Total occurrence/bwt positions scanned: " << format_number(profiling.total_mem_occurrences) << std::endl;
     if (profiling.total_mems_outputted > 0) {
         std::cout << "   Average tag runs per MEM: " << (double)profiling.total_tag_runs / profiling.total_mems_outputted << std::endl;
+    }
+    // Global n/r ratio: total BWT positions scanned / total tag runs decoded.
+    // Unlike the per-MEM mean(n/r) above (which can be skewed by a long tail
+    // of high-occurrence MEMs), this is the volume-weighted aggregate density
+    // of MEM hits per decoded tag run. It is the right comparison metric
+    // across datasets of different MEM-occurrence distributions.
+    if (profiling.total_tag_runs > 0) {
+        std::cout << "   Global n/r ratio (Σmem.size / Σtag_runs): "
+                  << (double)profiling.total_mem_occurrences / profiling.total_tag_runs << std::endl;
     }
     std::cout << "   Total time for locate operations: " << profiling.total_locate_time << " seconds" << std::endl;
     std::cout << "     - First locate (locate_sa_value): " << profiling.total_first_locate_time << " seconds" << std::endl;
