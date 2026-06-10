@@ -3,7 +3,10 @@
 //
 // Output format (stdout, all to make machine-parsing trivial):
 //   #SUMMARY  total_runs  total_length  min  max  mean
-//   #HIST     bucket_lo   bucket_hi     count  cumulative_count  cumulative_fraction
+//   #HIST     bucket_lo   bucket_hi     count  fraction  cumulative_count  cumulative_fraction
+//
+// `fraction` = count / total_runs (per-bucket slice of all stored tag runs).
+// `cumulative_fraction` = cumulative_count / total_runs (running total).
 //
 // Percentiles are intentionally NOT computed here; derive them post-hoc from
 // the cumulative_count column in the #HIST rows. The histogram is exact at
@@ -104,16 +107,17 @@ int main(int argc, char** argv) {
     const unsigned last_nonzero_bucket =
         63u - static_cast<unsigned>(__builtin_clzll(max_len));
 
-    cout << "#HIST\tbucket_lo\tbucket_hi\tcount\tcumulative_count\tcumulative_fraction\n";
+    cout << "#HIST\tbucket_lo\tbucket_hi\tcount\tfraction\tcumulative_count\tcumulative_fraction\n";
     uint64_t cum = 0;
     for (size_t b = 0; b <= last_nonzero_bucket; b++) {
         cum += bucket_count[b];
         const uint64_t lo = (b == 0) ? 1ULL : (1ULL << b);
         const uint64_t hi = (b == 63) ? numeric_limits<uint64_t>::max()
                                       : ((1ULL << (b + 1)) - 1ULL);
-        const double frac = static_cast<double>(cum) / static_cast<double>(total_runs);
+        const double frac     = static_cast<double>(bucket_count[b]) / static_cast<double>(total_runs);
+        const double cum_frac = static_cast<double>(cum)             / static_cast<double>(total_runs);
         cout << "#HIST\t" << lo << "\t" << hi << "\t" << bucket_count[b]
-             << "\t" << cum << "\t" << frac << "\n";
+             << "\t" << frac << "\t" << cum << "\t" << cum_frac << "\n";
     }
 
     return 0;
