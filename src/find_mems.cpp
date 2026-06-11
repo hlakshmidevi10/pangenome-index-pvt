@@ -707,6 +707,87 @@ void dump_mem_info_lightweight(const MEM& mem, const int read_id,
     }
 }
 
+// Helper function to dump MEM information (All-Positions Algorithm).
+// Verification / POC path: bypasses the tag array entirely and emits ONE
+// PackedEntry per BWT position in [bwt_start, bwt_end] using only the
+// r-index (locate_sa_value + locateNext). No run-start filtering, no
+// graph-position dedup. seq_id and path_bp come straight from the SA value
+// at each position.
+//
+// Output volume per MEM = mem.size (= total_mem_occurrences in profiling).
+// At HPRC-noisy-alt scale this can be hundreds of millions of records;
+// intended for small-scale A/B verification against the lightweight and
+// full-tag dedup modes, not production use.
+//
+// MEMProfilingStats accounting:
+//   tag_runs            = 0          (tag array not consulted)
+//   first_locate_calls  = 1          (initial locate_sa_value)
+//   locate_next_calls   = mem.size   (one per BWT position, including a final
+//                                     unused step after the last emission;
+//                                     trade a per-iteration branch for one
+//                                     wasted locateNext per MEM)
+//   entries_written     = mem.size
+void dump_mem_info_all_positions(const MEM& mem, const int read_id, FastLocate& r_index,
+                                 vector<size_t>& seq_id_counter,
+                                 std::vector<PackedEntry>& entries,
+                                 MEMProfilingStats& mem_stats,
+                                 bool /*debug_stats*/ = false) {
+    const size_t bwt_start  = mem.bwt_start;
+    const size_t bwt_end    = mem.bwt_start + mem.size - 1;
+    const size_t mem_length = mem.end - mem.start;
+
+    // Tag array intentionally not consulted; tag_runs stays 0.
+    mem_stats.tag_runs = 0;
+
+    if (mem.size == 0) return;
+
+    // Seed SA cursor at bwt_start.
+#if TIME
+    auto first_locate_start = chrono::high_resolution_clock::now();
+#endif
+    size_type sa_value = locate_sa_value(r_index, bwt_start);
+    mem_stats.first_locate_calls = 1;
+#if TIME
+    auto first_locate_end = chrono::high_resolution_clock::now();
+    std::chrono::duration<double> first_locate_duration = first_locate_end - first_locate_start;
+    mem_stats.first_locate_time = first_locate_duration.count();
+#endif
+
+    // Walk every BWT position in the MEM interval; emit one entry each.
+    for (size_t pos = bwt_start; pos <= bwt_end; ++pos) {
+        const size_type seq_id  = r_index.seqId(sa_value);
+        const size_type path_bp = r_index.seqOffset(sa_value);
+
+        seq_id_counter[seq_id]++;
+        mem_stats.entries_written++;
+
+        entries.push_back(PackedEntry{
+            static_cast<uint32_t>(seq_id),
+            static_cast<uint32_t>(path_bp),
+            static_cast<uint32_t>(mem_length),
+            static_cast<uint32_t>(mem.start),
+            static_cast<uint32_t>(read_id)
+        });
+
+        // Advance to the next BWT position. We unconditionally locateNext even
+        // on the last iteration (result discarded next loop exit) -- trading
+        // one wasted call per MEM for a tighter inner loop.
+#if TIME
+        auto locate_next_start = chrono::high_resolution_clock::now();
+#endif
+        sa_value = r_index.locateNext(sa_value);
+        mem_stats.locate_next_calls++;
+#if TIME
+        auto locate_next_end = chrono::high_resolution_clock::now();
+        std::chrono::duration<double> locate_next_duration = locate_next_end - locate_next_start;
+        mem_stats.locate_next_time += locate_next_duration.count();
+#endif
+    }
+
+    mem_stats.locate_time = mem_stats.first_locate_time + mem_stats.locate_next_time;
+    mem_stats.locate_operations = mem_stats.first_locate_calls + mem_stats.locate_next_calls;
+}
+
 // Bucket-sort entries by seq_id (using prefix sums of seq_id_counter), then sort each
 // bucket by path_bp ascending, and write _path_pos_v2.bin (+ optional .tsv) +
 // _seq_id_starts.out. See PLAN_find_mems_binary_io_v2.md.
@@ -795,10 +876,16 @@ void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags|--all-positions]" << std::endl;
         std::cerr << "  --lightweight-tags: treat <tag_array_index> as a .ltags file (LightTagIndex)" << std::endl;
         std::cerr << "                      instead of a full compact tags file. Emits one entry per" << std::endl;
         std::cerr << "                      tag run intersecting each MEM, with no graph-position dedup." << std::endl;
+        std::cerr << "  --all-positions:    verification/POC mode. Bypasses the tag array (the" << std::endl;
+        std::cerr << "                      <tag_array_index> argument is ignored / can be /dev/null)." << std::endl;
+        std::cerr << "                      Emits one entry per BWT position in each MEM interval" << std::endl;
+        std::cerr << "                      (mem.size entries per MEM). Output volume can be very" << std::endl;
+        std::cerr << "                      large; intended only for small-scale A/B against the" << std::endl;
+        std::cerr << "                      lightweight/full-tag dedup modes." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -812,6 +899,7 @@ int main(int argc, char **argv) {
     bool verbose = false;
     bool emit_tsv = false;
     bool lightweight_tags = false;
+    bool all_positions = false;
 
     for (int i = 6; i < argc; i++) {
         std::string arg(argv[i]);
@@ -823,9 +911,15 @@ int main(int argc, char **argv) {
             emit_tsv = true;
         } else if (arg == "--lightweight-tags") {
             lightweight_tags = true;
+        } else if (arg == "--all-positions") {
+            all_positions = true;
         } else if (output_file_name.empty()) {
             output_file_name = arg;
         }
+    }
+    if (lightweight_tags && all_positions) {
+        std::cerr << "ERROR: --lightweight-tags and --all-positions are mutually exclusive" << std::endl;
+        return EXIT_FAILURE;
     }
 
     // Print run parameters for logging
@@ -840,7 +934,10 @@ int main(int argc, char **argv) {
     std::cerr << "Output file:       " << (output_file_name.empty() ? "(stdout)" : output_file_name) << std::endl;
     std::cerr << "Debug stats:       " << (debug_stats ? "enabled" : "disabled") << std::endl;
     std::cerr << "Verbose mode:      " << (verbose ? "enabled" : "disabled") << std::endl;
-    std::cerr << "Tag mode:          " << (lightweight_tags ? "lightweight (.ltags)" : "full compact tags") << std::endl;
+    std::cerr << "Tag mode:          "
+              << (all_positions   ? "all-positions (tag array bypassed)"
+                  : lightweight_tags ? "lightweight (.ltags)"
+                                     : "full compact tags") << std::endl;
     std::cerr << "========================================" << std::endl;
 
     // Initialize profiling data
@@ -878,10 +975,14 @@ int main(int argc, char **argv) {
 
     // Load either the full compact TagArray or the LightTagIndex, depending on
     // --lightweight-tags. Exactly one of `tag_array` / `light_tag_index` is
-    // populated; the other stays empty and is never accessed below.
+    // populated; the other stays empty and is never accessed below. In
+    // --all-positions mode neither is loaded (the tag_array_index CLI arg is
+    // ignored).
     TagArray tag_array;
     LightTagIndex light_tag_index;
-    if (lightweight_tags) {
+    if (all_positions) {
+        cerr << "Skipping tag array load (--all-positions mode)" << endl;
+    } else if (lightweight_tags) {
         cerr << "Reading the lightweight tag index (.ltags)" << endl;
         std::ifstream in_ds(tag_array_index, std::ios::binary);
         if (!in_ds) {
@@ -990,7 +1091,14 @@ int main(int argc, char **argv) {
             //
             // Option 3 (--lightweight-tags): consumes a LightTagIndex (.ltags) with
             // bwt_intervals only. Emits one entry per intersecting tag run, no dedup.
-            if (lightweight_tags) {
+            //
+            // Option 4 (--all-positions): verification/POC. Skips the tag array
+            // entirely; emits one entry per BWT position in [bwt_start, bwt_end].
+            if (all_positions) {
+                dump_mem_info_all_positions(mem, i, r_index,
+                                            seq_id_counter, entries, mem_stats,
+                                            debug_stats);
+            } else if (lightweight_tags) {
                 dump_mem_info_lightweight(mem, i, light_tag_index, r_index,
                                           seq_id_counter, entries, mem_stats,
                                           debug_stats);
