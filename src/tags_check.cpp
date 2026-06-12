@@ -1244,7 +1244,8 @@ static void usage_verify_translation_tables(const char* prog) {
               << std::endl;
 }
 
-// Print statistics for compact tag array: total runs, BWT size, first few tags, and node_id range
+// Print statistics for compact tag array: total runs, BWT size, first few tags,
+// node_id range, AND full per-length histogram of run lengths (single streaming pass).
 static int print_tags_stats(const std::string& compact_tags_file, size_t num_first_tags = 10) {
     using namespace panindexer;
     std::cerr << "Loading compact tag array: " << compact_tags_file << std::endl;
@@ -1263,10 +1264,17 @@ static int print_tags_stats(const std::string& compact_tags_file, size_t num_fir
     size_t total_tag_length = 0;
     size_t gap_runs = 0;
     size_t gap_length = 0;
-    
+
     int64_t min_node_id = std::numeric_limits<int64_t>::max();
     int64_t max_node_id = std::numeric_limits<int64_t>::min();
     bool has_valid_node = false;
+
+    // Full per-length histogram. Run lengths are bounded by the tag encoding
+    // (length_bits = 9 -> max single-run length = 511), but we size the vector
+    // generously to tolerate any future encoding-cap widening.
+    constexpr size_t HIST_MAX = 4096;
+    std::vector<uint64_t> length_hist(HIST_MAX + 1, 0);
+    uint64_t over_hist = 0;  // runs longer than HIST_MAX (shouldn't happen with length_bits=9)
 
     std::vector<std::tuple<handlegraph::pos_t, uint64_t, size_t, size_t>> first_tags;
 
@@ -1274,18 +1282,21 @@ static int print_tags_stats(const std::string& compact_tags_file, size_t num_fir
                                                  size_t bwt_start, size_t bwt_end) {
         total_runs++;
         total_tag_length += len;
-        
+
+        if (len <= HIST_MAX) length_hist[len]++;
+        else                 over_hist++;
+
         int64_t node_id = gbwtgraph::id(p);
         bool is_rev = gbwtgraph::is_rev(p);
         size_t offset = gbwtgraph::offset(p);
-        
+
         // Track node_id range for all tags with valid node_id
         if (node_id > 0) {
             has_valid_node = true;
             if (node_id < min_node_id) min_node_id = node_id;
             if (node_id > max_node_id) max_node_id = node_id;
         }
-        
+
         if (node_id == 0 || offset != 0) {
             // Gap or invalid tag
             gap_runs++;
@@ -1315,13 +1326,13 @@ static int print_tags_stats(const std::string& compact_tags_file, size_t num_fir
     
     std::cout << "\n# First " << first_tags.size() << " tags:\n";
     std::cout << "# run_index\tbwt_start\tbwt_end\tlen\tnode_id\tis_rev\toffset\n";
-    
+
     for (size_t i = 0; i < first_tags.size(); ++i) {
         auto [p, len, bwt_start, bwt_end] = first_tags[i];
         int64_t node_id = gbwtgraph::id(p);
         bool is_rev = gbwtgraph::is_rev(p);
         size_t offset = gbwtgraph::offset(p);
-        
+
         std::cout << i << "\t" << bwt_start << "\t" << bwt_end << "\t" << len << "\t";
         if (node_id == 0 || offset != 0) {
             std::cout << "-\t-\t-\n";
@@ -1329,7 +1340,59 @@ static int print_tags_stats(const std::string& compact_tags_file, size_t num_fir
             std::cout << node_id << "\t" << (is_rev ? 1 : 0) << "\t" << offset << "\n";
         }
     }
-    
+
+    // === Full per-length histogram ===
+    // Emit every length with at least one run. Suitable for piping to
+    // downstream analysis: `... --tags-stats $TAGS | awk '/^LH/{print $2,$3}'`
+    // gives `length count` rows.
+    std::cout << "\n# Run-length histogram (LH lines: 'LH <length> <count>')\n";
+    std::cout << "# Lengths with zero runs are omitted. Run-length cap = "
+              << (1 << 9) - 1 << " (length_bits=9).\n";
+    uint64_t hist_runs_sum = 0;
+    uint64_t hist_length_sum = 0;
+    size_t min_len_seen = 0;
+    size_t max_len_seen = 0;
+    for (size_t L = 1; L <= HIST_MAX; ++L) {
+        if (length_hist[L] == 0) continue;
+        std::cout << "LH\t" << L << "\t" << length_hist[L] << "\n";
+        hist_runs_sum   += length_hist[L];
+        hist_length_sum += L * length_hist[L];
+        if (min_len_seen == 0) min_len_seen = L;
+        max_len_seen = L;
+    }
+    if (over_hist > 0) {
+        std::cout << "LH_OVER\t" << HIST_MAX << "+\t" << over_hist
+                  << "  (runs above HIST_MAX -- check encoding limit!)\n";
+    }
+
+    // Histogram summary so callers don't have to re-derive it
+    std::cout << "\n# Histogram summary\n";
+    std::cout << "# Min run length:  " << min_len_seen << "\n";
+    std::cout << "# Max run length:  " << max_len_seen << "\n";
+    if (total_runs > 0) {
+        std::cout << "# Mean run length: "
+                  << static_cast<double>(total_tag_length) / static_cast<double>(total_runs)
+                  << "\n";
+    }
+    // Cumulative percentiles (P50, P90, P99, P99.9)
+    uint64_t cumulative = 0;
+    bool printed_p50 = false, printed_p90 = false, printed_p99 = false, printed_p999 = false;
+    for (size_t L = 1; L <= HIST_MAX; ++L) {
+        cumulative += length_hist[L];
+        double pct = (total_runs > 0) ? (100.0 * cumulative / total_runs) : 0.0;
+        if (!printed_p50  && pct >= 50.0)  { std::cout << "# P50 length: "   << L << "\n"; printed_p50 = true; }
+        if (!printed_p90  && pct >= 90.0)  { std::cout << "# P90 length: "   << L << "\n"; printed_p90 = true; }
+        if (!printed_p99  && pct >= 99.0)  { std::cout << "# P99 length: "   << L << "\n"; printed_p99 = true; }
+        if (!printed_p999 && pct >= 99.9)  { std::cout << "# P99.9 length: " << L << "\n"; printed_p999 = true; }
+        if (printed_p999) break;
+    }
+    // Sanity cross-check
+    if (hist_runs_sum != total_runs || hist_length_sum != total_tag_length) {
+        std::cerr << "WARN: histogram sums don't match aggregate totals "
+                  << "(hist_runs=" << hist_runs_sum << " vs total=" << total_runs << "; "
+                  << "hist_length=" << hist_length_sum << " vs total=" << total_tag_length << ")\n";
+    }
+
     std::cerr << "Statistics printed successfully." << std::endl;
     return 0;
 }
