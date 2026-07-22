@@ -2,6 +2,7 @@
 #include "pangenome_index/tag_arrays.hpp"
 #include "pangenome_index/light_tag_index.hpp"
 #include <chrono>
+#include <mutex>
 #include <unordered_set>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -580,6 +581,246 @@ void dump_mem_info_unique_runs(const MEM& mem, const int read_id, TagArray& tag_
     }
 }
 
+// ============================================================================
+// MEM-run classification (--debug-classify).
+//
+// For each MEM interval [sp, ep] we independently enumerate the BWT runs and
+// tag runs that intersect it, and classify each tag-run *start* by whether it
+// coincides with a BWT-run start. This measures how much of the current
+// lightweight algorithm's inter-tag-emission locateNext walking could be
+// replaced by direct samples[rid] lookups (which are available at every BWT
+// run start via getSample(rid)).
+//
+// Note: tag runs are NOT necessarily contained in single BWT runs. At o==0
+// tag positions on multi-in-degree nodes, several distinct incoming characters
+// can share the same tag, causing a tag run to span BWT-run boundaries. We
+// count these separately (spans_multi_bwt).
+//
+// Definitions used below (all in BWT space, inclusive endpoints):
+//   bwt_run_k       = [bwt_starts[k], bwt_ends[k]]  clipped to [sp, ep]
+//   tag_run_k       = [tag_starts[k], tag_ends[k]]  clipped to [sp, ep]
+//   first_bwt_start = the BWT position where the first intersecting BWT run
+//                     actually begins (may be < sp; used to size the initial
+//                     locate_sa_value walk cost)
+//   first_tag_start = same, for the first intersecting tag run.
+//
+// Walking-cost model:
+//   current_walk_cost   = (sp - first_bwt_run_start)   // seed locate_sa_value
+//                       + sum_{k=1..T-1} (tag_start_k - tag_start_{k-1})
+//   optimized_walk_cost = (sp - first_bwt_run_start)   // seed still needed
+//                       + sum_{k=0..T-1}
+//                             (tag_start_k > sp ?
+//                                (tag_start_k - bwt_start_of_containing_run(tag_start_k))
+//                              : 0)
+//   savings             = current - optimized
+//
+// The savings represent BWT positions we would NOT need to walk locateNext
+// over, if dump_mem_info_lightweight seeded each tag emission from the
+// containing BWT run's stored sample instead of walking from the previous
+// tag start.
+// ============================================================================
+
+struct MEMRunClassification {
+    // MEM identity
+    uint32_t read_id;
+    uint32_t mem_start;      // read coord
+    uint32_t mem_length;
+    uint64_t bwt_start;
+    uint64_t bwt_size;
+
+    // Run counts
+    uint32_t num_bwt_runs;   // BWT runs intersecting [sp, ep]
+    uint32_t num_tag_runs;   // tag runs intersecting [sp, ep]
+
+    // Tag-start classification (partitions num_tag_runs)
+    uint32_t tags_at_bwt_start;         // tag_start coincides with some bwt_run_start
+    uint32_t tags_interior_to_bwt_run;  // tag_start strictly inside a bwt_run
+
+    // Structural
+    uint32_t tags_spanning_multi_bwt;   // tag runs whose end lies in a different bwt run from their start
+
+    // Walking-cost decomposition (units: BWT positions == locateNext calls).
+    //   seed_cost      = sp - (containing BWT run's start). Same for both algs.
+    //   inter_current  = current alg walk from sp to last_tag_start.
+    //   inter_optimized= optimized alg walk (uses BWT-run-start anchors).
+    //   current_total  = seed_cost + inter_current
+    //   optimized_total= seed_cost + inter_optimized
+    //   savings        = inter_current - inter_optimized (always >= 0)
+    uint64_t seed_cost;
+    uint64_t inter_current;
+    uint64_t inter_optimized;
+    uint64_t current_walk_cost;
+    uint64_t optimized_walk_cost;
+};
+
+// Enumerate BWT runs intersecting [sp, ep]. Fills out_starts/out_ends with the
+// UNCLIPPED BWT-run boundaries (so the caller can distinguish "starts before
+// sp" from "starts at sp"). Uses one predecessor query + linear block-decode
+// walk per new run; O((num_runs_in_interval) * block_size).
+static void enumerate_bwt_runs(const FastLocate& r_index,
+                               size_t sp, size_t ep,
+                               std::vector<size_t>& out_starts,
+                               std::vector<size_t>& out_ends) {
+    out_starts.clear();
+    out_ends.clear();
+    if (sp > ep) return;
+
+    // Seed: find the run containing sp.
+    size_t rid = 0;
+    size_t rid_start = 0;
+    r_index.run_id_and_offset_at(sp, rid, rid_start);
+    while (true) {
+        size_t rid_end = r_index.bwt_end_position_of_run(rid);
+        out_starts.push_back(rid_start);
+        out_ends.push_back(rid_end);
+        if (rid_end >= ep) break;
+        rid_start = rid_end + 1;
+        rid++;
+    }
+}
+
+// Enumerate tag runs intersecting [sp, ep]. Fills out_starts/out_ends with the
+// UNCLIPPED tag-run boundaries. Uses two rank queries + (T-1) select queries.
+static void enumerate_tag_runs(const LightTagIndex& ltag,
+                               size_t sp, size_t ep,
+                               std::vector<size_t>& out_starts,
+                               std::vector<size_t>& out_ends) {
+    out_starts.clear();
+    out_ends.clear();
+    if (sp > ep) return;
+
+    const size_t first_rid = ltag.run_id_at(sp);
+    const size_t last_rid  = ltag.run_id_at(ep);
+    const size_t n_runs    = ltag.num_runs();
+    const size_t bwt_sz    = ltag.bwt_size();
+    for (size_t rid = first_rid; rid <= last_rid; ++rid) {
+        const size_t start_bwt = ltag.run_start_bwt(rid);
+        // End of this run is (start of next run) - 1, or bwt_size - 1 for the last run.
+        const size_t end_bwt = (rid + 1 < n_runs)
+            ? (ltag.run_start_bwt(rid + 1) - 1)
+            : (bwt_sz - 1);
+        out_starts.push_back(start_bwt);
+        out_ends.push_back(end_bwt);
+    }
+}
+
+// Classify tag runs intersecting the MEM against BWT-run boundaries. See the
+// header block above for cost model.
+static MEMRunClassification classify_mem_runs(const MEM& mem, int read_id,
+                                              const LightTagIndex& ltag,
+                                              const FastLocate& r_index) {
+    MEMRunClassification c{};
+    c.read_id     = static_cast<uint32_t>(read_id);
+    c.mem_start   = static_cast<uint32_t>(mem.start);
+    c.mem_length  = static_cast<uint32_t>(mem.end - mem.start);
+    c.bwt_start   = mem.bwt_start;
+    c.bwt_size    = static_cast<uint64_t>(mem.size);
+
+    const size_t sp = mem.bwt_start;
+    const size_t ep = mem.bwt_start + mem.size - 1;
+
+    std::vector<size_t> bwt_starts, bwt_ends;
+    std::vector<size_t> tag_starts, tag_ends;
+    enumerate_bwt_runs(r_index, sp, ep, bwt_starts, bwt_ends);
+    enumerate_tag_runs(ltag, sp, ep, tag_starts, tag_ends);
+
+    c.num_bwt_runs = static_cast<uint32_t>(bwt_starts.size());
+    c.num_tag_runs = static_cast<uint32_t>(tag_starts.size());
+
+    if (c.num_tag_runs == 0 || c.num_bwt_runs == 0) return c;
+
+    // For each tag run start, find the containing BWT run via merge-walk.
+    // Both lists are sorted ascending; tag_starts[k] falls in the BWT run
+    // whose bwt_starts[b] <= tag_starts[k] <= bwt_ends[b].
+    size_t b = 0;
+    for (size_t k = 0; k < tag_starts.size(); ++k) {
+        const size_t ts = tag_starts[k];
+        const size_t te = tag_ends[k];
+        while (b + 1 < bwt_starts.size() && bwt_ends[b] < ts) ++b;
+        // Invariant: bwt_starts[b] <= ts <= bwt_ends[b]
+        // (unless the tag starts before sp, in which case bwt_starts[b] <= sp <= ts is still fine.)
+
+        // Classification of tag_start alignment.
+        if (ts == bwt_starts[b]) {
+            c.tags_at_bwt_start++;
+        } else {
+            c.tags_interior_to_bwt_run++;
+        }
+
+        // Does this tag run span BWT-run boundaries? (find containing bwt run for tag_end)
+        // te may exceed the last enumerated bwt run; clip to ep for the check.
+        const size_t te_clipped = std::min(te, ep);
+        size_t b_end = b;
+        while (b_end + 1 < bwt_starts.size() && bwt_ends[b_end] < te_clipped) ++b_end;
+        if (b_end != b) c.tags_spanning_multi_bwt++;
+    }
+
+    // Walking-cost model. All costs are counted in BWT positions (== locateNext
+    // calls). See MEMRunClassification for definitions.
+    //
+    // Seed cost: walk from the containing BWT run's start (available as a
+    // sample via getSample(rid)) up to sp. This is the locate_sa_value cost
+    // and is IDENTICAL under both algorithms; the samples[rid] optimization
+    // only affects inter-tag walking.
+    const size_t seed_cost = sp - bwt_starts.front();
+
+    // Current algorithm: from the seed at sp, walk locateNext linearly to each
+    // successive tag start. Cost = sum of gaps between consecutive tag starts,
+    // starting from sp. Equivalent to (last_tag_start - sp).
+    uint64_t inter_current = 0;
+    size_t prev_pos_cur = sp;
+    for (size_t k = 1; k < tag_starts.size(); ++k) {
+        inter_current += (tag_starts[k] - prev_pos_cur);
+        prev_pos_cur = tag_starts[k];
+    }
+
+    // Optimized algorithm: at each tag emission k >= 1, either
+    //   (a) continue walking from the previous emission position, OR
+    //   (b) jump to the sample at the rightmost BWT-run-start in the interval
+    //       (tag_starts[k-1], tag_starts[k]], then walk forward from there.
+    // Choose whichever anchor is closer to (i.e., <=) tag_starts[k] and higher
+    // than the alternative. If no BWT-run-start falls in (prev_pos, tag_start],
+    // (a) is optimal and the two algorithms tie for this step.
+    uint64_t inter_optimized = 0;
+    size_t bwt_idx = 0;
+    size_t prev_pos_opt = sp;
+    for (size_t k = 1; k < tag_starts.size(); ++k) {
+        const size_t ts = tag_starts[k];
+        while (bwt_idx + 1 < bwt_starts.size() && bwt_starts[bwt_idx + 1] <= ts) ++bwt_idx;
+        const size_t anchor = (bwt_starts[bwt_idx] > prev_pos_opt) ? bwt_starts[bwt_idx] : prev_pos_opt;
+        inter_optimized += (ts - anchor);
+        prev_pos_opt = ts;
+    }
+
+    c.seed_cost           = static_cast<uint64_t>(seed_cost);
+    c.inter_current       = inter_current;
+    c.inter_optimized     = inter_optimized;
+    c.current_walk_cost   = static_cast<uint64_t>(seed_cost) + inter_current;
+    c.optimized_walk_cost = static_cast<uint64_t>(seed_cost) + inter_optimized;
+    return c;
+}
+
+// Header for the classification TSV; must match write_classification_row().
+static const char* CLASSIFY_TSV_HEADER =
+    "read_id\tmem_start\tmem_length\tbwt_start\tbwt_size\t"
+    "num_bwt_runs\tnum_tag_runs\t"
+    "tags_at_bwt_start\ttags_interior\ttags_span_multi_bwt\t"
+    "seed_cost\tinter_current\tinter_optimized\t"
+    "current_walk_cost\toptimized_walk_cost\tsavings\n";
+
+static void write_classification_row(std::ostream& os, const MEMRunClassification& c) {
+    const uint64_t savings = (c.inter_current >= c.inter_optimized)
+        ? (c.inter_current - c.inter_optimized) : 0;
+    os << c.read_id << '\t' << c.mem_start << '\t' << c.mem_length << '\t'
+       << c.bwt_start << '\t' << c.bwt_size << '\t'
+       << c.num_bwt_runs << '\t' << c.num_tag_runs << '\t'
+       << c.tags_at_bwt_start << '\t' << c.tags_interior_to_bwt_run << '\t'
+       << c.tags_spanning_multi_bwt << '\t'
+       << c.seed_cost << '\t' << c.inter_current << '\t' << c.inter_optimized << '\t'
+       << c.current_walk_cost << '\t' << c.optimized_walk_cost << '\t'
+       << savings << '\n';
+}
+
 // Helper function to dump MEM information (Lightweight Tag Index Algorithm).
 // Consumes a LightTagIndex which contains ONLY the bwt_intervals bitvector
 // (no tag values). Emits one PackedEntry per tag run intersecting the MEM
@@ -876,7 +1117,7 @@ void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags|--all-positions]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags|--all-positions] [--debug-classify=<path.tsv>]" << std::endl;
         std::cerr << "  --lightweight-tags: treat <tag_array_index> as a .ltags file (LightTagIndex)" << std::endl;
         std::cerr << "                      instead of a full compact tags file. Emits one entry per" << std::endl;
         std::cerr << "                      tag run intersecting each MEM, with no graph-position dedup." << std::endl;
@@ -886,6 +1127,12 @@ int main(int argc, char **argv) {
         std::cerr << "                      (mem.size entries per MEM). Output volume can be very" << std::endl;
         std::cerr << "                      large; intended only for small-scale A/B against the" << std::endl;
         std::cerr << "                      lightweight/full-tag dedup modes." << std::endl;
+        std::cerr << "  --debug-classify=<path>: per-MEM run-classification TSV written to <path>." << std::endl;
+        std::cerr << "                      Requires --lightweight-tags. Adds one row per emitted MEM" << std::endl;
+        std::cerr << "                      classifying tag-run starts by alignment with BWT-run" << std::endl;
+        std::cerr << "                      starts, and estimating current-vs-optimized locateNext" << std::endl;
+        std::cerr << "                      walking cost. Does not alter any output; adds per-MEM" << std::endl;
+        std::cerr << "                      overhead so DO NOT use for wall-time measurement." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -895,6 +1142,7 @@ int main(int argc, char **argv) {
     size_t mem_length = std::stoi(argv[4]);
     size_t min_occ = std::stoi(argv[5]);
     string output_file_name;
+    string classify_tsv_path;
     bool debug_stats = false;
     bool verbose = false;
     bool emit_tsv = false;
@@ -913,12 +1161,18 @@ int main(int argc, char **argv) {
             lightweight_tags = true;
         } else if (arg == "--all-positions") {
             all_positions = true;
+        } else if (arg.rfind("--debug-classify=", 0) == 0) {
+            classify_tsv_path = arg.substr(std::string("--debug-classify=").size());
         } else if (output_file_name.empty()) {
             output_file_name = arg;
         }
     }
     if (lightweight_tags && all_positions) {
         std::cerr << "ERROR: --lightweight-tags and --all-positions are mutually exclusive" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!classify_tsv_path.empty() && !lightweight_tags) {
+        std::cerr << "ERROR: --debug-classify requires --lightweight-tags (the classifier reads a LightTagIndex)" << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -938,7 +1192,24 @@ int main(int argc, char **argv) {
               << (all_positions   ? "all-positions (tag array bypassed)"
                   : lightweight_tags ? "lightweight (.ltags)"
                                      : "full compact tags") << std::endl;
+    std::cerr << "Debug classify:    "
+              << (classify_tsv_path.empty() ? "disabled" : classify_tsv_path)
+              << std::endl;
     std::cerr << "========================================" << std::endl;
+
+    // Open the classification TSV (if requested). Written from the main thread
+    // only; the per-read loop is currently single-threaded so no mutex needed,
+    // but we keep the ofstream at function scope for the loop below.
+    std::ofstream classify_tsv;
+    if (!classify_tsv_path.empty()) {
+        classify_tsv.open(classify_tsv_path);
+        if (!classify_tsv.is_open()) {
+            std::cerr << "ERROR: cannot open --debug-classify output file: "
+                      << classify_tsv_path << std::endl;
+            return EXIT_FAILURE;
+        }
+        classify_tsv << CLASSIFY_TSV_HEADER;
+    }
 
     // Initialize profiling data
     ProfilingData profiling;
@@ -1106,6 +1377,16 @@ int main(int argc, char **argv) {
                 dump_mem_info_unique_runs(mem, i, tag_array, r_index,
                                           seq_id_counter, entries, mem_stats,
                                           debug_stats);
+            }
+
+            // Per-MEM classification, emitted alongside the normal output.
+            // Intentionally not timed and not included in profiling totals
+            // (mem_stats is untouched). Only meaningful in lightweight mode
+            // because classify_mem_runs consumes LightTagIndex.
+            if (classify_tsv.is_open()) {
+                MEMRunClassification cls =
+                    classify_mem_runs(mem, i, light_tag_index, r_index);
+                write_classification_row(classify_tsv, cls);
             }
 
             // Aggregate per-MEM stats
