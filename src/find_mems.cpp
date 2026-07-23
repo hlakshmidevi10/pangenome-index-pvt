@@ -2,6 +2,7 @@
 #include "pangenome_index/tag_arrays.hpp"
 #include "pangenome_index/light_tag_index.hpp"
 #include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <unordered_set>
 #include <sys/resource.h>
@@ -670,6 +671,17 @@ struct MEMRunClassification {
     // Structural (orthogonal to the partition above; overlaps buckets 1, 2, 4).
     uint32_t tags_spanning_multi_bwt;   // tag runs whose end lies in a different bwt run from their start
 
+    // Density metrics for the BWT runs intersecting this MEM.
+    // avg_bwt_run_length: mean UNCLIPPED length (bwt_end - bwt_start + 1) over
+    //   all num_bwt_runs runs the MEM touches. Uses full global endpoints, so
+    //   first and last run lengths reflect their true size, not just the part
+    //   inside [sp, ep]. Represents the structural run size in the region.
+    // avg_tags_per_bwt_run: num_tag_runs / num_bwt_runs. How densely tag runs
+    //   are packed inside the BWT runs the MEM touches. When ~= num_tag_runs
+    //   itself, the MEM sits inside a single BWT run (dense case).
+    double avg_bwt_run_length;
+    double avg_tags_per_bwt_run;
+
     // Walking-cost decomposition (units: BWT positions == locateNext calls).
     //   seed_cost      = sp - (containing BWT run's start). Same for both algs.
     //   inter_current  = current alg walk from sp to last_tag_start.
@@ -757,6 +769,18 @@ static MEMRunClassification classify_mem_runs(const MEM& mem, int read_id,
 
     c.num_bwt_runs = static_cast<uint32_t>(bwt_starts.size());
     c.num_tag_runs = static_cast<uint32_t>(tag_starts.size());
+
+    // Density metrics. Guarded on num_bwt_runs > 0 (checked below via early return).
+    if (c.num_bwt_runs > 0) {
+        // Unclipped: use bwt_ends[k] - bwt_starts[k] + 1 (the run's true global span).
+        uint64_t total_bwt_len = 0;
+        for (size_t k = 0; k < bwt_starts.size(); ++k) {
+            total_bwt_len += (bwt_ends[k] - bwt_starts[k] + 1);
+        }
+        c.avg_bwt_run_length = static_cast<double>(total_bwt_len) / c.num_bwt_runs;
+        c.avg_tags_per_bwt_run =
+            static_cast<double>(c.num_tag_runs) / c.num_bwt_runs;
+    }
 
     if (c.num_tag_runs == 0 || c.num_bwt_runs == 0) return c;
 
@@ -849,12 +873,13 @@ static MEMRunClassification classify_mem_runs(const MEM& mem, int read_id,
 }
 
 // Header for the classification TSV; must match write_classification_row().
-// v3: bucket 1 reformulated as "tag run contains at least one bwt_run_start"
-// (superset of the old "ts == bwt_start"). Sum of buckets 1-4 == num_tag_runs.
-// tags_span_multi_bwt is still emitted (orthogonal to the partition).
+// v4: adds avg_bwt_run_length (unclipped) and avg_tags_per_bwt_run density
+// metrics. Bucket 1 remains "tag run contains at least one bwt_run_start".
+// Sum of buckets 1-4 == num_tag_runs. tags_span_multi_bwt is orthogonal.
 static const char* CLASSIFY_TSV_HEADER =
     "read_id\tmem_start\tmem_length\tbwt_start\tbwt_size\t"
     "num_bwt_runs\tnum_tag_runs\t"
+    "avg_bwt_run_length\tavg_tags_per_bwt_run\t"
     "tags_contain_bwt_start\ttags_at_bwt_end\ttags_strictly_interior\ttags_other\t"
     "tags_span_multi_bwt\t"
     "seed_cost\tinter_current\tinter_optimized\t"
@@ -863,9 +888,15 @@ static const char* CLASSIFY_TSV_HEADER =
 static void write_classification_row(std::ostream& os, const MEMRunClassification& c) {
     const uint64_t savings = (c.inter_current >= c.inter_optimized)
         ? (c.inter_current - c.inter_optimized) : 0;
+    // Fixed 2-decimal formatting for the two doubles; keeps TSV column widths
+    // stable and avoids surprises from default stream precision (6 digits).
+    char density_buf[64];
+    snprintf(density_buf, sizeof(density_buf), "%.2f\t%.2f",
+             c.avg_bwt_run_length, c.avg_tags_per_bwt_run);
     os << c.read_id << '\t' << c.mem_start << '\t' << c.mem_length << '\t'
        << c.bwt_start << '\t' << c.bwt_size << '\t'
        << c.num_bwt_runs << '\t' << c.num_tag_runs << '\t'
+       << density_buf << '\t'
        << c.tags_contain_bwt_start << '\t' << c.tags_at_bwt_end << '\t'
        << c.tags_strictly_interior << '\t' << c.tags_other << '\t'
        << c.tags_spanning_multi_bwt << '\t'
