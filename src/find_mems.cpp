@@ -632,11 +632,33 @@ struct MEMRunClassification {
     uint32_t num_bwt_runs;   // BWT runs intersecting [sp, ep]
     uint32_t num_tag_runs;   // tag runs intersecting [sp, ep]
 
-    // Tag-start classification (partitions num_tag_runs)
-    uint32_t tags_at_bwt_start;         // tag_start coincides with some bwt_run_start
-    uint32_t tags_interior_to_bwt_run;  // tag_start strictly inside a bwt_run
+    // Tag-run classification against containing BWT run(s). Priority-ordered
+    // mutually exclusive partition of num_tag_runs. Every tag lands in
+    // exactly one bucket; ordering is checked top-to-bottom.
+    //
+    //   1) tags_at_bwt_start
+    //        ts == b_start_of_containing_bwt_run(ts).
+    //        Captures: tag==bwt_run (te==b_end), at-start-only, and tags
+    //        that start at a bwt boundary and then span into the next run.
+    //
+    //   2) tags_at_bwt_end
+    //        Applied only if not in (1): ts > b_start AND te lands exactly
+    //        at the end of *some* BWT run.
+    //
+    //   3) tags_strictly_interior
+    //        b_start < ts AND te < b_end AND same containing BWT run (i.e.
+    //        te does not cross into a subsequent BWT run).
+    //
+    //   4) tags_other_spans_multi
+    //        Catch-all for tags where ts > b_start AND te crosses into a
+    //        subsequent BWT run without landing exactly on a b_end. Should
+    //        be rare; separated so any nonzero count is visible.
+    uint32_t tags_at_bwt_start;
+    uint32_t tags_at_bwt_end;
+    uint32_t tags_strictly_interior;
+    uint32_t tags_other_spans_multi;
 
-    // Structural
+    // Structural (orthogonal to the partition above; overlaps buckets 1, 2, 4).
     uint32_t tags_spanning_multi_bwt;   // tag runs whose end lies in a different bwt run from their start
 
     // Walking-cost decomposition (units: BWT positions == locateNext calls).
@@ -729,7 +751,8 @@ static MEMRunClassification classify_mem_runs(const MEM& mem, int read_id,
 
     if (c.num_tag_runs == 0 || c.num_bwt_runs == 0) return c;
 
-    // For each tag run start, find the containing BWT run via merge-walk.
+    // For each tag run, find the containing BWT run for its start via merge-walk,
+    // then classify against the priority-ordered partition (see the struct docs).
     // Both lists are sorted ascending; tag_starts[k] falls in the BWT run
     // whose bwt_starts[b] <= tag_starts[k] <= bwt_ends[b].
     size_t b = 0;
@@ -738,21 +761,33 @@ static MEMRunClassification classify_mem_runs(const MEM& mem, int read_id,
         const size_t te = tag_ends[k];
         while (b + 1 < bwt_starts.size() && bwt_ends[b] < ts) ++b;
         // Invariant: bwt_starts[b] <= ts <= bwt_ends[b]
-        // (unless the tag starts before sp, in which case bwt_starts[b] <= sp <= ts is still fine.)
 
-        // Classification of tag_start alignment.
-        if (ts == bwt_starts[b]) {
-            c.tags_at_bwt_start++;
-        } else {
-            c.tags_interior_to_bwt_run++;
-        }
-
-        // Does this tag run span BWT-run boundaries? (find containing bwt run for tag_end)
-        // te may exceed the last enumerated bwt run; clip to ep for the check.
+        // Find containing BWT run for te (may differ from b if the tag spans).
+        // te may exceed the last enumerated bwt run when the last tag extends
+        // past ep; clip to ep for the check so we compare within-interval only.
         const size_t te_clipped = std::min(te, ep);
         size_t b_end = b;
         while (b_end + 1 < bwt_starts.size() && bwt_ends[b_end] < te_clipped) ++b_end;
-        if (b_end != b) c.tags_spanning_multi_bwt++;
+        const bool spans_multi = (b_end != b);
+        if (spans_multi) c.tags_spanning_multi_bwt++;
+
+        // Priority-ordered partition (checked top to bottom; first match wins).
+        if (ts == bwt_starts[b]) {
+            // Bucket 1: any tag starting exactly at a BWT-run-start.
+            // Includes tag==bwt_run (te == bwt_ends[b]) and tags that start at
+            // a BWT boundary and span into subsequent runs.
+            c.tags_at_bwt_start++;
+        } else if (!spans_multi && te == bwt_ends[b]) {
+            // Bucket 2: same-BWT-run, ends exactly at bwt_end. Excludes bucket 1.
+            c.tags_at_bwt_end++;
+        } else if (!spans_multi && te < bwt_ends[b]) {
+            // Bucket 3: strictly interior to a single BWT run.
+            c.tags_strictly_interior++;
+        } else {
+            // Bucket 4: spans multiple BWT runs without starting at a bwt_start
+            // and without landing exactly on a bwt_end. Should be rare.
+            c.tags_other_spans_multi++;
+        }
     }
 
     // Walking-cost model. All costs are counted in BWT positions (== locateNext
@@ -801,10 +836,15 @@ static MEMRunClassification classify_mem_runs(const MEM& mem, int read_id,
 }
 
 // Header for the classification TSV; must match write_classification_row().
+// v2: replaces the single 'tags_interior' column with the four priority-ordered
+// buckets (tags_at_bwt_start, tags_at_bwt_end, tags_strictly_interior,
+// tags_other_spans_multi). The sum of these four == num_tag_runs.
+// tags_span_multi_bwt is still emitted (orthogonal to the partition).
 static const char* CLASSIFY_TSV_HEADER =
     "read_id\tmem_start\tmem_length\tbwt_start\tbwt_size\t"
     "num_bwt_runs\tnum_tag_runs\t"
-    "tags_at_bwt_start\ttags_interior\ttags_span_multi_bwt\t"
+    "tags_at_bwt_start\ttags_at_bwt_end\ttags_strictly_interior\ttags_other_spans_multi\t"
+    "tags_span_multi_bwt\t"
     "seed_cost\tinter_current\tinter_optimized\t"
     "current_walk_cost\toptimized_walk_cost\tsavings\n";
 
@@ -814,7 +854,8 @@ static void write_classification_row(std::ostream& os, const MEMRunClassificatio
     os << c.read_id << '\t' << c.mem_start << '\t' << c.mem_length << '\t'
        << c.bwt_start << '\t' << c.bwt_size << '\t'
        << c.num_bwt_runs << '\t' << c.num_tag_runs << '\t'
-       << c.tags_at_bwt_start << '\t' << c.tags_interior_to_bwt_run << '\t'
+       << c.tags_at_bwt_start << '\t' << c.tags_at_bwt_end << '\t'
+       << c.tags_strictly_interior << '\t' << c.tags_other_spans_multi << '\t'
        << c.tags_spanning_multi_bwt << '\t'
        << c.seed_cost << '\t' << c.inter_current << '\t' << c.inter_optimized << '\t'
        << c.current_walk_cost << '\t' << c.optimized_walk_cost << '\t'
