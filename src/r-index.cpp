@@ -1675,6 +1675,116 @@ void FastLocate::print_character_counts(std::ostream& out) const {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-DNA-character BWT run-start markers (see r-index.hpp for design notes,
+// DESIGN_FLIPPED_MEM.md section 4 for how they participate in the SA-carry
+// rule for the flipped MEM finder).
+// ---------------------------------------------------------------------------
+
+size_t FastLocate::dna_char_to_idx(size_t c) {
+    switch (c) {
+        case 'A': case 'a': return 0;
+        case 'C': case 'c': return 1;
+        case 'G': case 'g': return 2;
+        case 'T': case 't': return 3;
+        case 'N': case 'n': return 4;
+        default: return DNA_ALPHABET_SIZE;  // invalid marker
+    }
+}
+
+void FastLocate::ensure_run_starts_by_char_built() const {
+    std::call_once(this->run_starts_by_char_once, [this]() {
+        const size_t n = this->sequence_size;
+        // Per-character builders for sd_vector. sd_vector_builder wants the
+        // total length and the number of 1-bits up front, so we do a first
+        // pass to count then a second pass to populate.
+        std::array<size_t, DNA_ALPHABET_SIZE> counts{};
+        counts.fill(0);
+
+        // Determine total number of blocks.
+        const size_t num_blocks = !this->blocks.empty()
+            ? this->blocks.size()
+            : this->blocks_encoded_start_bits.size();
+
+        // First pass: count run-starts per character.
+        {
+            std::vector<std::pair<size_t, size_t>> runs;
+            for (size_t bid = 0; bid < num_blocks; ++bid) {
+                this->get_block_runs(bid, runs);
+                for (const auto& r : runs) {
+                    size_t idx = FastLocate::dna_char_to_idx(r.first);
+                    if (idx < DNA_ALPHABET_SIZE) {
+                        counts[idx]++;
+                    }
+                }
+            }
+        }
+
+        // Allocate builders.
+        std::array<std::unique_ptr<sdsl::sd_vector_builder>, DNA_ALPHABET_SIZE> builders;
+        for (size_t i = 0; i < DNA_ALPHABET_SIZE; ++i) {
+            builders[i] = std::make_unique<sdsl::sd_vector_builder>(n, counts[i]);
+        }
+
+        // Second pass: populate. Walk blocks in order, tracking BWT position.
+        {
+            std::vector<std::pair<size_t, size_t>> runs;
+            size_t bwt_pos = 0;
+            for (size_t bid = 0; bid < num_blocks; ++bid) {
+                this->get_block_runs(bid, runs);
+                for (const auto& r : runs) {
+                    size_t idx = FastLocate::dna_char_to_idx(r.first);
+                    if (idx < DNA_ALPHABET_SIZE) {
+                        builders[idx]->set(bwt_pos);
+                    }
+                    bwt_pos += r.second;
+                }
+            }
+        }
+
+        // Materialize sd_vectors.
+        for (size_t i = 0; i < DNA_ALPHABET_SIZE; ++i) {
+            this->run_starts_by_char[i] = sdsl::sd_vector<>(*builders[i]);
+        }
+    });
+}
+
+size_t FastLocate::leftmost_c_in_interval(size_t c, size_t sp, size_t ep) const {
+    if (sp > ep) return SIZE_MAX;
+    size_t idx = FastLocate::dna_char_to_idx(c);
+    if (idx >= DNA_ALPHABET_SIZE) return SIZE_MAX;
+
+    // Fast path: BWT[sp] == c means sp itself is the answer. Trades one
+    // bwt_char_at_encoded call (a predecessor + block scan) for skipping the
+    // per-c bitvector's ensure/select machinery. Worth it on the hot path
+    // when Case A is common (which it is: most backward extends narrow an
+    // interval that already contains many copies of the extended character).
+    if (this->bwt_char_at_encoded(sp) == c) {
+        return sp;
+    }
+
+    // Case B: sp does not carry the target character. Find the smallest
+    // c-run-start position > sp. If that position is within [sp, ep], it's
+    // the leftmost c in the interval; otherwise no c is in the interval.
+    this->ensure_run_starts_by_char_built();
+    std::call_once(this->run_starts_by_char_select_once[idx], [this, idx]() {
+        sdsl::util::init_support(this->run_starts_by_char_select[idx],
+                                 &this->run_starts_by_char[idx]);
+    });
+
+    const auto& bv = this->run_starts_by_char[idx];
+    auto iter = bv.predecessor(sp);
+    if (iter == bv.one_end()) {
+        iter = bv.one_begin();
+    } else {
+        ++iter;
+    }
+    if (iter == bv.one_end() || iter->second > ep) return SIZE_MAX;
+    return iter->second;
+}
+
+// ---------------------------------------------------------------------------
+
 void FastLocate::initialize_complement_table() {
     for (size_t i = 0; i < 256; ++i) {
         complement_table[i] = i;

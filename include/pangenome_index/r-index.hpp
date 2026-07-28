@@ -354,6 +354,37 @@ namespace panindexer {
         mutable sdsl::sd_vector<>::select_1_type blocks_start_select_support;
         mutable std::once_flag blocks_start_select_once;
 
+        // Per-DNA-character BWT run-start markers (indices 0..4 for A,C,G,T,N).
+        // run_starts_by_char[c][i] = 1 iff BWT position i starts a run of
+        // character c. Used to answer "leftmost c in [sp, ep]" queries during
+        // the SA-carrying rule inside backward_extend_encoded_with_sa.
+        //
+        // Built lazily on first leftmost_c_in_interval query; not serialized.
+        // See DESIGN_FLIPPED_MEM.md section 4 for the SA-carry mechanism.
+        static constexpr size_t DNA_ALPHABET_SIZE = 5;  // A, C, G, T, N
+        mutable std::array<sdsl::sd_vector<>, DNA_ALPHABET_SIZE> run_starts_by_char;
+        mutable std::array<sdsl::sd_vector<>::select_1_type, DNA_ALPHABET_SIZE> run_starts_by_char_select;
+        // One flag guards construction of all 5 bitvectors together.
+        mutable std::once_flag run_starts_by_char_once;
+        // Per-character flags guard lazy select-support construction.
+        mutable std::array<std::once_flag, DNA_ALPHABET_SIZE> run_starts_by_char_select_once;
+
+        // Maps a DNA symbol byte (e.g. 'A' = 65) to an index 0..4 for use with
+        // run_starts_by_char. Non-DNA characters return DNA_ALPHABET_SIZE (invalid).
+        static size_t dna_char_to_idx(size_t c);
+
+        // Ensure run_starts_by_char is built. Called lazily on first
+        // leftmost_c_in_interval query. Idempotent.
+        void ensure_run_starts_by_char_built() const;
+
+        // Find the leftmost BWT position p in [sp, ep] such that BWT[p] == c,
+        // where c is a raw DNA character byte ('A','C','G','T','N'). Returns
+        // SIZE_MAX if no such position exists in the interval.
+        //
+        // O(1) fast path when BWT[sp] == c; otherwise O(log r) via successor
+        // on the per-character run-starts bitvector.
+        size_t leftmost_c_in_interval(size_t c, size_t sp, size_t ep) const;
+
 
         // variables for FMD-index
         std::array<uint8_t, 256> complement_table{};
