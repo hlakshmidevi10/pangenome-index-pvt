@@ -1,0 +1,847 @@
+# Research Journal — pangenome-index-latest
+
+**Purpose.** Chronological, append-only record of research decisions, experiments,
+measurements, and open questions on this codebase. Written by whichever agent or
+human is doing the work. Reads top-to-bottom as a history of what we tried,
+what we learned, and where the frontier is.
+
+**Not a design doc, not a changelog, not a wiki.** Design docs
+(`DESIGN_FLIPPED_MEM.md`) describe intent; changelogs (`git log`) describe code;
+wikis get restructured. This journal describes *thinking*, and only ever grows.
+
+---
+
+## Conventions (read before writing an entry)
+
+### Entry structure
+
+Each entry is a level-2 heading of the form `## JR-NNN — <short title>` where
+`NNN` is a zero-padded monotonic integer. The heading is immediately followed by
+a fenced YAML block, then prose.
+
+```markdown
+## JR-042 — <short title>
+
+​```yaml
+id: JR-042
+date: YYYY-MM-DD
+author: <model name or human handle> (session with <collaborator, if any>)
+status: open | resolved | superseded | deferred | wontfix
+tags: [free-form, comma-separated, lowercase-with-hyphens]
+refs:
+  follows: [JR-041]              # this entry continues from JR-041 (default lineage)
+  supersedes: []                 # entries this replaces
+  resolves: []                   # entries whose "open" status this closes
+  confirms: []                   # entries whose hypothesis this experiment confirms
+  refutes: []                    # entries whose hypothesis this experiment refutes
+​```
+
+<body -- see recommended sections below>
+```
+
+Omit `refs.*` subfields that are empty. Keep the fenced block; other agents may
+grep for it.
+
+### Body sections (loose template, not enforced)
+
+Not every entry needs every section. Use judgement. But if an entry doesn't
+have a clear **Findings** section, ask whether it belongs in the journal at
+all -- design work goes in `DESIGN_FLIPPED_MEM.md`, code documentation goes
+in comments.
+
+- **Context.** What prompted this entry. 1 short paragraph.
+- **Hypothesis / Question.** What we're testing or trying to answer. Be
+  explicit; vague hypotheses lead to vague conclusions.
+- **Method.** Commands run, binaries used, datasets consumed. Exact enough
+  that another agent can reproduce it.
+- **Findings.** Numbers, tables, quotes from log files. Concrete.
+- **Interpretation.** What the numbers mean in the context of the larger
+  research goal. Separate from the raw findings so the next reader can
+  disagree with your interpretation without disputing your measurements.
+- **Open questions.** New questions this entry raised. Prefer explicit
+  numbered lists over vague "future work" mentions -- these are what the
+  next JR-entry will pick up.
+
+### Append-only rules
+
+1. **Never edit an existing entry.** Ever. Write a new entry that references
+   the old one via `refs.supersedes`, `refs.resolves`, `refs.refutes`, etc.
+   Editing history erases the record of what we thought at the time.
+2. **Exception:** typo/formatting fixes in prose are OK, so long as they
+   don't change meaning. If in doubt, write a new entry.
+3. **To close an "open" entry:** write a new entry whose `refs.resolves`
+   lists the old ID. The old entry's YAML `status` field stays as it was
+   when written -- you can (and should) add a one-line note at the end of
+   the old entry's *body* saying `> Resolved by JR-NNN (YYYY-MM-DD).`
+   That's the only permitted body edit.
+4. **Timestamps.** Use the actual calendar date of the work, not the date
+   you're writing the entry. If you're backfilling an entry for something
+   that happened earlier, use the earlier date.
+5. **When multiple agents append in the same session,** the second agent
+   picks the next `JR-NNN`. Merge conflicts on this file are the "cost of
+   doing business" -- prefer them over losing an entry to a silent overwrite.
+
+### Index maintenance
+
+The **Index** section immediately below is hand-maintained. When you add an
+entry, add its row to the index in numeric order. When you close an entry
+(via a resolving entry), update its `status` column in the index only --
+never in the entry's own YAML.
+
+The index lets an agent skim the journal state without reading every entry.
+If you find yourself adding an entry, always update the index in the same
+change.
+
+### What to write about
+
+Good candidates for a journal entry:
+- A hypothesis about performance, correctness, or algorithm behavior +
+  the experiment that tested it.
+- An unexpected finding while working on something else.
+- A design decision made under uncertainty, with the reasoning.
+- A dataset characterization ("what does the size distribution actually
+  look like?").
+- A bug found in existing code, with the smallest reproducer and its scope.
+- A negative result -- something we tried that didn't work.
+
+Not-good candidates:
+- "I renamed foo to bar" -- git log.
+- "The API for X is Y" -- code comments or design doc.
+- "The next step is Z" -- todo list or design doc.
+
+### Cross-references outside the journal
+
+When an entry cites external artifacts (a commit, a source file, a log
+under `runs/`, a design doc section), spell out the path or SHA. Do not
+say "see the earlier commit" or "in the design doc" -- future readers
+won't have the same context you do.
+
+---
+
+## Index
+
+| ID | Date | Title | Status | Tags |
+|---|---|---|---|---|
+| [JR-001](#jr-001--stage-1-sa-carrying-backward-extend-primitive) | 2026-07-28 | Stage 1: SA-carrying backward extend primitive | resolved | stage1, r-index, primitive, sa-carry |
+| [JR-002](#jr-002--stage-2-flipped-mem-finder) | 2026-07-28 | Stage 2: flipped MEM finder | resolved | stage2, mem-finder, algorithm |
+| [JR-003](#jr-003--stage-3-wire-flipped-finder-into-find_mems) | 2026-07-28 | Stage 3: wire flipped finder into find_mems | resolved | stage3, find-mems, perf |
+| [JR-004](#jr-004--risk-e-legacy-step-3-emits-non-left-maximal-mems-on-hprc) | 2026-07-28 | Risk E: legacy Step 3 emits non-left-maximal MEMs on HPRC | open | risk-e, correctness, legacy-bug, hprc |
+| [JR-005](#jr-005--risk-e-size-distribution--per-read-concentration) | 2026-07-29 | Risk E: size distribution + per-read concentration | open | risk-e, distribution, hprc, characterization |
+| [JR-006](#jr-006--refined-stage-3-perf-estimate-once-risk-e-is-fixed) | 2026-07-29 | Refined Stage 3 perf estimate once Risk E is fixed | open | stage3, perf, risk-e, projection |
+
+---
+
+## JR-001 — Stage 1: SA-carrying backward extend primitive
+
+```yaml
+id: JR-001
+date: 2026-07-28
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [stage1, r-index, primitive, sa-carry]
+refs:
+  follows: []
+```
+
+### Context
+
+`FINDINGS_SEED_COST.md` measured that `locate_sa_value` (the "seed" cost) is
+32.2% of walk time in `dump_mem_info_lightweight` on HPRCv1 chr6, 100K reads.
+`DESIGN_FLIPPED_MEM.md` proposes eliminating this cost by restructuring MEM
+enumeration to use only backward extends (which admits SA-carrying) instead
+of legacy's forward+backward mix. Stage 1 of that plan: build the primitive
+that carries `SA[sp]` through a chain of backward extends.
+
+### Hypothesis
+
+The r-index paper's SA-carry rule (Cobas, Gagie, Navarro 2021, §3), when
+mirrored to our samples-at-run-*starts* convention, produces `SA[new_sp]`
+at O(rank) marginal cost per backward-extend step -- no `locateNext` walk
+from a run-start sample required. Case A (LF-decrement) should dominate;
+Case B (leftmost-c lookup) is rare in practice.
+
+### Method
+
+Added `backward_extend_encoded_with_sa` in `src/r-index.cpp:795` alongside
+existing `backward_extend_encoded` (not replacing it -- 5 call sites want
+unchanged behavior). New `bi_interval_with_sa` struct in
+`include/pangenome_index/r-index.hpp:458`.
+
+Case A: `BWT[old_sp] == c` -> `sa_sp' = sa_sp - 1` (LF-decrement).
+Case B: `BWT[old_sp] != c` -> find leftmost c-position j in `[old_sp, old_ep]`
+via `leftmost_c_in_interval` (built in Stage 0.85, commit 1c9ff21); j is at
+a c-run start so `SA[j] = samples[run_id_at(j)]`; then `sa_sp' = SA[j] - 1`.
+Initial toehold (sa_sp_prev == NO_POSITION): seed via one `locate_sa_value`
+walk from the containing run's sample.
+
+Verification: `bin/test_backward_extend_sa` (`src/test_backward_extend_sa.cpp`)
+runs random-ACGT patterns + text-derived deep walks against the canonical
+yeast index. At every successful step, compares `sa_sp` from the new path
+against `locate_sa_value_naive(new_sp)` ground truth. Also cross-checks the
+interval math against the plain `backward_extend_encoded`.
+
+Command:
+```
+bin/test_backward_extend_sa \
+  ../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri
+```
+(and the same with `20000 20000 123` for larger stress.)
+
+### Findings
+
+Two runs, both on `runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri`
+(n=337M, 14M runs):
+
+| Config | Trials | Steps | Case A | Case B | Case B % | Mismatches |
+|---|---:|---:|---:|---:|---:|---:|
+| defaults (seed=42) | 10,000 | 304,485 | 216,016 | 78,469 | 26.6% | **0** |
+| stress (seed=123) | 40,000 | 1,204,000 | 849,957 | 314,043 | 27.0% | **0** |
+
+E2E validation on yeast pipeline (`./query.sh configs/yeast235-chrII-normalized.env
+v2-yeast235 stage1-sa-primitive --gaf`): 2000/2000 valid, byte-identical MD5
+to prior baselines (`alignment.gaf` = `6d2c8784bef2b638ca6f0b96ce8f6bfd`,
+`mems_path_pos_v2.bin` = `3474a0cb016e13b2ff2033f27d9be498`). The new primitive
+has no callers on the hot path yet; this run just confirmed the header change
++ library rebuild didn't perturb anything.
+
+### Interpretation
+
+Design's Case A / Case B split holds up empirically: Case A is ~73% at yeast
+scale, well below the 50% threshold that DESIGN_FLIPPED_MEM.md §5.3 Risk B
+flagged as a concern. LF-decrement dominates as intended.
+
+Zero mismatches across 1.2M steps establishes the primitive as ground-truth-
+equivalent to `locate_sa_value` at the primitive level. The next stage
+(JR-002) can consume `sa_sp` and know it's correct.
+
+### Open questions
+
+1. Case B fraction on HPRC chr6 (larger n, denser BWT) is unmeasured.
+   Might differ from yeast's 27%.
+
+Commit: `1c00f89` (`r-index: add backward_extend_encoded_with_sa (SA-carrying primitive)`)
+
+---
+
+## JR-002 — Stage 2: flipped MEM finder
+
+```yaml
+id: JR-002
+date: 2026-07-28
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [stage2, mem-finder, algorithm]
+refs:
+  follows: [JR-001]
+```
+
+### Context
+
+With the SA-carry primitive from JR-001 in place, Stage 2 builds the
+right-to-left MEM enumerator that consumes it. Each emitted MEM carries
+`SA[bwt_start]` for free -- Stage 3 (JR-003) will then wire this into
+`dump_mem_info_lightweight` to skip the seed walk.
+
+### Hypothesis
+
+The flipped algorithm (DESIGN_FLIPPED_MEM.md §3, verified by
+`xy-test/mem-prototype/compare_mem_algorithms.py` against a brute-force
+oracle across 1,014 cases) produces the same MEM set as the legacy
+3-phase finder. C++ port should match legacy on real read data.
+
+### Method
+
+Added `find_all_mems_flipped` + `MEM_with_sa` struct in
+`include/pangenome_index/algorithm.hpp:766`. Faithful C++ port of the
+Python prototype:
+
+- Outer loop iterates right-anchors right-to-left, starting at `x = len-1`.
+- Step 1' backward-extends from `x` leftward via `backward_extend_encoded_with_sa`,
+  emits MEM if length >= min_len.
+- Step 2' fresh forward-extend from `pattern[i-1]` to identify the next anchor
+  (extracted as `flipped_advance_anchor` -- runs both when MEM was emitted
+  and when Step 1' match was too short).
+
+`MEM_with_sa` mirrors legacy `MEM` fields + adds `sa_sp`. Chosen over
+extending `MEM` because MEM is used at 60+ call sites in find_mems.cpp; per
+CLAUDE.md minimality, adding a field would ripple.
+
+Verification: `bin/test_flipped_mems` (`src/test_flipped_mems.cpp`) runs both
+`find_all_mems` and `find_all_mems_flipped` on real reads, compares the
+`(start, end, bwt_start, size)` MEM sets, and verifies `sa_sp` matches
+`locate_sa_value(bwt_start)` for every flipped MEM. Categorizes
+set-differences as FLIPPED_MISSED (real MEM flipped missed, hard fail),
+FLIPPED_EXTRA (MEM flipped invented, hard fail), or LEGACY_SPURIOUS
+(legacy MEM not left-maximal per `count_encoded`, tolerated -- this is
+Risk E in DESIGN_FLIPPED_MEM.md §5.3).
+
+Commands:
+```
+bin/test_flipped_mems \
+  ../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri \
+  ../mem-projection/yeast-235/yeast-235-chrI/S288C_chrII_N100K_R1_200_reads.txt \
+  30 1 <N>
+```
+for N in {500, 10000, 100000}.
+
+### Findings
+
+Yeast (min_len=30, min_occ=1):
+
+| max_reads | Legacy MEMs | Flipped MEMs | Missed | Extra | Legacy spurious | sa_sp mismatches |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500 | 581 | 581 | 0 | 0 | 0 | 0 |
+| 10,000 | 11,450 | 11,392 | 0 | 0 | 58 (2 reads) | 0 |
+| 100,000 | 114,281 | 113,752 | 0 | 0 | 529 (8 reads) | 0 |
+
+HPRC chr6 (min_len=50, min_occ=1), first 1,000 reads: 1000 = 1000, 0 mismatches.
+First 10,000 reads: 10,000 flipped vs 10,170 legacy, 0 missed, 0 extra,
+170 legacy-spurious (see JR-004 for spurious-MEM characterization).
+
+Also verified min_occ=2 on yeast 10K reads: 11,441 = 11,441 exact set match,
+no legacy_spurious (Risk E requires MEMs extending to end with size >= min_occ;
+higher min_occ makes it rarer).
+
+### Interpretation
+
+Flipped's MEM set on yeast is exactly `legacy \ spurious`. Zero flipped-missed
+and zero flipped-extras across 100K yeast reads and 10K HPRC reads is strong
+evidence the algorithm is correct. The 529 yeast + 170 HPRC "legacy_spurious"
+divergences are entirely explained by a pre-existing legacy bug (JR-004).
+
+`sa_sp` values are consistent with `locate_sa_value` ground truth across
+125K+ MEMs -- the SA-carry chain works end-to-end at algorithm level, not
+just primitive level.
+
+### Open questions
+
+1. The `test_flipped_mems` "LEGACY_SPURIOUS" category was added mid-Stage-2
+   when the first HPRC-scale test revealed divergences. It should not be a
+   permanent tolerance in the test -- once Risk E is fixed (JR-004), the
+   category can be removed and the test's bar tightened back to exact set
+   equality.
+
+Commit: `df06976` (`algorithm: add find_all_mems_flipped + SA-carrying MEM struct`)
+
+---
+
+## JR-003 — Stage 3: wire flipped finder into find_mems
+
+```yaml
+id: JR-003
+date: 2026-07-28
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [stage3, find-mems, perf, e2e]
+refs:
+  follows: [JR-002]
+```
+
+### Context
+
+Stages 1 (JR-001) and 2 (JR-002) built and verified the machinery. Neither
+had any effect on production `find_mems` output. Stage 3 wires the flipped
+finder into `find_mems.cpp`'s lightweight emission path behind a new
+`--use-flipped-mems` flag (default OFF -- CLAUDE.md "don't break the
+default path"), and measures the resulting E2E performance.
+
+### Hypothesis
+
+Design projection (DESIGN_FLIPPED_MEM.md §4.4, §5.2 Stage 4): eliminating
+the seed cost yields ~10% end-to-end `find_mems` wall reduction on HPRC
+chr6, no RSS regression.
+
+### Method
+
+Refactored `dump_mem_info_lightweight` into `dump_mem_info_lightweight_core`
++ two thin wrappers so both legacy (computes seed via `locate_sa_value`)
+and flipped (consumes `sa_sp` from `MEM_with_sa`) share the tag-run
+enumeration and PackedEntry emission verbatim. Per CLAUDE.md: "no copy-paste
+of an existing function with one line changed -- refactor or templatize."
+
+Added `--use-flipped-mems` CLI flag. Rejects `--use-flipped-mems` without
+`--lightweight-tags` (Stage 3 is scoped to the lightweight path only) and
+rejects the combination with `--all-positions`.
+
+Per-read dispatch in `main()`: if flag on, `find_all_mems_flipped` -> iterate
+`MEM_with_sa` -> `dump_mem_info_lightweight_flipped`. Otherwise unchanged.
+
+Local smoke on yeast 500 reads (subset of canonical file via `head -500`):
+byte-identical `.tsv` (sorted) and `.bin` MD5 for both paths. Confirmed no
+divergence at that scale before scaling up.
+
+E2E:
+```
+# Yeast (via query.sh, since it supports no extra flags, only for flag OFF baseline)
+./query.sh configs/yeast235-chrII-normalized.env v2-yeast235 stage3-flag-off --gaf
+
+# Yeast flipped + HPRC flipped (manual pipeline, query.sh doesn't accept extra find_mems flags)
+mkdir -p runs/.../queries/<name>/lightweight
+cd runs/.../queries/<name>/lightweight
+/usr/bin/time -l $PI_BIN/find_mems <ri> <ltags> <reads> <mem_len> <min_occ> mems \
+  --lightweight-tags --use-flipped-mems
+$GAFPACK --gfa ... --path-pos mems_path_pos_v2.bin ... --dedup-read-node --gaf-file-prefix alignment
+python3 $VALIDATE_GAF alignment.gaf ... --sample 2000
+```
+
+### Findings
+
+**Yeast E2E, flag OFF** (regression check that default path is unchanged):
+- MD5 of `alignment.gaf` and `mems_path_pos_v2.bin` byte-identical to prior
+  baselines (`validation-test`, `stage1-sa-primitive`, `stage3-flag-off`)
+  across three separate query runs.
+
+**Yeast E2E, flag ON** (`runs/v2-yeast235/queries/stage3-flag-on/`):
+- validate_gaf: 2000/2000 valid (100%), 0 invalid.
+- GAF line count: 4,906,654 (baseline 4,954,592, delta -47,938).
+- Set diff: 0 flipped-only records, 47,938 legacy-only records (all trace
+  to Risk-E spurious MEMs -- see JR-004).
+
+**HPRC chr6 E2E, flag ON** (`runs/hprc-chr6-2026-06-02/queries/stage3-flipped/`,
+`find_mems` only, since validate_gaf is out of scope per user):
+
+| Metric | Baseline (legacy) | Flipped | Δ |
+|---|---:|---:|---:|
+| Wall (s) | 47.996 | 34.437 | -28.3% |
+| Peak RSS (MB) | 4599.94 | 4106.73 | -10.7% |
+| MEMs emitted | 100,846 | 100,014 | -832 |
+| Total entries written | 21.7M | 1.1M | -95% |
+| Total locate operations | 47.8M | 2.7M | -94% |
+| First-locate calls | 100,846 | **0** | eliminated |
+| First-locate time | 14.28s | **0s** | eliminated |
+| locateNext calls | 47.7M | 2.7M | -94% |
+| MEM-finding time | 19.30s | 29.22s | +51% |
+| MEM-processing time | 21.59s | 1.34s | -94% |
+
+validate_gaf on flipped HPRC output: 2000/2000 valid.
+
+### Interpretation
+
+Design's Stage 3 primary goal hit cleanly: `First locate calls: 0` and
+`First locate time: 0s` in the profiler output. The seed cost is fully
+eliminated.
+
+The 28% headline wall reduction is larger than the 10% design projection.
+Two effects compound: (a) seed elimination (~14s saved, this is Stage 3's
+genuine contribution) and (b) massive downstream volume collapse from
+excluding legacy's Risk-E spurious MEMs (~6s saved, this is Risk E getting
+out of the way). Once Risk E is fixed in legacy, the honest apples-to-apples
+delta is smaller -- see JR-006 for the refined projection.
+
+MEM-finding got slower by 10s (+51%). This is Risk C in DESIGN_FLIPPED_MEM.md
+§5.3 -- Step 2' does a fresh forward extend from `pattern[i-1]` that
+partially duplicates work the legacy 3-phase split amortized. Predicted and
+measured. Net-positive because the processing-side collapse is larger.
+
+Peak RSS drop is entirely from the smaller in-memory entry vector before
+sort (`22.86 MB` vs an estimated ~350 MB from legacy's 21.7M entries).
+
+### Open questions
+
+1. Real Stage-3-only perf delta once Risk E is fixed in legacy -- see JR-006.
+2. Case B fraction at HPRC scale still unmeasured (JR-001 open item).
+3. Stage 4: N=5 warm-cache benchmark per `mem-projection/pangenome-pipeline/perf/`
+   protocol not yet run. Numbers above are single cold runs.
+4. Full commit not yet landed. Code is written and builds; awaiting sign-off
+   on Risk E treatment before committing.
+
+Commit: (pending as of 2026-07-29)
+
+---
+
+## JR-004 — Risk E: legacy Step 3 emits non-left-maximal MEMs on HPRC
+
+```yaml
+id: JR-004
+date: 2026-07-28
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: open
+tags: [risk-e, correctness, legacy-bug, hprc]
+refs:
+  follows: [JR-002, JR-003]
+```
+
+### Context
+
+Discovered while running JR-002's set-equality check on 10K HPRC reads:
+flipped and legacy MEM sets diverged. Investigation traced the divergence
+to a bug in the legacy 3-phase finder's Step 3, previously flagged as
+Risk E in DESIGN_FLIPPED_MEM.md §5.3 ("the current algorithm's Step 3
+out-of-bounds bug"). This entry establishes concretely that Risk E is
+real, characterizes its trigger, and quantifies its scope.
+
+### Hypothesis
+
+Legacy's Step 3 at `include/pangenome_index/algorithm.hpp:724` accesses
+`pattern[len]` when Step 2 extends to end-of-pattern. C++ `std::string`
+returns `\0` (the null terminator) at that position, not undefined
+behavior. When `find_mems` runs on the encoded r-index, `sym_map[0]`
+aliases to whatever DNA character was assigned code 0 during
+`calculate_C` (typically 'A'). So Step 3 mis-extends by a phantom 'A'
+followed by pattern's reverse, and the outer loop advances by only 1
+anchor per iteration, emitting a new bogus "MEM" ending at end-of-pattern
+at each anchor.
+
+### Method
+
+`bin/test_flipped_mems` (JR-002) already categorizes legacy-only MEMs
+as LEGACY_SPURIOUS iff `is_left_maximal(mem)` returns false. Left-maximality
+is checked by calling `FastLocate::count_encoded` on `pattern[start-1..end)`
+and testing whether the count is >= min_occ. If the count of the
+left-extension is >= min_occ, the MEM is not left-maximal (by definition).
+
+Ran on yeast 100K reads and HPRC chr6 10K reads.
+
+For one specific HPRC divergent read (#8093 in yeast, #4778 in HPRC), also
+dumped legacy's and flipped's MEM lists explicitly to confirm the pattern:
+legacy emits MEMs with `start = <k>, k+1, k+2, ..., end = len` for a
+contiguous range of k values.
+
+### Findings
+
+**Trigger:** legacy emits spurious MEMs iff the true MEM at some anchor
+extends all the way to `end = pattern.length()` AND the resulting Step 3
+mis-extension keeps succeeding for enough iterations.
+
+**Scope on yeast (100K reads, min_len=30, min_occ=1):**
+- 529 spurious MEMs across 8 reads (0.008% of reads affected).
+
+**Scope on HPRC (10K reads, min_len=50, min_occ=1):**
+- 170 spurious MEMs across 3 reads (0.03% of reads affected).
+- Most pathological: read #4778 emits **126 spurious MEMs**, all ending
+  at position 200 (end of read), with start positions 25, 26, 27, ...,
+  150 -- one at every anchor position in that range.
+- Read #2251: 39 spurious MEMs, starts 112-150.
+- Read #5238: 5 spurious MEMs.
+
+**Downstream amplification:** the spurious MEMs have very large `size`
+(occurrence count) values because they're low-complexity tail patterns
+matching many places in the pangenome. Each spurious MEM balloons into
+hundreds or thousands of downstream tag-run entries, so a small MEM-set
+delta becomes a large output-volume delta:
+
+- Legacy HPRC 100K entries written: 21.7M
+- Flipped HPRC 100K entries written: 1.1M (20x reduction)
+
+### Interpretation
+
+Risk E is (a) rare in read count but (b) pathological in output volume.
+It's benign for correctness in the sense that `validate_gaf` passes 100%
+on legacy output (every spurious MEM's substring IS a real substring of
+the pangenome at the claimed position -- just not left-maximal). But it's
+non-benign for performance: legacy does ~20x more downstream work on
+HPRC because of it.
+
+The one-line fix (guard against `e >= len` before Step 3's loop) has
+been deferred pending prioritization. When it lands:
+- Legacy behavior changes on the small fraction of reads that trip Risk E.
+- Legacy output size drops to match flipped's.
+- `test_flipped_mems`'s LEGACY_SPURIOUS tolerance can be removed.
+- Stage 3's honest perf delta will be measurable -- see JR-006.
+
+### Open questions
+
+1. **Fix scope:** does `if (e >= len) return len;` before Step 3 fully
+   suffice, or are there other codepaths where a similar `pattern[j]`
+   with `j >= len` access can occur? A search of the codebase for
+   `pattern[` accesses inside MEM-related loops would answer this.
+2. **Yeast vs HPRC ratio:** yeast 100K has 529 spurious across 8 reads
+   (~66 per affected read); HPRC 10K has 170 across 3 reads (~57 per
+   affected read). Not directly comparable (different min_len). But
+   worth confirming on HPRC 100K to see if the "large batch of spurious
+   from one bad read" pattern scales.
+3. **Which reads trigger it?** The 3 HPRC reads that triggered on the
+   first 10K don't look obviously low-complexity. Understanding the
+   linguistic characteristic that triggers Risk E might inform whether
+   the fix has other implications.
+
+> To be resolved by: (a) fix commit for `algorithm.hpp:724`, (b) new
+> journal entry describing the fix + re-baselined measurements.
+
+---
+
+## JR-005 — Risk E: size distribution + per-read concentration
+
+```yaml
+id: JR-005
+date: 2026-07-29
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: open
+tags: [risk-e, distribution, hprc, characterization]
+refs:
+  follows: [JR-004]
+  confirms: [JR-004]
+```
+
+### Context
+
+JR-004 established that Risk E is real and quantified it in aggregate.
+User asked whether MEM sizes are meaningfully different from averages
+alone -- specifically whether the spurious MEMs form a distinct
+subpopulation vs. being smeared across the whole distribution. This
+entry answers that with concrete per-MEM data.
+
+### Method
+
+New diagnostic binary `bin/dump_mem_size_distribution`
+(`src/dump_mem_size_distribution.cpp`) -- one-off tool that emits a TSV
+row per MEM from both finders, tagged with `left_maximal` and
+`in_other_finder`. Then downstream awk pipelines for histograms and
+per-read counts.
+
+Command:
+```
+bin/dump_mem_size_distribution \
+  ../mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/hprcv1_chr6.ri \
+  ../mem-projection/hprcv1/chr6.alt.reads.txt \
+  50 1 10000 \
+  > xy-test/risk_e_analysis/hprc_10k.tsv
+```
+Output: 20,171 rows (header + 10,170 legacy MEMs + 10,000 flipped MEMs).
+
+### Findings
+
+**Cross-tabulation of left-maximal x in-other-finder (10K HPRC reads):**
+
+```
+count   finder   left_maximal   in_other_finder
+10000   flipped  yes            yes
+  170   legacy   no             no
+10000   legacy   yes            yes
+```
+
+Only three cells populated. **Zero flipped-emitted-non-left-maximal**,
+**zero flipped-invented-MEMs**, **zero real-MEMs-flipped-missed**. The
+flipped MEM set is exactly `legacy \ spurious`.
+
+**Size histogram (log-scale bins):**
+
+| bin | legacy count | flipped count |
+|---|---:|---:|
+| [1, 10) | 269 | 269 |
+| [10, 100) | 9,692 | 9,692 |
+| [100, 1000) | 21 | 21 |
+| [1000, 10,000) | 9 | 9 |
+| [10,000, 100,000) | **179** | **9** |
+| [100,000, inf) | 0 | 0 |
+
+Every bin except `[10⁴, 10⁵)` is identical between the two finders. In
+the top bin, legacy has 179, flipped has 9, delta = 170 -- exactly matching
+the 170 legacy-spurious count.
+
+**Spurious MEM size stats (n=170):**
+
+| stat | value |
+|---|---:|
+| min | 20,751 |
+| Q1 | 26,939 |
+| median | 32,173 |
+| Q3 | 34,924 |
+| P90 | 36,287 |
+| P95 | 39,583 |
+| P99 | 64,323 |
+| max | 64,450 |
+| mean | 31,680.7 |
+| sum | 5,385,718 |
+
+**Shared / real MEM size stats (n=10,000):**
+
+| stat | value |
+|---|---:|
+| min | 1 |
+| Q1 | 64 |
+| median | 86 |
+| Q3 | 90 |
+| P90 | 90 |
+| P95 | 90 |
+| P99 | 91 |
+| max | 53,629 |
+| mean | 103.2 |
+| sum | 1,031,936 |
+
+**Per-read spurious concentration:**
+
+| read_id | # spurious | total spurious size |
+|---|---:|---:|
+| #4778 | 126 | 3,672,631 |
+| #2251 | 39 | 1,391,423 |
+| #5238 | 5 | 321,664 |
+
+All 3 affected reads out of 10,000 (0.03%). Read #4778 alone accounts
+for 68% of the total spurious size mass.
+
+**Volume decomposition of legacy's total occurrences (10K reads):**
+- Legacy real MEMs total size: 1,031,936
+- Legacy spurious MEMs total size: 5,385,718
+- Legacy TOTAL: 6,417,654
+- Flipped total: 1,031,936 (exactly = legacy real)
+- **Spurious share of legacy's total occurrence volume: 83.9%**
+
+### Interpretation
+
+The spurious and real MEM size distributions are **disjoint**. Real MEMs
+are tight around 86-91; spurious MEMs are all >= 20,751. There's no
+overlap and no ambiguous middle ground. Any legacy MEM with size in the
+tens of thousands and end == len is essentially guaranteed to be spurious.
+
+The three-order-of-magnitude size gap is what makes Risk E dominate
+downstream volume despite affecting only 0.03% of reads. 170 spurious
+MEMs at median size 32K = ~5.4M "phantom occurrences", which is 5.2x
+more occurrence volume than all 10,000 real MEMs combined. In
+`dump_mem_info_lightweight` each occurrence becomes a `locateNext` step
+(walking to the next tag-run start), which is why legacy's ~48M locate
+calls collapse to flipped's ~2.7M once these phantoms are gone.
+
+The linguistic characteristic that triggers Risk E is now partly clear:
+the affected reads' spurious MEMs all end at pattern-end, with contiguous
+start positions (read #4778: starts 25, 26, ..., 150). This is the exact
+signature the "phantom-'A' backward-extend eating one position per outer-loop
+iteration" theory predicts. Not confirmed via instrumentation of the
+legacy Step 3 loop -- doing that would be the direct proof.
+
+### Open questions
+
+1. **Why these 3 reads and not others?** The reads' sequences don't look
+   obviously low-complexity. Something specific about their end sequences
+   makes Step 3's phantom-extend succeed for 100+ iterations. Instrumenting
+   Step 3 to log what `back.size` is at each iteration on read #4778
+   would pin this down.
+2. **Does the size gap scale to 100K reads?** With ~10x more reads and
+   presumably ~10x more spurious cases, is the size distribution still
+   cleanly disjoint or does it start to overlap at the edges?
+3. **Yeast comparison:** JR-004 showed yeast has 529 spurious across 8
+   reads with `min_len=30`. Yeast's spurious size distribution should
+   look similar (disjoint tails), but the specific sizes will be smaller
+   because yeast pangenome is 100x smaller than HPRC chr6. Not yet
+   measured.
+
+Data files (retained for future reference):
+- `xy-test/risk_e_analysis/hprc_10k.tsv` (20,171 rows, ~2 MB)
+- `xy-test/risk_e_analysis/hprc_10k.log`
+
+Binary: `bin/dump_mem_size_distribution` (source: `src/dump_mem_size_distribution.cpp`)
+
+> This entry does not resolve JR-004; it strengthens the evidence that
+> Risk E is a well-scoped bug with a well-scoped fix. JR-004 stays open
+> pending the actual fix commit.
+
+---
+
+## JR-006 — Refined Stage 3 perf estimate once Risk E is fixed
+
+```yaml
+id: JR-006
+date: 2026-07-29
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: open
+tags: [stage3, perf, risk-e, projection]
+refs:
+  follows: [JR-003, JR-005]
+```
+
+### Context
+
+JR-003 measured a 28% wall reduction on HPRC chr6 (48s -> 34.4s) with
+`--use-flipped-mems`. JR-005 established that 84% of legacy's downstream
+occurrence volume is Risk-E phantom work. The 28% headline therefore
+double-counts: it credits Stage 3 for savings that a fixed legacy would
+also realize. This entry decomposes the 28% into the two components and
+projects the honest Stage-3-only delta.
+
+### Method
+
+Arithmetic on JR-003's timing breakdown, using JR-005's ratio
+(1,031,936 / 6,417,654 = 16.1% -- the real fraction of legacy's work).
+
+Legacy processing-time components:
+- MEM finding: 19.3s (independent of Risk E; same finder either way)
+- Tag queries: 0.66s
+- First locate (seed): 14.28s  <- Stage 3 eliminates this
+- LocateNext: 4.69s
+- Other: 0.25s
+
+If Risk E were fixed in legacy, the tag queries and locateNext costs would
+drop by roughly the same ratio as the occurrence-volume drop (0.161 of the
+current value):
+- Tag queries: 0.66s * 0.161 ~ 0.11s (saves 0.55s)
+- LocateNext: 4.69s * 0.161 ~ 0.76s (saves 3.93s)
+
+Plus sorting: 2.83s * 0.161 ~ 0.46s (saves 2.37s from the sort phase).
+
+### Findings
+
+**Estimated fixed-legacy find_mems wall breakdown:**
+
+| Component | Legacy (as measured) | Fixed legacy (est.) | Basis |
+|---|---:|---:|---|
+| R-index load | 2.85s | 2.85s | unchanged |
+| Tag index load | 1.18s | 1.18s | unchanged |
+| MEM finding | 19.30s | 19.30s | Risk E fix doesn't change MEM count materially (170/100K ~ 0.17% of MEMs) |
+| Tag queries | 0.66s | 0.11s | scaled by 0.161 |
+| First locate (seed) | 14.28s | ~2.30s | scaled by 0.161 (assuming per-real-MEM seed cost matches) |
+| LocateNext | 4.69s | 0.76s | scaled by 0.161 |
+| Other | 0.25s | 0.04s | scaled |
+| Sort | 2.83s | 0.46s | scaled |
+| **Total (est.)** | **~48s** | **~27s** | |
+
+**Flipped (as measured):** 34.4s.
+
+**Estimated honest Stage-3-only delta:** flipped 34.4s vs fixed-legacy ~27s
+= **flipped is ~27% SLOWER than fixed-legacy on HPRC**.
+
+Wait -- that contradicts JR-003's headline. Let me redo more carefully.
+
+Actually the "first locate scaled by 0.161" step is wrong. First-locate
+is one call per emitted MEM, so it scales with MEM count (100.8K -> 100.0K,
+essentially unchanged), not with occurrence volume. Redo:
+
+- First locate: legacy 14.28s / 100,846 calls = 141.6 microseconds per call.
+  Fixed legacy would still have ~100,000 calls (loses only the 170 spurious
+  MEMs). But each spurious MEM's first-locate walk is very long (since sp
+  falls in a huge run). If spurious first-locates average 5x the walk length
+  of real first-locates (rough guess): real per-call ~= (14.28s - N*5t) / 100000
+  where t = real avg first-locate time, N = 170 spurious. Without measurement
+  we can't split cleanly.
+
+The right way to answer this question is to *actually run fixed-legacy* --
+fix Risk E in a scratch commit, re-run HPRC baseline, then compare against
+JR-003's flipped numbers. Estimating via ratios is unreliable when the
+spurious MEMs have very different per-call costs than real ones.
+
+### Interpretation
+
+**JR-003's 28% headline is not honest as an apples-to-apples measure of
+Stage 3's contribution.** It measures "flipped vs Risk-E-buggy legacy" and
+credits Stage 3 for savings a bug-fix would also deliver.
+
+The honest number requires measurement, not estimation. The estimation
+above has one solid conclusion and one uncertain one:
+
+- **Solid:** Stage 3 eliminates ~14s of `first_locate` time -- this is
+  real and independent of Risk E. Even if fixed-legacy's first_locate
+  time drops proportionally with spurious MEM removal, most of the 14s
+  is still real per-MEM seed work on the 100K non-spurious MEMs.
+
+- **Uncertain:** Stage 3's Step 2' costs ~10s extra in MEM-finding. Whether
+  the net (seed savings - Step 2' cost) is positive at the ~4s level or
+  the ~10s level depends on how much of legacy's 14.28s first-locate is
+  attributable to the 170 spurious MEMs specifically.
+
+### Open questions
+
+1. **Actually measure fixed-legacy.** Apply the Risk E one-line fix to
+   `algorithm.hpp:724`, re-run HPRC baseline, then re-run this comparison.
+   This is the definitive answer and this entry should be superseded by
+   one that reports the measurement.
+2. Until (1) is done, the 28% headline stands as "what a user switching
+   between legacy-today and flipped-today would see," which is still a
+   real number even if not the theoretically clean one. Should be
+   documented that way if any external reporting happens.
+3. Stage 4 (N=5 warm-cache benchmark) should be re-run against
+   fixed-legacy for the actual paper/lab-meeting numbers, not against
+   Risk-E-buggy legacy.
+
+> To be resolved by: a new entry that reports fixed-legacy HPRC timing
+> measurement + apples-to-apples flipped delta.
+
+---
