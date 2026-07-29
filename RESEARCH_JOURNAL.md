@@ -129,6 +129,7 @@ won't have the same context you do.
 | [JR-005](#jr-005--risk-e-size-distribution--per-read-concentration) | 2026-07-29 | Risk E: size distribution + per-read concentration | resolved (by JR-007) | risk-e, distribution, hprc, characterization |
 | [JR-006](#jr-006--refined-stage-3-perf-estimate-once-risk-e-is-fixed) | 2026-07-29 | Refined Stage 3 perf estimate once Risk E is fixed | resolved (by JR-007) | stage3, perf, risk-e, projection |
 | [JR-007](#jr-007--risk-e-fix-fixed-legacy--flipped-produce-byte-identical-coverage) | 2026-07-29 | Risk E fix: fixed-legacy == flipped (byte-identical coverage) + honest Stage 3 delta | resolved | risk-e, fix, correctness, perf, stage3 |
+| [JR-008](#jr-008--stage-3-benchmark-n5-warm-cache-hprc-chr6-100k-reads) | 2026-07-29 | Stage 3 benchmark: N=5 warm-cache HPRC chr6 100K reads | resolved | stage3, perf, benchmark, hprc |
 
 ---
 
@@ -1087,5 +1088,256 @@ zero on healthy code paths).
 Data artifacts:
 - `runs/v2-yeast235/queries/riske-fixed-legacy/lightweight/`
 - `runs/hprc-chr6-2026-06-02/queries/riske-fixed-legacy/lightweight/`
+
+---
+
+## JR-008 — Stage 3 benchmark: N=5 warm-cache HPRC chr6 100K reads
+
+```yaml
+id: JR-008
+date: 2026-07-29
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [stage3, perf, benchmark, hprc, harness]
+refs:
+  follows: [JR-007]
+  confirms: [JR-006, JR-007]
+```
+
+### Context
+
+JR-007 established Stage 3 correctness (byte-identical
+`alignment_coverage.csv` between fixed-legacy and flipped) and reported
+a single-run wall delta of -15.3% on HPRC chr6. User asked for a proper
+benchmark with variance signal, using the existing perf harness at
+`mem-projection/pangenome-pipeline/perf/perf_harness.sh` rather than
+ad-hoc invocations. This entry runs N=5 warm-cache trials per mode and
+reports the mean/min/median with stdev.
+
+### Method
+
+**Harness modification.** The existing `perf_harness.sh` accepts
+`--modes=lightweight|full-tag` as the axis of comparison but has no
+hook for extra find_mems flags such as `--use-flipped-mems`. Added a
+one-line backward-compatible extension: an optional
+`FIND_MEMS_EXTRA_FLAGS` environment variable is appended to the
+find_mems command line. Unset = current behavior. Provenance file
+records the value.
+
+CLAUDE.md discourages editing downstream pipeline files from the
+finder repo, but the change is (a) purely additive, (b) preserves the
+default behavior, and (c) the alternative (reimplementing the harness
+protocol in the finder repo) would duplicate ~200 lines and risk drift.
+User was asked and approved.
+
+**Benchmark protocol.** Ran the harness twice back-to-back within a
+single machine session:
+
+```
+export MEM_PROJ=/Users/hlakshmidevi/personal/mem-projection
+export INDEX_DIR="$MEM_PROJ/pangenome-pipeline/runs/hprc-chr6-2026-06-02"
+
+FIND_MEMS_EXTRA_FLAGS="" \
+  ./perf/perf_harness.sh configs/hprcv1-chr6-alt-reads.env 5 \
+    hprc-stage3-legacy --modes=lightweight
+
+FIND_MEMS_EXTRA_FLAGS="--use-flipped-mems" \
+  ./perf/perf_harness.sh configs/hprcv1-chr6-alt-reads.env 5 \
+    hprc-stage3-flipped --modes=lightweight
+```
+
+Each harness invocation: 2 warmups (untimed, to reach warm-cache
+steady state) + 5 timed trials, contiguous ordering (all warmups then
+all trials for the same mode). Coverage-only mode (no `.gaf`, no
+validate_gaf).
+
+Then merged the two per-run outputs into a single perf-tag directory
+so `summarize.py` produces a pairwise A/B comparison:
+- `perf/hprc-stage3-legacy/lightweight/` -> `perf/hprc-stage3/legacy/`
+- `perf/hprc-stage3-flipped/lightweight/` -> `perf/hprc-stage3/flipped/`
+
+**Pre-restart false start.** An earlier N=3 run produced legacy
+trial-1 wall = 133s (~3.3x the others). Discarded and restarted with
+N=5; the retry showed legacy trial-1 at 46.8s (still slower than
+trials 2-5 which clustered 37.9-39.3s, but not catastrophic). Root
+cause of the 133s spike not investigated -- possibly other machine
+activity between the harness warmups and timed trials. Reported here
+for transparency; the N=5 restart is the actual benchmark.
+
+Config: `configs/hprcv1-chr6-alt-reads.env` (MEM_LEN=50, MIN_OCC=1).
+Reads: `../hprcv1/chr6.alt.reads.txt` (100K reads, 200bp each,
+19MB file).
+Machine: M1 mac laptop (single user, background quiescent).
+`find_mems` binary: commit `fe9373e` (Risk E fix applied).
+
+### Findings
+
+**Per-trial wall (find_mems, seconds):**
+
+| trial | legacy | flipped |
+|---:|---:|---:|
+| 1 | 46.80 | 35.13 |
+| 2 | 39.33 | 34.54 |
+| 3 | 38.57 | 35.88 |
+| 4 | 39.25 | 34.26 |
+| 5 | 37.91 | 35.28 |
+| **min** | **37.91** | **34.26** |
+| **median** | **39.25** | **35.13** |
+| **mean** | **40.37** | **35.02** |
+| max | 46.80 | 35.88 |
+| stdev | ±3.64 | ±0.64 |
+
+**find_mems wall delta (flipped vs legacy):**
+
+- **min-vs-min:** -9.6% (36.9s -> 34.3s)
+- **median-vs-median:** -10.5% (39.3s -> 35.1s)
+- **mean-vs-mean:** -13.3% (40.4s -> 35.0s, per `summarize.py`)
+
+The median-based delta is essentially exactly the design's original
+projection of ~10% (DESIGN_FLIPPED_MEM.md §4.4). The mean-based
+delta is inflated by legacy's trial-1 outlier; use median as the
+robust headline.
+
+**Full breakdown from `summarize.py perf/hprc-stage3` (N=5, warm cache):**
+
+```
+STEP 09 - find_mems
+  metric                  flipped                 legacy                     delta
+  wall (rusage)           35.02 +-  0.64 s        40.37 +-  3.64 s        +15.3%
+    user                  29.53 +-  0.11 s        30.82 +-  0.36 s         +4.4%
+    sys                    4.58 +-  0.41 s         7.63 +-  2.14 s        +66.4%
+  peak RSS (kB)           4,201,613 +-  65,277    4,243,389 +-  37,078      +1.0%
+  peak (reported)         4090.0 +-  56.8 MB      4134.9 +-  31.8 MB       +1.1%
+  minor faults              645,310 +- 33,772       911,297 +- 233,678     +41.2%
+  major faults            132 +- 5                136 +- 6                  +2.6%
+  vol ctx switches        522 +- 59              2117 +- 2571            +305.2%
+  invol ctx switches      53518 +- 4467          81085 +- 21357            +51.5%
+
+STEP 09 - find_mems  PHASE BREAKDOWN (from find_mems internal profiler)
+  phase                   flipped                 legacy                     delta
+  Total exec              34.81 +-  0.64 s        40.19 +-  3.64 s        +15.5%
+    R-index load           2.619 +- 0.125 s        2.535 +- 0.203 s         -3.2%
+    Tag-index load         0.725 +- 0.074 s        0.743 +- 0.040 s         +2.5%
+    Read processing       31.35 +-  0.57 s        36.79 +-  3.74 s        +17.4%
+      MEM finding         29.64 +-  0.46 s        19.75 +-  1.13 s        -33.4%
+      MEM processing       1.51 +-  0.15 s        16.76 +-  2.61 s      +1007.9%
+        Tag queries        0.416 +- 0.072 s        0.838 +- 0.552 s       +101.4%
+        Locate ops         0.99 +-  0.08 s        15.78 +-  2.01 s      +1501.4%
+          First locate     0.00 +-  0.00 s        15.26 +-  1.98 s           n/a
+          Locate next      0.99 +-  0.08 s         0.53 +-  0.04 s        -46.7%
+    Bucket sort+write     0.116 +- 0.009 s        0.118 +- 0.009 s         +2.1%
+```
+
+(Signs read as: positive delta = legacy's value is larger than
+flipped's. So "+15.3%" wall means legacy is 15.3% larger than
+flipped, i.e., flipped is 13.3% faster on a mean basis or 10.5%
+faster on a median basis.)
+
+**Peak RSS delta = +1.0% (essentially noise).** JR-003's reported 11%
+RSS improvement was against Risk-E-buggy legacy; fixed-legacy now uses
+the same in-memory volume as flipped.
+
+**Output artifacts byte-identical across all 5 x 2 = 10 trials:**
+
+| artifact | flipped | legacy | delta |
+|---|---:|---:|---:|
+| `mems_path_pos_v2.bin` | 19,175,136 | 19,175,136 | 0.0% |
+| `alignment_coverage.csv` | 61,058,356 | 61,058,356 | 0.0% |
+| `mems_seq_id_starts.out` | 19,872 | 19,872 | 0.0% |
+
+Also gafpack's internal stats (records loaded, total GAF entries,
+step-visits, seq_ids scanned, mean passes/path) are bit-identical
+across the two modes. Confirms JR-007's byte-identity finding at
+N=5-per-mode scale.
+
+**gafpack step is unaffected**, as expected -- it processes the same
+input records either way. Wall 16.5s vs 16.5s (+0.2%, noise).
+
+### Interpretation
+
+**Headline: flipped is ~10-13% faster than fixed-legacy on find_mems
+wall, with byte-identical outputs.** The design's original 10%
+projection sits inside the min-median-mean range.
+
+**Wall decomposition of the ~5s improvement:**
+- Seed elimination saves ~15.3s (`First locate: 15.26 -> 0.00`).
+  Stage 3's primary contribution.
+- Step 2' costs +9.9s in MEM finding (`19.75 -> 29.64`).
+  This is Risk C from DESIGN_FLIPPED_MEM.md §5.3 -- flipped's Step 2'
+  does a fresh forward extend that partially duplicates work legacy
+  amortizes across Steps 1 and 3.
+- LocateNext costs +0.5s in flipped (`0.53 -> 0.99`; small
+  absolute).
+- Tag queries save ~0.4s in flipped (probably from tighter working
+  set on the tag index, but noise floor is close).
+- R-index load, tag-index load, bucket sort: all within 1-3%
+  (indistinguishable from noise).
+- Net: +15.3 - 9.9 - 0.5 + 0.4 = +5.3s, matches the observed
+  40.4 -> 35.0 delta.
+
+**Flipped run is dramatically more consistent (stdev ratio ~5.7x):**
+- Flipped stdev = 0.64s (1.8% of mean).
+- Legacy stdev = 3.64s (9.0% of mean), driven almost entirely by
+  trial-1 = 46.8s.
+- Hypothesis: legacy's per-MEM `locate_sa_value` walk is very
+  cache-sensitive (long walks through cold BWT-run pages);
+  small variations in page-cache state produce large wall variations.
+  Flipped's O(rank) SA-carry has smaller cache footprint and is
+  more deterministic. Not confirmed by direct measurement.
+
+**Voluntary context switches show a 4x difference** (flipped 522 vs
+legacy 2117). Legacy's per-MEM locate_sa_value walk apparently
+triggers more I/O yields into the kernel; flipped's tighter SA-carry
+avoids them. Consistent with the cache-sensitivity hypothesis.
+
+**Minor page faults +41% legacy vs flipped.** Legacy touches more BWT
+pages (via the locateNext walks in `locate_sa_value`), so the
+first-touch fault count is higher. Same underlying phenomenon.
+
+**Combined 09+10 wall delta:**
+- flipped: 51.51 +- 0.83s
+- legacy: 56.90 +- 3.41s
+- delta: +10.5% (find_mems wins dominate; gafpack is unchanged).
+
+### Open questions
+
+1. **Turn `--use-flipped-mems` on by default?** With correctness
+   proven byte-identical (JR-007) and perf +10% wall on find_mems
+   (this entry), the case is clear. Design's Stage 5 in
+   `DESIGN_FLIPPED_MEM.md` §5.2 outlines the rollout. Would need:
+   - Flip the CLI default (or introduce `--use-legacy-mems` as a
+     regression-testing escape hatch).
+   - Update DESIGN_FLIPPED_MEM.md status line to "Stage 5 landed".
+   - Update `mem-projection/pangenome-pipeline/query.sh` to
+     acknowledge the change (or leave it alone, since the flag
+     flip doesn't change the invocation).
+   - Rerun the harness one more time after the flip to confirm
+     nothing else in the codebase depended on the previous default.
+2. **Risk C mitigation still on the table.** Step 2' costs +9.9s of
+   the ~15.3s seed savings. Recovering some of that would push the
+   delta well past 15%. A future entry could investigate reusing
+   Step 1's rightward walk instead of a fresh Step 2' forward extend.
+3. **Why is legacy trial-1 always slower?** Both this run (N=5) and
+   the discarded N=3 run had trial-1 legacy noticeably above the
+   others. Two warmups appear insufficient to stabilize legacy's
+   locate walks; flipped isn't affected. Increasing warmups from 2
+   to 3 (via harness edit) or dropping trial-1 as a post-hoc extra
+   warmup would clean up the mean. Not urgent -- median is already
+   robust to this outlier.
+
+### Data artifacts
+
+- `perf/hprc-stage3/` -- merged perf-tag dir consumed by summarize.py.
+- `perf/hprc-stage3-legacy/`, `perf/hprc-stage3-flipped/` -- the two
+  raw harness invocations preserved for full-trial forensics.
+- `perf/hprc-stage3/PROVENANCE.txt` -- concatenated harness provenance
+  (host, date, binaries, index files, FIND_MEMS_EXTRA_FLAGS value
+  per run).
+- `perf/hprc-stage3/SUMMARY.tsv` -- per-trial machine-readable rows,
+  mode column renamed to `legacy`/`flipped`.
+
+Harness edit committed separately in the pipeline repo (one-line
+addition of `${FIND_MEMS_EXTRA_FLAGS:-}` word-splitting into the
+find_mems invocations).
 
 ---
