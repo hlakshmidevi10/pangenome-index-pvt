@@ -452,6 +452,46 @@ namespace panindexer {
         bi_interval backward_extend_encoded(const bi_interval& bint, size_t symbol);
         bi_interval forward_extend_encoded(const bi_interval& bint, size_t symbol);
 
+        // SA-carrying backward extend (see DESIGN_FLIPPED_MEM.md section 4).
+        //
+        // Carries SA[sp] through a chain of backward extends at O(rank) marginal
+        // cost per step: no locateNext walk from a run-start sample. Used by
+        // Step 1' of the flipped MEM finder to deliver SA[sp] "for free" on
+        // MEM emission -- eliminating the seed cost measured in
+        // FINDINGS_SEED_COST.md (32% of walk time).
+        //
+        // Two modes, distinguished by the sentinel FastLocate::NO_POSITION in
+        // `sa_sp_prev`:
+        //
+        //   1) Initial toehold: caller passes `sa_sp_prev = NO_POSITION`. Any
+        //      prior interval works; typically the whole-BWT interval
+        //      {0, 0, bwt_size()}. After computing the new interval, the
+        //      function seeds SA[new_sp] via a one-time locate walk from the
+        //      containing run's sample. Equivalent cost to a single legacy
+        //      locate_sa_value at the start of each Step 1' walk.
+        //
+        //   2) Subsequent step: caller passes the previous step's sa_sp. If the
+        //      new interval is non-empty, sa_sp is updated via one of:
+        //        Case A (BWT[old_sp] == c): sa_sp' = sa_sp - 1 (LF-decrement).
+        //        Case B (BWT[old_sp] != c): find leftmost c-position j in
+        //          [old_sp, old_ep] via leftmost_c_in_interval; j is at a
+        //          c-run start so SA[j] = samples[run_id_at(j)]; then
+        //          sa_sp' = SA[j] - 1.
+        //
+        // Return value: bi_interval_with_sa with sa_sp set only when the new
+        // interval is non-empty (bint.size > 0). On empty result, sa_sp is
+        // NO_POSITION and the caller must stop the backward-extend walk.
+        struct bi_interval_with_sa {
+            bi_interval bint;
+            size_type sa_sp;  // SA[bint.forward] when bint.size > 0, else NO_POSITION.
+        };
+        // Note: non-const because it composes backward_extend_encoded which
+        // is non-const (historical -- it reads state only). All accessors
+        // called here (rank_at_cached_encoded, bwt_char_at_encoded,
+        // run_id_and_offset_at, locateNext, leftmost_c_in_interval) are const.
+        bi_interval_with_sa backward_extend_encoded_with_sa(
+            const bi_interval& bint, size_type sa_sp_prev, size_t symbol);
+
         // Format check
         inline bool is_encoded() const { return !this->blocks_encoded_start_bits.empty(); }
 

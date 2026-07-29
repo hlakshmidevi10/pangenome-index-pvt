@@ -792,6 +792,77 @@ namespace panindexer {
         return bi_interval(tmp.reverse, tmp.forward, tmp.size);
     }
 
+    // SA-carrying backward extend. See declaration comment in r-index.hpp and
+    // DESIGN_FLIPPED_MEM.md section 4 for the algorithm. Correctness invariant:
+    // when this function returns a non-empty interval, the returned sa_sp
+    // equals SA[returned bint.forward] -- i.e. exactly what locate_sa_value
+    // would compute, at O(rank) marginal cost instead of an O(run-length) walk.
+    FastLocate::bi_interval_with_sa FastLocate::backward_extend_encoded_with_sa(
+            const bi_interval& bint, size_type sa_sp_prev, size_t a) {
+        const size_t old_sp = bint.forward;
+        const size_t old_ep = bint.forward + (bint.size > 0 ? bint.size - 1 : 0);
+
+        // Delegate the interval math to the existing primitive -- no duplication
+        // of the FMD RC-side accounting or empty-case handling. All the added
+        // work here is the SA update.
+        bi_interval new_bint = this->backward_extend_encoded(bint, a);
+        bi_interval_with_sa result{new_bint, FastLocate::NO_POSITION};
+        if (new_bint.size <= 0) {
+            return result;  // failure: caller must terminate the walk.
+        }
+
+        const size_t new_sp = new_bint.forward;
+
+        // Initial toehold path: no valid prior SA to carry. Seed by locating
+        // new_sp directly from its containing run's sample. This is a one-time
+        // cost per Step 1' walk (called once at the start), amortized over all
+        // subsequent extends which use the O(1) or O(log r) LF-decrement path.
+        if (sa_sp_prev == FastLocate::NO_POSITION) {
+            size_t run_id = 0;
+            size_t offset_of_first = 0;
+            this->run_id_and_offset_at(new_sp, run_id, offset_of_first);
+            size_type sa = this->getSample(run_id);
+            while (offset_of_first < new_sp) {
+                sa = this->locateNext(sa);
+                offset_of_first++;
+            }
+            result.sa_sp = sa;
+            return result;
+        }
+
+        // Case A: BWT[old_sp] == a. Then old_sp is itself the leftmost a in
+        // [old_sp, old_ep] (BWT[old_sp] == a is the boundary condition), so
+        // LF(old_sp) = new_sp and SA[new_sp] = SA[old_sp] - 1 by the LF
+        // identity. Costs one bwt_char_at_encoded call (predecessor + block
+        // decode) on top of what backward_extend_encoded already did.
+        if (this->bwt_char_at_encoded(old_sp) == a) {
+            // sa_sp_prev is SA[old_sp]; subtract 1 for LF-decrement. SA values
+            // are >= 1 for all non-endmarker positions (they map to seqOffset
+            // plus a positive seq_id bias), so underflow would indicate a
+            // corrupted carry -- an assert would fire below, but we trust the
+            // invariant here.
+            result.sa_sp = sa_sp_prev - 1;
+            return result;
+        }
+
+        // Case B: BWT[old_sp] != a. The leftmost a in [old_sp, old_ep] is at
+        // some j > old_sp. By construction BWT[j-1] != a (else j-1 would be
+        // leftmost), so j starts a run of a and SA[j] = samples[run_id_at(j)]
+        // -- no locate walk needed. Then SA[new_sp] = SA[j] - 1.
+        //
+        // In debug builds an assertion fires if leftmost_c_in_interval returns
+        // SIZE_MAX: since new_bint is non-empty, at least one a-position must
+        // exist in [old_sp, old_ep]; a miss here indicates a primitive bug.
+        size_t j = this->leftmost_c_in_interval(a, old_sp, old_ep);
+        assert(j != SIZE_MAX && "backward_extend_encoded_with_sa: Case B could not locate leftmost a despite non-empty result interval");
+        size_t j_run_id = 0;
+        size_t j_run_offset = 0;
+        this->run_id_and_offset_at(j, j_run_id, j_run_offset);
+        assert(j_run_offset == j && "backward_extend_encoded_with_sa: leftmost a-position in interval is not at a run start (invariant violated)");
+        result.sa_sp = this->getSample(j_run_id) - 1;
+        return result;
+    }
+
 
     // This function returns the exact number of runs, considering that each NENDMARKER is a separate run
     size_type FastLocate::total_runs() {
