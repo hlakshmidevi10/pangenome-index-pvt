@@ -1772,13 +1772,11 @@ size_t FastLocate::leftmost_c_in_interval(size_t c, size_t sp, size_t ep) const 
                                  &this->run_starts_by_char[idx]);
     });
 
+    // successor(sp + 1) = smallest 1-bit strictly greater than sp.
+    // Equivalent to the previous predecessor+advance idiom but one primitive
+    // call instead of two, no branches for the "no 1-bit <= sp" edge case.
     const auto& bv = this->run_starts_by_char[idx];
-    auto iter = bv.predecessor(sp);
-    if (iter == bv.one_end()) {
-        iter = bv.one_begin();
-    } else {
-        ++iter;
-    }
+    auto iter = bv.successor(sp + 1);
     if (iter == bv.one_end() || iter->second > ep) return SIZE_MAX;
     return iter->second;
 }
