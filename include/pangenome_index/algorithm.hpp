@@ -714,8 +714,25 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         //           << " size=" << bint2.size << std::endl;
         output.push_back({x, e, bint2.forward, bint2.size});
 
-        // if (j == len) return len;
-        // std::cerr << "here4" << std::endl;
+        // Risk E fix (DESIGN_FLIPPED_MEM.md sec 5.3, RESEARCH_JOURNAL.md
+        // JR-004/JR-005): when the MEM extends to end-of-pattern (e == len),
+        // Step 3's first iteration would evaluate pattern[e] = pattern[len],
+        // which for std::string returns the null terminator '\0'. In the
+        // encoded r-index, sym_map[0] aliases to whatever DNA character was
+        // assigned code 0 (typically 'A'), so backward_extend_encoded silently
+        // treats the null as a valid DNA extension. The bogus extension often
+        // succeeds, and the outer loop then advances by exactly one anchor per
+        // iteration, emitting a spurious non-left-maximal MEM at each. On
+        // HPRC chr6 100K reads this manifested as ~800 spurious MEMs with
+        // very large `size` values (median ~32K), driving ~20x more
+        // downstream tag-run emission work than the correct algorithm should.
+        //
+        // Semantic fix: when e == len, there is no character at pattern[len]
+        // to extend by, and no right-anchor to the right of the emitted MEM
+        // (any such anchor would need right-endpoint > len - 1). Terminate
+        // the outer loop by returning len.
+        if (e >= len) return len;
+
         // Step 3: reset to P[j], backward extend from j−1 to x+1
         FastLocate::bi_interval back = {0, 0, fmd_index.bwt_size()};
         // back = fmd_index.backward_extend(back, pattern[j]);
