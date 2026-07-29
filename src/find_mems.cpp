@@ -926,12 +926,28 @@ static void write_classification_row(std::ostream& os, const MEMRunClassificatio
 // matching early-exit fix); both paths now perform the same locate work.
 // The remaining savings come from skipping graph-position decoding (no
 // encoded_runs_iv reads) and the unordered_set<pos_t> allocation.
-void dump_mem_info_lightweight(const MEM& mem, const int read_id,
-                               const LightTagIndex& ltag, FastLocate& r_index,
-                               vector<size_t>& seq_id_counter,
-                               std::vector<PackedEntry>& entries,
-                               MEMProfilingStats& mem_stats,
-                               bool debug_stats = false) {
+// Core of the lightweight per-MEM emission path. Extracted so both the
+// legacy locate-first entrypoint and the Stage 3 flipped-MEM entrypoint can
+// share the tag-run walk and PackedEntry emission; they differ only in how
+// they obtain the seed SA value at bwt_start:
+//
+//   * Legacy: locate_sa_value(bwt_start) -- pays the O(BWT-run-length) seed
+//     cost that FINDINGS_SEED_COST.md measured at 32% of walk time.
+//   * Flipped: sa_value comes for free out of backward_extend_encoded_with_sa
+//     during MEM discovery (DESIGN_FLIPPED_MEM.md sec 4).
+//
+// The caller passes seed_sa_value = SA[bwt_start] already; this function
+// walks locateNext from there. mem_stats.first_locate_time / _calls fields
+// are populated by the caller (they measure the caller's SA-seed cost,
+// which is zero in the flipped path).
+static void dump_mem_info_lightweight_core(const MEM& mem, const int read_id,
+                                           const LightTagIndex& ltag,
+                                           FastLocate& r_index,
+                                           size_type seed_sa_value,
+                                           vector<size_t>& seq_id_counter,
+                                           std::vector<PackedEntry>& entries,
+                                           MEMProfilingStats& mem_stats,
+                                           bool debug_stats) {
     const size_t bwt_start  = mem.bwt_start;
     const size_t bwt_end    = mem.bwt_start + mem.size - 1;
     const size_t mem_length = mem.end - mem.start;
@@ -954,19 +970,7 @@ void dump_mem_info_lightweight(const MEM& mem, const int read_id,
 
     if (n_runs == 0) return;
 
-    // Seed SA at the first run-start position covered by the MEM.
-    // The first run may have started BEFORE bwt_start; we clip to bwt_start.
-#if TIME
-    auto first_locate_start = chrono::high_resolution_clock::now();
-#endif
-    size_type sa_value = locate_sa_value(r_index, bwt_start);
-    mem_stats.first_locate_calls = 1;
-#if TIME
-    auto first_locate_end = chrono::high_resolution_clock::now();
-    std::chrono::duration<double> first_locate_duration = first_locate_end - first_locate_start;
-    mem_stats.first_locate_time = first_locate_duration.count();
-#endif
-
+    size_type sa_value = seed_sa_value;
     size_t cur_bwt = bwt_start;
 
     // Stats accumulators when debug_stats is enabled.
@@ -1030,6 +1034,51 @@ void dump_mem_info_lightweight(const MEM& mem, const int read_id,
         std::cerr << "Seq_ids appearing in >1 entry: " << dup_seq << std::endl;
         std::cerr << "=================================" << std::endl;
     }
+}
+
+// Legacy lightweight entrypoint: computes SA[bwt_start] via locate_sa_value
+// (paying the seed cost) and hands off to the core walk. Preserves the
+// original signature that predates Stage 3 -- default MEM finder callers
+// invoke this and see byte-identical behavior.
+void dump_mem_info_lightweight(const MEM& mem, const int read_id,
+                               const LightTagIndex& ltag, FastLocate& r_index,
+                               vector<size_t>& seq_id_counter,
+                               std::vector<PackedEntry>& entries,
+                               MEMProfilingStats& mem_stats,
+                               bool debug_stats = false) {
+#if TIME
+    auto first_locate_start = chrono::high_resolution_clock::now();
+#endif
+    size_type sa_value = locate_sa_value(r_index, mem.bwt_start);
+    mem_stats.first_locate_calls = 1;
+#if TIME
+    auto first_locate_end = chrono::high_resolution_clock::now();
+    std::chrono::duration<double> first_locate_duration = first_locate_end - first_locate_start;
+    mem_stats.first_locate_time = first_locate_duration.count();
+#endif
+    dump_mem_info_lightweight_core(mem, read_id, ltag, r_index, sa_value,
+                                   seq_id_counter, entries, mem_stats,
+                                   debug_stats);
+}
+
+// Stage 3 entrypoint: consumes a MEM_with_sa whose sa_sp field was populated
+// by find_all_mems_flipped's SA-carry walk. Skips the locate_sa_value seed
+// (the whole point of the flipped design). first_locate_time/_calls remain
+// zero, isolating the walk cost in profiling output.
+//
+// The MEM_with_sa is downcast to a plain MEM for the core call because the
+// core walk only needs {start, end, bwt_start, size}. sa_sp is passed
+// separately as the seed.
+void dump_mem_info_lightweight_flipped(const MEM_with_sa& mem_sa, const int read_id,
+                                       const LightTagIndex& ltag, FastLocate& r_index,
+                                       vector<size_t>& seq_id_counter,
+                                       std::vector<PackedEntry>& entries,
+                                       MEMProfilingStats& mem_stats,
+                                       bool debug_stats = false) {
+    const MEM mem = mem_sa.to_legacy();
+    dump_mem_info_lightweight_core(mem, read_id, ltag, r_index, mem_sa.sa_sp,
+                                   seq_id_counter, entries, mem_stats,
+                                   debug_stats);
 }
 
 // Helper function to dump MEM information (All-Positions Algorithm).
@@ -1201,7 +1250,7 @@ void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags|--all-positions] [--debug-classify=<path.tsv>]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags|--all-positions] [--use-flipped-mems] [--debug-classify=<path.tsv>]" << std::endl;
         std::cerr << "  --lightweight-tags: treat <tag_array_index> as a .ltags file (LightTagIndex)" << std::endl;
         std::cerr << "                      instead of a full compact tags file. Emits one entry per" << std::endl;
         std::cerr << "                      tag run intersecting each MEM, with no graph-position dedup." << std::endl;
@@ -1211,6 +1260,13 @@ int main(int argc, char **argv) {
         std::cerr << "                      (mem.size entries per MEM). Output volume can be very" << std::endl;
         std::cerr << "                      large; intended only for small-scale A/B against the" << std::endl;
         std::cerr << "                      lightweight/full-tag dedup modes." << std::endl;
+        std::cerr << "  --use-flipped-mems: use the right-to-left flipped MEM finder with SA-carry" << std::endl;
+        std::cerr << "                      (see DESIGN_FLIPPED_MEM.md). Skips the per-MEM" << std::endl;
+        std::cerr << "                      locate_sa_value seed walk that FINDINGS_SEED_COST.md" << std::endl;
+        std::cerr << "                      measured at ~32% of walk time. Requires --lightweight-tags." << std::endl;
+        std::cerr << "                      OFF by default; the legacy 3-phase finder remains the" << std::endl;
+        std::cerr << "                      default until this path passes the full E2E validation" << std::endl;
+        std::cerr << "                      gate on HPRC chr6." << std::endl;
         std::cerr << "  --debug-classify=<path>: per-MEM run-classification TSV written to <path>." << std::endl;
         std::cerr << "                      Requires --lightweight-tags. Adds one row per emitted MEM" << std::endl;
         std::cerr << "                      classifying tag-run starts by alignment with BWT-run" << std::endl;
@@ -1232,6 +1288,7 @@ int main(int argc, char **argv) {
     bool emit_tsv = false;
     bool lightweight_tags = false;
     bool all_positions = false;
+    bool use_flipped_mems = false;
 
     for (int i = 6; i < argc; i++) {
         std::string arg(argv[i]);
@@ -1245,6 +1302,8 @@ int main(int argc, char **argv) {
             lightweight_tags = true;
         } else if (arg == "--all-positions") {
             all_positions = true;
+        } else if (arg == "--use-flipped-mems") {
+            use_flipped_mems = true;
         } else if (arg.rfind("--debug-classify=", 0) == 0) {
             classify_tsv_path = arg.substr(std::string("--debug-classify=").size());
         } else if (output_file_name.empty()) {
@@ -1257,6 +1316,19 @@ int main(int argc, char **argv) {
     }
     if (!classify_tsv_path.empty() && !lightweight_tags) {
         std::cerr << "ERROR: --debug-classify requires --lightweight-tags (the classifier reads a LightTagIndex)" << std::endl;
+        return EXIT_FAILURE;
+    }
+    // Scope the flipped path to lightweight mode (Stage 3 of
+    // DESIGN_FLIPPED_MEM.md deliberately does not touch dump_mem_info or
+    // dump_mem_info_unique_runs). Reject other combinations so users get a
+    // fast failure instead of silently falling back to the legacy path.
+    if (use_flipped_mems && !lightweight_tags) {
+        std::cerr << "ERROR: --use-flipped-mems requires --lightweight-tags "
+                     "(Stage 3 wires the flipped finder only into the lightweight emission path)" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (use_flipped_mems && all_positions) {
+        std::cerr << "ERROR: --use-flipped-mems and --all-positions are mutually exclusive" << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -1276,6 +1348,9 @@ int main(int argc, char **argv) {
               << (all_positions   ? "all-positions (tag array bypassed)"
                   : lightweight_tags ? "lightweight (.ltags)"
                                      : "full compact tags") << std::endl;
+    std::cerr << "MEM finder:        "
+              << (use_flipped_mems ? "flipped (SA-carry, DESIGN_FLIPPED_MEM.md)"
+                                   : "legacy 3-phase") << std::endl;
     std::cerr << "Debug classify:    "
               << (classify_tsv_path.empty() ? "disabled" : classify_tsv_path)
               << std::endl;
@@ -1397,8 +1472,23 @@ int main(int argc, char **argv) {
         auto mem_finding_start = chrono::high_resolution_clock::now();
 #endif
 
-        // Find MEMs for this read
-        auto mems = find_all_mems(read, mem_length, min_occ, r_index);
+        // Find MEMs for this read. Two code paths -- kept as separate calls
+        // so the vector element type is monomorphic (MEM vs MEM_with_sa) and
+        // there is no per-element indirection to switch between them.
+        //
+        // The flipped path is intentionally restricted to lightweight mode
+        // (see CLI flag validation above); Stage 3 does not touch the full-tag
+        // or all-positions emitters.
+        std::vector<MEM> mems_legacy;
+        std::vector<MEM_with_sa> mems_flipped;
+        size_t mems_count = 0;
+        if (use_flipped_mems) {
+            mems_flipped = find_all_mems_flipped(read, mem_length, min_occ, r_index);
+            mems_count = mems_flipped.size();
+        } else {
+            mems_legacy = find_all_mems(read, mem_length, min_occ, r_index);
+            mems_count = mems_legacy.size();
+        }
 
 #if TIME
         auto mem_finding_end = chrono::high_resolution_clock::now();
@@ -1412,68 +1502,21 @@ int main(int argc, char **argv) {
             std::cerr << "Read sequence: " << read << std::endl;
         }
 #endif
-        
-        profiling.total_mems_outputted += mems.size();
-        
+
+        profiling.total_mems_outputted += mems_count;
+
 #if TIME
         auto mem_processing_start = chrono::high_resolution_clock::now();
 #endif
 
-        for (const auto& mem : mems) {
-#if DEBUG
-            if (verbose) {
-                std::cerr << "MEM START: " << mem.start << ", MEM END: " << mem.end 
-                          << " BWT START: " << mem.bwt_start << " BWT SIZE: " << mem.size << std::endl;
-            }
-#endif
-
-            total_mem_matches += mem.size;
-            
-            // Track MEM statistics
-            profiling.total_mem_length += (mem.end - mem.start);
-            profiling.total_mem_occurrences += mem.size;
-
-            // Per-MEM profiling
-            MEMProfilingStats mem_stats;
-            
-            // Choose algorithm:
-            // Option 1: Original - locates ALL BWT positions (slower, more SA lookups)
-            // dump_mem_info(mem, i, tag_array, r_index, seq_id_counter, mem_stats,
-            //     output_file.is_open() ? &output_file : nullptr, debug_stats);
-            //
-            // // Option 2 (default): Optimized - locates only START of each unique tag run,
-            // dedup by graph_pos via unordered_set<pos_t>.
-            //
-            // Option 3 (--lightweight-tags): consumes a LightTagIndex (.ltags) with
-            // bwt_intervals only. Emits one entry per intersecting tag run, no dedup.
-            //
-            // Option 4 (--all-positions): verification/POC. Skips the tag array
-            // entirely; emits one entry per BWT position in [bwt_start, bwt_end].
-            if (all_positions) {
-                dump_mem_info_all_positions(mem, i, r_index,
-                                            seq_id_counter, entries, mem_stats,
-                                            debug_stats);
-            } else if (lightweight_tags) {
-                dump_mem_info_lightweight(mem, i, light_tag_index, r_index,
-                                          seq_id_counter, entries, mem_stats,
-                                          debug_stats);
-            } else {
-                dump_mem_info_unique_runs(mem, i, tag_array, r_index,
-                                          seq_id_counter, entries, mem_stats,
-                                          debug_stats);
-            }
-
-            // Per-MEM classification, emitted alongside the normal output.
-            // Intentionally not timed and not included in profiling totals
-            // (mem_stats is untouched). Only meaningful in lightweight mode
-            // because classify_mem_runs consumes LightTagIndex.
-            if (classify_tsv.is_open()) {
-                MEMRunClassification cls =
-                    classify_mem_runs(mem, i, light_tag_index, r_index);
-                write_classification_row(classify_tsv, cls);
-            }
-
-            // Aggregate per-MEM stats
+        // Aggregate one MEM's stats into the global profiling counters. Split
+        // out so both dispatch paths below share it verbatim -- keeps the
+        // legacy / flipped branches focused on the emission call itself.
+        auto accumulate_stats = [&](const MEMProfilingStats& mem_stats,
+                                    int64_t mem_size, size_t mem_span) {
+            total_mem_matches += mem_size;
+            profiling.total_mem_length += mem_span;
+            profiling.total_mem_occurrences += mem_size;
             profiling.total_tag_query_time += mem_stats.tag_query_time;
             profiling.total_locate_time += mem_stats.locate_time;
             profiling.total_first_locate_time += mem_stats.first_locate_time;
@@ -1484,11 +1527,69 @@ int main(int argc, char **argv) {
             profiling.total_file_write_time += mem_stats.file_write_time;
             profiling.total_tag_runs += mem_stats.tag_runs;
             profiling.total_entries_written += mem_stats.entries_written;
-            
-            // Calculate n/r ratio (n = mem.size, r = number of decoded runs)
             if (mem_stats.tag_runs > 0) {
-                double n_over_r = (double)mem.size / mem_stats.tag_runs;
+                double n_over_r = (double)mem_size / mem_stats.tag_runs;
                 profiling.total_n_over_r_ratio += n_over_r;
+            }
+        };
+
+        if (use_flipped_mems) {
+            // Flipped path: MEM_with_sa carries sa_sp so the lightweight
+            // emitter skips locate_sa_value entirely.
+            for (const auto& mem_sa : mems_flipped) {
+#if DEBUG
+                if (verbose) {
+                    std::cerr << "MEM START: " << mem_sa.start << ", MEM END: " << mem_sa.end
+                              << " BWT START: " << mem_sa.bwt_start << " BWT SIZE: " << mem_sa.size
+                              << " SA_SP: " << mem_sa.sa_sp << std::endl;
+                }
+#endif
+                MEMProfilingStats mem_stats;
+                dump_mem_info_lightweight_flipped(mem_sa, i, light_tag_index, r_index,
+                                                  seq_id_counter, entries, mem_stats,
+                                                  debug_stats);
+                if (classify_tsv.is_open()) {
+                    MEMRunClassification cls =
+                        classify_mem_runs(mem_sa.to_legacy(), i, light_tag_index, r_index);
+                    write_classification_row(classify_tsv, cls);
+                }
+                accumulate_stats(mem_stats, mem_sa.size, mem_sa.end - mem_sa.start);
+            }
+        } else {
+            // Legacy path: unchanged. Three emission options selected by
+            // --all-positions / --lightweight-tags / (default full-tag).
+            //   Option 1 (dump_mem_info) is dead -- kept commented in git
+            //   history; do not resurrect without porting to v2 records.
+            //   Option 2 (default): dump_mem_info_unique_runs (full compact tags).
+            //   Option 3: dump_mem_info_lightweight (.ltags).
+            //   Option 4: dump_mem_info_all_positions (bypass tag array).
+            for (const auto& mem : mems_legacy) {
+#if DEBUG
+                if (verbose) {
+                    std::cerr << "MEM START: " << mem.start << ", MEM END: " << mem.end
+                              << " BWT START: " << mem.bwt_start << " BWT SIZE: " << mem.size << std::endl;
+                }
+#endif
+                MEMProfilingStats mem_stats;
+                if (all_positions) {
+                    dump_mem_info_all_positions(mem, i, r_index,
+                                                seq_id_counter, entries, mem_stats,
+                                                debug_stats);
+                } else if (lightweight_tags) {
+                    dump_mem_info_lightweight(mem, i, light_tag_index, r_index,
+                                              seq_id_counter, entries, mem_stats,
+                                              debug_stats);
+                } else {
+                    dump_mem_info_unique_runs(mem, i, tag_array, r_index,
+                                              seq_id_counter, entries, mem_stats,
+                                              debug_stats);
+                }
+                if (classify_tsv.is_open()) {
+                    MEMRunClassification cls =
+                        classify_mem_runs(mem, i, light_tag_index, r_index);
+                    write_classification_row(classify_tsv, cls);
+                }
+                accumulate_stats(mem_stats, mem.size, mem.end - mem.start);
             }
         }
         
