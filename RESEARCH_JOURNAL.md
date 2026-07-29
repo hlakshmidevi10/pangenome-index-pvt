@@ -125,9 +125,10 @@ won't have the same context you do.
 | [JR-001](#jr-001--stage-1-sa-carrying-backward-extend-primitive) | 2026-07-28 | Stage 1: SA-carrying backward extend primitive | resolved | stage1, r-index, primitive, sa-carry |
 | [JR-002](#jr-002--stage-2-flipped-mem-finder) | 2026-07-28 | Stage 2: flipped MEM finder | resolved | stage2, mem-finder, algorithm |
 | [JR-003](#jr-003--stage-3-wire-flipped-finder-into-find_mems) | 2026-07-28 | Stage 3: wire flipped finder into find_mems | resolved | stage3, find-mems, perf |
-| [JR-004](#jr-004--risk-e-legacy-step-3-emits-non-left-maximal-mems-on-hprc) | 2026-07-28 | Risk E: legacy Step 3 emits non-left-maximal MEMs on HPRC | open | risk-e, correctness, legacy-bug, hprc |
-| [JR-005](#jr-005--risk-e-size-distribution--per-read-concentration) | 2026-07-29 | Risk E: size distribution + per-read concentration | open | risk-e, distribution, hprc, characterization |
-| [JR-006](#jr-006--refined-stage-3-perf-estimate-once-risk-e-is-fixed) | 2026-07-29 | Refined Stage 3 perf estimate once Risk E is fixed | open | stage3, perf, risk-e, projection |
+| [JR-004](#jr-004--risk-e-legacy-step-3-emits-non-left-maximal-mems-on-hprc) | 2026-07-28 | Risk E: legacy Step 3 emits non-left-maximal MEMs on HPRC | resolved (by JR-007) | risk-e, correctness, legacy-bug, hprc |
+| [JR-005](#jr-005--risk-e-size-distribution--per-read-concentration) | 2026-07-29 | Risk E: size distribution + per-read concentration | resolved (by JR-007) | risk-e, distribution, hprc, characterization |
+| [JR-006](#jr-006--refined-stage-3-perf-estimate-once-risk-e-is-fixed) | 2026-07-29 | Refined Stage 3 perf estimate once Risk E is fixed | resolved (by JR-007) | stage3, perf, risk-e, projection |
+| [JR-007](#jr-007--risk-e-fix-fixed-legacy--flipped-produce-byte-identical-coverage) | 2026-07-29 | Risk E fix: fixed-legacy == flipped (byte-identical coverage) + honest Stage 3 delta | resolved | risk-e, fix, correctness, perf, stage3 |
 
 ---
 
@@ -558,6 +559,8 @@ been deferred pending prioritization. When it lands:
 > To be resolved by: (a) fix commit for `algorithm.hpp:724`, (b) new
 > journal entry describing the fix + re-baselined measurements.
 
+> Resolved by JR-007 (2026-07-29).
+
 ---
 
 ## JR-005 — Risk E: size distribution + per-read concentration
@@ -725,6 +728,8 @@ Binary: `bin/dump_mem_size_distribution` (source: `src/dump_mem_size_distributio
 > Risk E is a well-scoped bug with a well-scoped fix. JR-004 stays open
 > pending the actual fix commit.
 
+> Resolved by JR-007 (2026-07-29).
+
 ---
 
 ## JR-006 — Refined Stage 3 perf estimate once Risk E is fixed
@@ -843,5 +848,244 @@ above has one solid conclusion and one uncertain one:
 
 > To be resolved by: a new entry that reports fixed-legacy HPRC timing
 > measurement + apples-to-apples flipped delta.
+
+> Resolved by JR-007 (2026-07-29). Estimation in this entry turned out to be
+> unreliable in the specific way flagged ("first-locate scales with MEM count,
+> not occurrence volume"); JR-007 supersedes both the numbers here and the
+> logic behind them.
+
+---
+
+## JR-007 — Risk E fix: fixed-legacy == flipped (byte-identical coverage) + honest Stage 3 delta
+
+```yaml
+id: JR-007
+date: 2026-07-29
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [risk-e, fix, correctness, perf, stage3]
+refs:
+  follows: [JR-006]
+  resolves: [JR-004, JR-005, JR-006]
+```
+
+### Context
+
+JR-004 established Risk E as a real bug in legacy Step 3
+(`include/pangenome_index/algorithm.hpp:724`). JR-005 characterized its
+size distribution and per-read concentration. JR-006 tried to estimate
+the honest Stage 3 perf delta arithmetically and flagged the estimation
+as unreliable. This entry closes all three: applies the fix, verifies
+correctness via a stronger check than validate_gaf (byte-identical
+downstream coverage), and measures the honest apples-to-apples flipped
+delta.
+
+### Hypothesis
+
+Under JR-004's model of the bug:
+
+- Fix: guard `if (e >= len) return len;` before Step 3's loop skips the
+  ill-defined `pattern[len]` access. If e == len, the emitted MEM covers
+  end-of-pattern; no right-anchor exists to the right of it, so returning
+  `len` correctly terminates the outer loop.
+- Prediction 1: fixed-legacy's MEM set becomes identical to flipped's on
+  every dataset (`test_flipped_mems` LEGACY_SPURIOUS goes to 0).
+- Prediction 2: fixed-legacy and flipped produce byte-identical
+  downstream `alignment_coverage.csv`.
+- Prediction 3: fixed-legacy find_mems wall drops substantially vs
+  buggy-legacy (Risk E was driving ~20x downstream volume amplification
+  on HPRC), giving an honest Stage 3 delta smaller than JR-003's 28%
+  headline.
+
+### Method
+
+**Fix** applied to `include/pangenome_index/algorithm.hpp` (in the
+`find_mems_function` between MEM emission and Step 3 setup). One line
+plus a substantial comment explaining the mechanism, so a future reader
+who trips this code path understands why the guard exists.
+
+```cpp
+if (e >= len) return len;
+```
+
+**Verification chain:**
+
+1. Unit-level (`bin/test_flipped_mems`) on HPRC 10K reads and yeast
+   100K reads with the fix in place. LEGACY_SPURIOUS must go from 170
+   / 529 respectively to 0.
+2. Pipeline E2E on yeast via `./query.sh` (query name:
+   `riske-fixed-legacy`), flag OFF. validate_gaf 2000/2000.
+3. Pipeline E2E on HPRC via manual invocation (query.sh does not accept
+   extra find_mems flags), flag OFF, with `gtime -v` for peak RSS.
+4. **Downstream identity check via `alignment_coverage.csv` MD5** across
+   `riske-fixed-legacy` vs `stage3-flipped` (flipped) vs
+   `local-validate` (buggy legacy baseline). This is a much stronger
+   correctness signal than validate_gaf's 2000-entry sample -- coverage
+   counts feed cosigt directly, so byte-identity here means genotyping
+   pipelines see the exact same input.
+
+### Findings
+
+**Unit-level (`bin/test_flipped_mems`):**
+
+| Dataset | Buggy-legacy LEGACY_SPURIOUS | Fixed-legacy LEGACY_SPURIOUS |
+|---|---:|---:|
+| HPRC 10K reads | 170 | **0** |
+| Yeast 100K reads | 529 | **0** |
+
+Fixed-legacy's MEM set is now exactly equal to flipped's on both datasets.
+Zero flipped-missed, zero flipped-extra, zero sa_sp mismatches (unchanged
+-- those were already zero).
+
+**Yeast E2E (validate_gaf):**
+
+- `runs/v2-yeast235/queries/riske-fixed-legacy/lightweight/`: 2000/2000 valid.
+- GAF line count: 4,906,654 (matches flipped's stage3-flag-on exactly,
+  down from buggy-legacy's 4,954,592).
+
+**HPRC E2E (find_mems only, no validate_gaf per user):**
+
+- `runs/hprc-chr6-2026-06-02/queries/riske-fixed-legacy/lightweight/`.
+- Total MEMs: 100.0K (was 100.8K in buggy-legacy).
+- Total entries written: 1.1M (was 21.7M -- Risk E amplification gone).
+- LocateNext calls: 2.7M (was 47.7M).
+- Wall: 40.66s (was 47.996s).
+- Peak RSS: 4113 MB (was 4600 MB).
+
+**Downstream identity (alignment_coverage.csv MD5):**
+
+Yeast:
+
+| variant | MD5 | size |
+|---|---|---:|
+| `riske-fixed-legacy` (flag OFF, fix applied) | `1baf368f3cdc59890f88410cc34cc051` | 16,108,726 |
+| `stage3-flag-on` (flipped) | `1baf368f3cdc59890f88410cc34cc051` | 16,108,726 |
+| `stage3-flag-off` (buggy legacy) | `db4ba02af811e72df2790db064b152b9` | 16,108,919 |
+
+HPRC:
+
+| variant | MD5 | size |
+|---|---|---:|
+| `riske-fixed-legacy` (flag OFF, fix applied) | `8c242732c837d697fb18c52fd0c0cf6e` | 61,058,356 |
+| `stage3-flipped` (flipped) | `8c242732c837d697fb18c52fd0c0cf6e` | 61,058,356 |
+| `local-validate` (buggy legacy baseline) | `8bb1c7bb78afca87ddd76bf93a7f732d` | 61,198,316 |
+
+**Fixed-legacy and flipped produce byte-identical coverage files on both
+datasets.** The buggy-legacy baseline differs -- its spurious MEMs
+contributed real (but wrong) coverage counts on some nodes.
+
+**Note on `.bin` and `.gaf` MD5s:** On yeast, `mems_path_pos_v2.bin`
+and `alignment.gaf` MD5s differed between fixed-legacy and flipped
+despite identical line counts and byte-identical sorted content
+(diff-sorted returned 0 lines). Root cause: the pipeline sorts
+`mems_path_pos_v2.bin` by `(seq_id, path_bp)` before writing, and when
+multiple records tie on that key, the sort's tie-break is
+implementation-defined and depends on insertion order. Legacy iterates
+left-to-right; flipped iterates right-to-left; same records, different
+insertion order, different tie-break resolution. On HPRC the MD5s
+happened to match -- either fewer ties, or the sort was stable and the
+insertion orders happened to converge. **Neither case affects
+correctness** -- gafpack aggregates records into coverage counts
+regardless of order within a bucket, which is why the coverage file is
+byte-identical either way. If future work wants to make the .bin/gaf
+outputs deterministic across finders, either make the pipeline sort
+stable-with-explicit-tiebreaker or add a secondary sort key.
+
+**Honest Stage 3 perf delta (HPRC chr6, 100K reads):**
+
+| Metric | Fixed-legacy | Flipped | Δ |
+|---|---:|---:|---:|
+| Wall | 40.66s | 34.44s | **-15.3%** |
+| Peak RSS | 4113.61 MB | 4106.73 MB | -0.2% (noise) |
+| Time for finding MEMs | 19.61s | 29.22s | **+49% (Risk C)** |
+| Time for processing MEMs | 17.37s | 1.34s | **-92%** |
+| ├─ First locate (seed) | 15.54s | **0s** | **-100% (Stage 3's win)** |
+| ├─ Locate next | 0.48s | 0.89s | +85% (small absolute) |
+| ├─ Tag queries | 0.55s | 0.34s | -37% |
+| Total MEMs | 100.0K | 100.0K | 0 (identical set) |
+| Total entries written | 1.1M | 1.1M | 0 |
+| Sort time | 0.19s | 0.11s | -42% |
+
+**Wall breakdown of the -15.3% improvement:**
+
+- Seed elimination saves 15.54s (this is the Stage 3 primary win).
+- Locate-next and other processing costs approximately break even
+  (Stage 3 shifts a tiny amount of work, sub-second).
+- MEM finding costs 9.61s more (Risk C: Step 2' does a fresh forward
+  extend that partially duplicates work legacy amortized across its
+  Step 1 and Step 3).
+- Sort saves 0.08s.
+- Net: 15.54 - 9.61 + ~0.1 = ~6s saved, matching the observed 40.66s
+  -> 34.44s = 6.22s delta.
+
+### Interpretation
+
+**Correctness result is stronger than JR-004/JR-005 dared to hope for.**
+The fix isn't just "reduces spurious MEMs" -- fixed-legacy is
+*bit-identical* to flipped at the downstream coverage level, on both
+datasets. Cosigt cannot tell them apart. This retires all doubt about
+whether flipped and legacy compute equivalent biology.
+
+**Honest Stage 3 delta is -15.3% wall on HPRC.** Between the design's
+original 10% projection (§4.4) and JR-003's misleading 28% headline. It
+sits closer to the projection because:
+
+- Design's 10% used a linear cost model where seed cost is 32.2% of
+  walk time on Risk-E-buggy legacy. On Risk-E-fixed legacy the seed's
+  share of processing time is much higher (`15.54 / 17.37 = 89%` of
+  MEM processing), because Risk E was inflating the "other work"
+  denominator. So seed elimination's *relative* impact on find_mems
+  wall goes up.
+- But Stage 2's Step 2' cost is a real -10s hit. Design flagged this
+  as Risk C and said "measure in Stage 4"; now measured.
+
+**Risk C is the biggest opportunity for future work.** Step 2' does
+work that partially duplicates what Step 1' just did (opposite
+direction). A version of the flipped finder that memoized or reused
+Step 1's rightward walk could recover some of the 9.6s -- worth
+investigating in a future entry.
+
+**Peak RSS is essentially identical (4.11 vs 4.11 GB, delta = 7 MB).**
+The 11% RSS drop JR-003 reported vs buggy-legacy was Risk E's fault --
+the ballooning entries vector before sort. Fixed-legacy also benefits
+from that; both paths now use the same in-memory volume.
+
+**Test binary implication:** `bin/test_flipped_mems`'s LEGACY_SPURIOUS
+category is now dead code -- it will always report 0. Could be
+removed, but leaving it in place is defensible as a regression guard:
+if a future refactor of legacy accidentally re-introduces a
+non-left-maximal-emission bug (Risk E or a similar one), this test
+will catch it. Cost: a `count_encoded` call per divergent MEM (i.e.,
+zero on healthy code paths).
+
+### Open questions
+
+1. **Coverage-file identity as a new canonical validation step.**
+   VALIDATION_GUIDE.md currently emphasizes validate_gaf's 2000-sample
+   check. The coverage-file MD5 comparison is objectively stronger --
+   it's the exact bytes cosigt consumes. Consider updating
+   VALIDATION_GUIDE.md to recommend coverage MD5 comparison as the
+   preferred check when a known-good baseline exists.
+2. **Non-deterministic .bin ordering across finders.** Documented as
+   a non-issue for correctness above. If deterministic outputs are
+   ever needed (e.g., for git-based CI diffs), the fix is a stable
+   sort with a total-order tie-breaker in `write_sorted_entries`.
+3. **Risk C mitigation.** Step 2''s work overlap with Step 1' is
+   ~10s / MEM-finding on HPRC. Worth a targeted investigation
+   entry before defaulting to flipped.
+4. **Turning `--use-flipped-mems` on by default.** Now that
+   fixed-legacy == flipped at coverage-file level, the decision is
+   purely about the -15% perf tradeoff. Deferred pending user
+   direction; when it's made, that decision itself should be a JR
+   entry documenting the tradeoff and any rollback plan.
+
+### Commits
+
+- (fix commit, pending as of writing)
+- (journal update commit, pending)
+
+Data artifacts:
+- `runs/v2-yeast235/queries/riske-fixed-legacy/lightweight/`
+- `runs/hprc-chr6-2026-06-02/queries/riske-fixed-legacy/lightweight/`
 
 ---
