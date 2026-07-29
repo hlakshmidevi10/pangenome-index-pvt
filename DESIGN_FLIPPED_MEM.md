@@ -1,12 +1,17 @@
 # Design: Zero-Seed-Cost MEM Finder via Flipped Iteration + R-Index SA Carrying
 
-**Status:** Design document. Algorithm correctness verified empirically (1,014 tests). SA-carrying mechanism specified but not yet implemented. Ready for C++ implementation.
+**Status:** Stages 0-0.85 complete (BWT primitive prerequisite implemented + verified). Stages 1-5 pending. See §5 for the implementation plan and completed prerequisites.
 
 **Branch:** `classify-mem-runs`
 
 **Companion artifacts:**
 - `FINDINGS_SEED_COST.md` — measurement data motivating this design
-- `xy-test/mem-prototype/compare_mem_algorithms.py` — working Python prototype
+- `VALIDATION_GUIDE.md` — validation protocol (100% valid on HPRC chr6 is the E2E bar)
+- `CLAUDE.md` — engineering principles (correctness > performance > minimality > elegance)
+- `xy-test/mem-prototype/compare_mem_algorithms.py` — Python prototype (1,014/1,014 tests establish algorithm correctness)
+- `src/test_r_index_sa.cpp` — Tier-1 unit test pattern (validated `leftmost_c_in_interval` on yeast, 105K+ tests, 0 failures)
+
+**Do not** validate against `xy-test/xy.ri` — it is a known-bad fixture. Use the yeast index at `../mem-projection/pangenome-pipeline/runs/v1-current/yeast235_chrII_100kb_normalized.ri` for local Tier-1 unit tests, and HPRC chr6 (`configs/hprcv1-chr6-alt-reads.env` on the pangenome-pipeline side) for E2E validation via `./query.sh`.
 
 ---
 
@@ -171,23 +176,23 @@ Since `j` is the leftmost `c` in `[sp, ep]` and the c-positions form runs in the
 
 **Computing `j` (the leftmost c-position in `[sp, ep]`):**
 
-Standard formulation: `j = C[c] + rank_c(BWT, sp - 1) + 1` gives the position of the `(rank_c(BWT, sp - 1) + 1)`-th c-occurrence in the BWT. Actually that's the LF formula for the smallest c-occurrence to the right of `sp - 1`. Equivalently: `j = select_c(rank_c(BWT, sp - 1) + 1)`. Requires a select-by-character primitive on the BWT.
+Use `FastLocate::leftmost_c_in_interval(c, sp, ep)` (added in commit `1c9ff21`, see §4.3). Returns `SIZE_MAX` if no `c` exists in the interval — but in Case B we've already narrowed to a non-empty interval that must contain `c`, so a `SIZE_MAX` return here indicates a bug (assert in debug builds).
 
 ### 4.3 Required BWT primitives
 
-The mechanism needs (per backward-extend step):
+Availability audited during Stage 0 (see §5.2). Status:
 
-1. **`BWT[sp]`** — access character at position `sp`. Should be cheap (rank/select on the BWT bitvector or equivalent). Available via `rankAt_encoded` if we're careful about API.
+| Primitive | Available? | Where |
+|---|---|---|
+| `BWT[sp]` — character access at BWT position | ✅ | `FastLocate::bwt_char_at_encoded` (`src/r-index.cpp:519`; made public in commit `1eb0139`) |
+| `rank_c(BWT, sp - 1)` — count of `c` in BWT prefix | ✅ | `FastLocate::rankAt_encoded` (`src/r-index.cpp:576`); also cached inside `backward_extend_encoded` at lines 757-758 |
+| Leftmost `c` in `[sp, ep]` — replaces raw `select_c` | ✅ | `FastLocate::leftmost_c_in_interval` (added in commit `1c9ff21`) |
+| `run_id_at(pos)` and run-start BWT position | ✅ | `FastLocate::run_id_and_offset_at` (`src/r-index.cpp:1212`) |
+| `samples[run_id]` — SA at run start | ✅ | Existing `samples` field |
 
-2. **`rank_c(BWT, sp - 1)`** — number of c-occurrences in `BWT[0..sp-1]`. This is the standard rank primitive; used by `backward_extend_encoded` internally.
+**On "leftmost c" rather than raw `select_c`:** the pangenome-index r-index does not store a general `select_c` over the BWT. Instead, commit `1c9ff21` added per-DNA-character run-start `sd_vector`s (one per char in ACGTN, `~2 MB total` per HPRCv1 chromosome), together with a query `leftmost_c_in_interval(c, sp, ep)` that returns the leftmost BWT position in `[sp, ep]` with `BWT[p] == c`. This is exactly the operation Case B needs, and it exploits the RLE structure (the answer is either `sp` itself when `BWT[sp] == c`, or the start of the leftmost c-run whose start falls in the interval). See `FastLocate::leftmost_c_in_interval` in `src/r-index.cpp:1752` and validation in `src/test_r_index_sa.cpp` (yeast: 105K+ tests, 0 failures).
 
-3. **`select_c(BWT, k)`** — position of the k-th c-occurrence in the BWT. Needed only in Case B. May not be directly available; if not, `j = C[c] + rank_c(BWT, sp - 1) + 1` gives it via the same rank + `C[]` array we already have.
-
-4. **`run_id_at(pos)`** — run id containing BWT position `pos`. Available (used by `run_id_and_offset_at` at `src/r-index.cpp:1212`).
-
-5. **`samples[run_id]`** — SA value at the run's start. Available (already used).
-
-**Primitive availability audit before implementation:** need to verify (1), (2), (3) are directly available or trivially derivable from existing calls. `backward_extend_encoded` already computes some of these internally; may be able to extend it to expose the values we need instead of computing them twice.
+**Overlap with `backward_extend_encoded`:** the existing `backward_extend_encoded` already computes `rank_at_cached_encoded(k)` and `rank_at_cached_encoded(k + s)` (lines 757-758). Case A's check "`BWT[sp] == c` and `sp` is leftmost c" reduces to `rank_cache_k[c] < rank_cache_ks[c]` AND `bwt_char_at_encoded(sp) == c`. The rank comparison is already computed; only the `bwt_char_at_encoded` call is added. So the marginal per-step cost of the SA-carry logic is one `bwt_char_at_encoded` call in the common case (Case A) plus one `leftmost_c_in_interval` call in the rare case (Case B).
 
 ### 4.4 Cost per backward extend step
 
@@ -207,53 +212,85 @@ For the HPRC 100k dataset: seed cost was 22.7M `locateNext` calls; Step 1' walk 
 
 ## 5. C++ implementation plan
 
-### 5.1 Files to modify
+### 5.0 Prerequisites completed
 
-- `include/pangenome_index/algorithm.hpp` — add new `find_all_mems_flipped` and `find_mems_flipped_function` alongside the existing ones (do not replace; run side-by-side for validation).
+**Stage 0 — audit BWT primitives.** Confirmed all except one available (see §4.3 table).
 
-- `include/pangenome_index/r-index.hpp` — extend `bi_interval` to carry an `sa_sp` field (an optional SA value tracked through backward extends). Or add a new struct `bi_interval_with_sa` used only in the flipped code path.
+**Stage 0.5-0.85 — resolve missing primitive.** Instead of a general `select_c` (would require a full BWT wavelet tree, ~25 MB per HPRCv1 chromosome), added per-DNA-character run-start `sd_vector`s (~2 MB) with query `leftmost_c_in_interval`. Rationale: exploits our existing RLE structure; the r-index already stores run boundaries via `blocks_start_pos`, so a mirror-image structure per character is a natural fit.
 
-- `src/r-index.cpp` — add a variant `backward_extend_encoded_with_sa` that computes the standard interval extension AND the SA carry rule. Do not modify the existing `backward_extend_encoded` (used by other code paths).
+- Committed as `1c9ff21`: `r-index: add per-DNA-character run-start bitvectors for select_c` (primitive + `leftmost_c_in_interval` in `src/r-index.cpp:1752`, header field in `include/pangenome_index/r-index.hpp:356-365`).
+- Committed as `1eb0139`: `test: add test_r_index_sa for leftmost_c_in_interval validation` (Tier-1 unit tests + selective exposure of `bwt_char_at_encoded` for tests to reach ground truth).
 
-- `src/find_mems.cpp` — add a lightweight dump path `dump_mem_info_lightweight_flipped` that receives the emitted MEM's `[sp, ep]` AND its `SA[sp]` (from the flipped MEM finder), skipping the `locate_sa_value(sp)` call entirely. Rest of the tag emission walk is identical.
+**Validation of Stage 0.85:**
+- Unit: `bin/test_r_index_sa` on yeast chrII (`../mem-projection/pangenome-pipeline/runs/v1-current/yeast235_chrII_100kb_normalized.ri`, n=337M, 14M runs) — 105K+ tests including structural point queries, edge cases, 100K random `(c, sp, ep)` triples. **Zero failures.**
+- E2E: `./query.sh configs/hprcv1-chr6-alt-reads.env hprc-chr6-2026-06-02 local-validate --gaf` on HPRC chr6 100K alt reads — **100% valid (2000/2000), 0 invalid, 10.23M GAF entries.** find_mems wall 48s vs baseline 48s (0% delta), RSS 4.599 GB vs baseline 4.6 GB (0% delta). Expected zero regression since the new primitive has no callers yet on the hot path.
+
+### 5.1 Files to modify (remaining stages)
+
+- `include/pangenome_index/algorithm.hpp` — add new `find_all_mems_flipped` and `find_mems_flipped_function` alongside the existing ones. Do not replace; run side-by-side for validation. Per CLAUDE.md "Don't break the default path" — legacy behavior stays byte-identical.
+
+- `include/pangenome_index/r-index.hpp` — add a new struct `bi_interval_with_sa` (or equivalent) carrying `bi_interval + sa_sp`, used only in the flipped code path. **Do not** extend the existing `bi_interval` — 5 existing call sites (r-index.cpp:791, algorithm.hpp:633/669/725, forward_extend_encoded) would each pay a memory-layout cost for a field they never use. Decision made during Stage 0 audit.
+
+- `src/r-index.cpp` — add `backward_extend_encoded_with_sa` as a **new function** alongside the existing `backward_extend_encoded` (do not modify the existing; it's called from 5 sites, all of which want the original behavior). Signature draft:
+  ```cpp
+  struct bi_interval_with_sa { bi_interval bint; size_t sa_sp; };
+  bi_interval_with_sa backward_extend_encoded_with_sa(
+      const bi_interval& bint, size_t sa_sp, size_t c) const;
+  ```
+  Return an "empty" result (bint.size == 0) if the extend fails. The initial toehold (very first backward extend from empty match) must be handled specially — see §4.2.
+
+- `src/find_mems.cpp` — add `dump_mem_info_lightweight_flipped` that receives the emitted MEM's `[sp, ep]` AND its `SA[sp]` (from the flipped MEM finder), skipping the `locate_sa_value(sp)` call entirely. Rest of the tag emission walk is identical.
 
 ### 5.2 Rollout stages
 
+Verification bars per CLAUDE.md + VALIDATION_GUIDE.md — every stage that touches output-affecting code paths must pass `--gaf` validation on HPRC chr6 (100% valid / 0 invalid) plus GAF line-count parity with baseline (10,230,764 entries).
+
 **Stage 1: SA-carry primitive standalone.**
-- Implement `backward_extend_encoded_with_sa` in isolation.
-- Write a C++ test (`xy-test/sa_carry_test.cpp` or `tests/`) that: pick random substrings of the test index, run backward extend both ways (with and without SA carry), verify `sa_sp` equals `locate_sa_value(sp)` at each step.
-- Run on `xy.ri` and yeast index. Expect zero mismatches across ~10K trials.
+- Implement `backward_extend_encoded_with_sa` in `src/r-index.cpp` alongside existing `backward_extend_encoded`.
+- Extend `bin/test_r_index_sa` (or add a new binary `bin/test_backward_extend_sa`, following the same pattern) that:
+  - Picks random substrings from the yeast index (do NOT use `xy-test/xy.ri` — known-bad fixture).
+  - For each substring, runs backward-extend character-by-character both ways: (a) with SA carry via new function, (b) without, then calls existing `locate_sa_value(sp)` at each intermediate state.
+  - Assert `sa_sp` from new path equals `locate_sa_value(sp)` at every step.
+  - Also count Case A vs Case B frequencies. Log the ratio (informs Risk B in §5.3).
+- Bar: 10K+ trials on yeast index, **zero mismatches**.
+- E2E: not applicable (new function has no callers yet). Skip.
 
 **Stage 2: Flipped MEM finder.**
-- Implement `find_all_mems_flipped` using `backward_extend_encoded_with_sa` for Step 1' and existing `forward_extend_encoded` for Step 2' (Step 2' doesn't need SA carry).
-- Write a test that runs both `find_all_mems` and `find_all_mems_flipped` on the same reads, diffs the resulting MEM sets. Expect identical MEM sets across all yeast reads.
+- Implement `find_all_mems_flipped` in `include/pangenome_index/algorithm.hpp` using `backward_extend_encoded_with_sa` for Step 1' and existing `forward_extend_encoded` for Step 2'. Step 2' doesn't need SA carry (its purpose is only to identify next-x, not to emit MEMs).
+- Write a test that runs both `find_all_mems` and `find_all_mems_flipped` on yeast reads (`xy-test/yeast_500reads.txt` is fine; the reads themselves aren't part of the "xy" ban), diffs MEM sets.
+- Bar: bitwise-identical `(start, end, bwt_start, size)` tuples across every yeast read. Also verify `sa_sp` returned by flipped equals `locate_sa_value(bwt_start)` computed via the legacy path — this is the correctness check that ties the algorithm-level result back to the primitive-level guarantee.
+- E2E: not applicable yet (find_mems still uses the legacy path).
 
 **Stage 3: Zero-seed-cost dump path.**
-- Implement `dump_mem_info_lightweight_flipped` that takes `(mem, sa_sp)` and emits tags via `locateNext` from `sa_sp`. No `locate_sa_value` call.
-- Wire it into `find_mems` main as an alternative code path behind a flag (e.g., `--use-flipped-mems`).
-- Verify TSV output is identical to the current path (bitwise, sorted).
+- Implement `dump_mem_info_lightweight_flipped` in `src/find_mems.cpp` that takes `(mem, sa_sp)` and emits tags via `locateNext` from `sa_sp`. **No `locate_sa_value` call.**
+- Wire into `find_mems` main behind a new flag `--use-flipped-mems` (default off). Default path remains byte-identical per CLAUDE.md.
+- Bar (unit): TSV output with `--use-flipped-mems` on yeast 500 reads is bitwise-identical to legacy output (after sorting, since order may differ).
+- Bar (E2E): `./query.sh configs/hprcv1-chr6-alt-reads.env hprc-chr6-2026-06-02 stage3-flipped --gaf` with the flipped path enabled. **Must show 100% valid, 0 invalid.** GAF line count must match baseline (10,230,764 entries) exactly — line-count parity catches silently-dropped MEMs that `validate_gaf` would miss.
 
 **Stage 4: Benchmark.**
-- Run both paths on yeast 500 reads and HPRCv1 chr6 (both 1k sample and full 100k).
-- Compare wall time via `--time-per-read` or the existing `SUMMARY.tsv` timing.
-- Expected: `find_mems` phase drops by ~10% end-to-end on HPRCv1 chr6 full.
+- Run flipped vs legacy on HPRC chr6 100K reads via `./query.sh`. Compare `timing_summary.txt`.
+- Target: find_mems wall reduction ≈ 10% (per §4.4 projection).
+- Bar: no RSS regression >10%; --gaf still 100% valid as regression check.
+- If wall doesn't drop, or drops less than 3%: revisit Case B frequency (Risk B in §5.3). If Case B dominates due to short intervals inside long runs, mitigation options open.
 
 **Stage 5: Ship.**
-- If Stage 4 confirms projection, make flipped path the default. Keep current path behind `--use-legacy-mems` for regression testing.
-- Update `FINDINGS_SEED_COST.md` with measured results.
-- Commit + push.
+- If Stage 4 confirms projection: make flipped path the default. Keep legacy behind `--use-legacy-mems` for regression testing.
+- Update `FINDINGS_SEED_COST.md` with measured results (replace "projected" with "measured" numbers).
+- Local commits ready for eventual push (user has instructed no automatic pushes).
 
 ### 5.3 Risks
 
-**Risk A: BWT primitives not available.** If `select_c` or leftmost-c-in-interval turns out to require a new BWT scan or a significantly more expensive derivation, Case B of the SA carry rule becomes expensive. Mitigation: audit primitive availability at Stage 0 (before any code); if missing, consider precomputing what's needed or restructuring the invariant to avoid Case B (e.g., always track SA at `ep` instead of `sp`, then walk `locateNext` from a stored `SA[sp]` at Step 1' completion — reverts partial benefit).
+**Risk A: BWT primitives not available.** ~~If `select_c` or leftmost-c-in-interval turns out to require a new BWT scan or a significantly more expensive derivation, Case B of the SA carry rule becomes expensive.~~ **RESOLVED in Stage 0.85.** Added `leftmost_c_in_interval` via per-DNA-character run-start `sd_vector`s. Storage overhead ~2 MB per HPRCv1 chromosome (measured by E2E: RSS unchanged from baseline). Case B query is O(1) fast-path (BWT[sp] == c) + O(log r) fallback (successor on the per-c bitvector).
 
-**Risk B: Case B is more common than expected.** The projected win assumes Case A dominates (fast LF-decrement path). If Case B fires on most backward extends, per-step cost climbs and win diminishes. Mitigation: instrument the primitive with Case A / Case B counters during Stage 1 testing. If Case B > 50% of steps, revisit design.
+**Risk B: Case B is more common than expected.** The projected win assumes Case A dominates (fast LF-decrement path). If Case B fires on most backward extends, per-step cost climbs and win diminishes. Mitigation: **Stage 1's test must include Case A / Case B frequency counters** and log the ratio. If Case B > 50% of steps on realistic reads, revisit design (options: (a) larger per-c bitvector coverage, (b) fall back to `locate_sa_value` when Case B is deep in a long run so amortized savings still win).
 
-**Risk C: Step 2' doubles pattern-extension work.** The current algorithm does Step 1 (min_len chars) + Step 2 (MEM extension) + Step 3 (up to MEM length). The flipped does Step 1' (MEM length) + Step 2' (MEM length + 1). Total extension work roughly comparable but the split is different. Actual wall impact depends on `backward_extend_encoded` vs `forward_extend_encoded` cost ratio. Mitigation: measure in Stage 4; if Step 2' overhead cancels seed cost savings, reconsider.
+**Risk C: Step 2' doubles pattern-extension work.** The current algorithm does Step 1 (min_len chars) + Step 2 (MEM extension) + Step 3 (up to MEM length). The flipped does Step 1' (MEM length) + Step 2' (MEM length + 1). Total extension work roughly comparable but the split is different. Actual wall impact depends on `backward_extend_encoded` vs `forward_extend_encoded` cost ratio (forward_extend is swap → backward_extend → swap, so ~2x per char). Mitigation: measure in Stage 4; if Step 2' overhead cancels seed cost savings, evaluate whether Step 2' can be trimmed (e.g., early termination heuristics).
 
-**Risk D: bugs during backward extend's early termination.** If Step 1' terminates because interval size drops below `min_occ` at position `j`, the SA carry state was updated for the *pre-termination* interval, not the failed one. Need to be careful about which state is returned and how it interacts with the "no MEM emitted" outcome. Mitigation: prototype the exact state machine in Python before C++.
+**Risk D: bugs during backward extend's early termination.** If Step 1' terminates because interval size drops below `min_occ` at position `j`, the SA carry state was updated for the *pre-termination* interval, not the failed one. Need to be careful about which state is returned and how it interacts with the "no MEM emitted" outcome. Mitigation: the Python prototype at `xy-test/mem-prototype/compare_mem_algorithms.py` handles this correctly (state is the last-successful interval's SA, not the failed one). C++ implementation should mirror the Python state machine exactly. Stage 1's unit test explicitly covers this by verifying `sa_sp` matches `locate_sa_value` at every step, including the last successful one before failure.
 
-**Risk E: the current algorithm's Step 3 out-of-bounds bug** (accessing `P[len]` when Step 2 extends to end). Doesn't affect the flipped path directly (Step 2' handles the boundary condition), but should be fixed independently to avoid latent UB in the current path. Mitigation: fix as a separate commit before adding new code paths.
+**Risk E: the current algorithm's Step 3 out-of-bounds bug** (accessing `P[len]` when Step 2 extends to end). Doesn't affect the flipped path directly (Step 2' handles the boundary condition), but should be fixed independently to avoid latent UB in the current path. Mitigation: fix as a separate commit before adding new code paths. Tracked as an independent todo item.
+
+**Risk F: Validation surface is downstream, not local.** find_mems output feeds gafpack → validate_gaf → cosigt. A bug in the flipped path could produce MEMs that pass local unit tests but corrupt downstream variant calls. Mitigation: Stage 3 gate requires `./query.sh ... --gaf` to show 100% valid AND GAF line-count parity. Anything less is a hard stop. See VALIDATION_GUIDE.md.
 
 ---
 
