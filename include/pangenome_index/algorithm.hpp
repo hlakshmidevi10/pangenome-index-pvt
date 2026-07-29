@@ -761,6 +761,158 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
     }
 
 
+// ---------------------------------------------------------------------------
+// Flipped MEM finder (see DESIGN_FLIPPED_MEM.md sections 3 and 5.2 Stage 2).
+//
+// Right-to-left outer loop. Each iteration:
+//   Step 1'  Backward-extend from anchor x leftward using the SA-carrying
+//            primitive (see backward_extend_encoded_with_sa). Stops when the
+//            interval collapses below min_occ or reaches pattern[0]. Emits a
+//            MEM if the matched length is at least min_len.
+//   Step 2'  Fresh forward-extend from pattern[i - 1] rightward, using the
+//            existing forward_extend_encoded (no SA carry needed here: the
+//            purpose is only to identify the next right-anchor).
+//
+// C++ port of xy-test/mem-prototype/compare_mem_algorithms.py which was
+// verified against a brute-force oracle across 1,014 cases (see the design
+// doc). This port faithfully mirrors the Python state machine, including
+// edge cases: Step 2' runs even when no MEM was emitted (short match), and
+// i == 0 forces outer-loop termination.
+//
+// Termination sentinel: outer loop uses SIZE_MAX to mean "stop iterating".
+// Python used -1; we use SIZE_MAX to stay in unsigned arithmetic and
+// preserve the natural end condition `x >= len`.
+// ---------------------------------------------------------------------------
+
+    struct MEM_with_sa {
+        size_t start;              // inclusive
+        size_t end;                // exclusive; MEM string is pattern[start..end)
+        size_t bwt_start;          // == bint.forward at emission
+        int64_t size;              // occurrence count (== bint.size)
+        FastLocate::size_type sa_sp;  // SA[bwt_start], carried in for free
+
+        // Downcast to the legacy MEM struct for comparison tests. Discards
+        // sa_sp; only the four fields the legacy code cares about survive.
+        MEM to_legacy() const {
+            return MEM{start, end, bwt_start, size};
+        }
+    };
+
+    // Advance-anchor helper for Step 2'. Runs a fresh forward-extend from
+    // pattern[i - 1] rightward until the interval collapses or we hit the
+    // pattern's right boundary. Returns the next right-anchor for the outer
+    // loop, or SIZE_MAX to terminate. See design doc section 3.1 Step 2'.
+    //
+    // Extracted because Step 2' runs both when a MEM was emitted and when the
+    // Step 1' match was too short to emit; inlining twice would duplicate the
+    // termination logic and risk drift.
+    inline size_t flipped_advance_anchor(const std::string& pattern, size_t min_occ,
+                                          size_t i, FastLocate& fmd_index) {
+        // MEM (or short match) covered the pattern's left edge -- no seed
+        // character available for the forward extend. All anchors to the
+        // left of i are inside the just-emitted (or attempted) match, so we
+        // are done enumerating.
+        if (i == 0) return SIZE_MAX;
+
+        const size_t len = pattern.length();
+        FastLocate::bi_interval fwd{0, 0, fmd_index.bwt_size()};
+        size_t j = i - 1;
+        while (j < len) {
+            fwd = fmd_index.forward_extend_encoded(fwd, static_cast<size_t>(pattern[j]));
+            if (fwd.size < static_cast<int64_t>(min_occ) || fwd.size <= 0) {
+                // Failed at j; last successful extend ended at j - 1. That
+                // becomes the next anchor. j >= i - 1 >= 0, and since the
+                // very first character (j == i - 1) is at least min_occ
+                // occurring in the text (it's a single character; unless the
+                // char literally doesn't appear at all), typically j > 0 here.
+                if (j == 0) return SIZE_MAX;
+                return j - 1;
+            }
+            ++j;
+        }
+        // Reached the pattern's right boundary without failure. Every position
+        // from i-1 onward is inside a successful extension; no more distinct
+        // right-anchors to process.
+        return SIZE_MAX;
+    }
+
+    // Process a single right-anchor x. Emits at most one MEM into output and
+    // returns the next anchor (or SIZE_MAX to terminate). Faithful port of
+    // find_mems_flipped_at_x in the Python prototype.
+    inline size_t find_mems_flipped_function(const std::string& pattern, size_t min_len,
+                                              size_t min_occ, size_t x,
+                                              FastLocate& fmd_index,
+                                              std::vector<MEM_with_sa>& output) {
+        const size_t len = pattern.length();
+        // Guard: if the remaining prefix pattern[0..x] is shorter than min_len,
+        // no MEM can start at or before x. Terminate.
+        if (x + 1 < min_len) return SIZE_MAX;
+
+        // Step 1': backward-extend from x leftward. Track the leftmost
+        // successful position (i) and the interval's SA-carry state.
+        FastLocate::bi_interval bint{0, 0, fmd_index.bwt_size()};
+        FastLocate::bi_interval last_good_bint = bint;  // holds the last-successful interval
+        FastLocate::size_type last_good_sa = FastLocate::NO_POSITION;
+        FastLocate::size_type sa_sp = FastLocate::NO_POSITION;
+        size_t i = x + 1;  // sentinel meaning "never succeeded"; will become the leftmost successful pos
+        for (size_t j_plus_one = x + 1; j_plus_one > 0; --j_plus_one) {
+            const size_t j = j_plus_one - 1;
+            auto step = fmd_index.backward_extend_encoded_with_sa(bint, sa_sp, static_cast<size_t>(pattern[j]));
+            if (step.bint.size < static_cast<int64_t>(min_occ) || step.bint.size <= 0) {
+                break;  // extension at j failed; the last successful interval is at position (j + 1)..x
+            }
+            // Extension succeeded through position j.
+            bint = step.bint;
+            sa_sp = step.sa_sp;
+            last_good_bint = bint;
+            last_good_sa = sa_sp;
+            i = j;
+        }
+
+        // If Step 1' never succeeded (even the very first backward-extend at
+        // pattern[x] dropped below min_occ), no MEM at this anchor; advance to
+        // x - 1. This matches the Python prototype's `if i > x: return x - 1`
+        // branch. Guard against x == 0 (which would underflow).
+        if (i > x) {
+            if (x == 0) return SIZE_MAX;
+            return x - 1;
+        }
+
+        // Emit MEM only if its length meets the min_len bar. If it doesn't,
+        // we STILL run Step 2' below to compute the next anchor -- that's
+        // the state machine the Python prototype implements and that the
+        // brute-force verification validates.
+        const size_t mem_len = x - i + 1;
+        if (mem_len >= min_len) {
+            output.push_back({
+                /* start     */ i,
+                /* end       */ x + 1,
+                /* bwt_start */ last_good_bint.forward,
+                /* size      */ last_good_bint.size,
+                /* sa_sp     */ last_good_sa
+            });
+        }
+
+        return flipped_advance_anchor(pattern, min_occ, i, fmd_index);
+    }
+
+    // Outer loop for the flipped finder. Mirror of find_all_mems, iterating
+    // anchors right-to-left. Returns MEMs in reverse-emission order; callers
+    // that need left-to-right order should sort by `start`.
+    inline std::vector<MEM_with_sa> find_all_mems_flipped(const std::string& pattern,
+                                                          size_t min_len, size_t min_occ,
+                                                          FastLocate& fmd_index) {
+        std::vector<MEM_with_sa> mems;
+        const size_t len = pattern.length();
+        if (len == 0) return mems;
+        size_t x = len - 1;
+        while (x != SIZE_MAX && x < len) {
+            x = find_mems_flipped_function(pattern, min_len, min_occ, x, fmd_index, mems);
+        }
+        return mems;
+    }
+
+
 
 
 
