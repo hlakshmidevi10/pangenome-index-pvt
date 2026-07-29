@@ -763,21 +763,25 @@ namespace panindexer {
             return this->blocks_encoded_start_bits.size();
         }
 
+        // Public read-only access to BWT character at a specific position.
+        // Needed by verification tests (bin/test_r_index_sa) that scan the
+        // BWT to build brute-force ground truth for select_c-like queries.
+        // Handles both encoded and legacy formats.
+        size_t bwt_char_at_encoded(size_t idx) const;
+
     private:
         void copy(const FastLocate &source);
 
 
-        void bwt_index_run_id(unsigned long idx, gbwt::range_type &run, size_type &run_id);
-
-
         size_t bwt_char_at(size_t idx) const;
 
-        // Encoded helpers
-        size_t bwt_char_at_encoded(size_t idx) const;
+        // Encoded helpers -- private; exposed only as needed by tests.
         size_t rankAt_encoded(size_t pos, size_t symbol, size_t &run_id, size_t &current_position) const;
         std::vector<size_t> rank_at_cached_encoded(size_t pos) const;
         std::pair<size_t, size_t> psi_encoded(size_t idx);
         std::pair<size_t, size_t> psi_and_run_id_encoded(size_t idx, size_t &run_id, size_t &current_position);
+
+        void bwt_index_run_id(unsigned long idx, gbwt::range_type &run, size_type &run_id);
         
         // Centralized per-block encoded operations helper
         struct EncodedBlock {
