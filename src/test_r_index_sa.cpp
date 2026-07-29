@@ -6,9 +6,12 @@
 //
 // Usage: bin/test_r_index_sa <r_index_file>
 //
-// IMPORTANT: use trusted r-index files only (e.g. the yeast chrII index at
-// runs/v1-current/yeast235_chrII_100kb_normalized.ri, or HPRCv1 chr6 on
-// vesuvio). Do NOT use xy-test/xy.ri -- it is a known-bad fixture.
+// IMPORTANT: use the canonical validation r-index listed in
+// VALIDATION_GUIDE.md:
+//   ../mem-projection/pangenome-pipeline/runs/v2-yeast235/
+//       yeast235_chrII_100kb_normalized.ri
+// or HPRCv1 chr6 on vesuvio (runs/hprc-chr6-2026-06-02/). Do NOT use
+// xy-test/xy.ri -- it is a known-bad fixture.
 //
 // Rationale: this primitive is used by the SA-carrying rule in the flipped
 // MEM finder (see DESIGN_FLIPPED_MEM.md section 4). Correctness is
@@ -160,7 +163,10 @@ void verify_marker_positions(FastLocate& idx, TestStats& stats) {
     // claim of "leftmost c in [pos, pos]".
     // This is O(n) but only runs once and gives a strong structural check.
     const size_t n = idx.sequence_size;
-    // Skip if huge; for xy.ri this should be small.
+    // Skip when the BWT is large: the O(n) walk is only intended for tiny
+    // toy indexes. On the canonical yeast index (n ~ 3.4e8) and HPRC chr6
+    // (n ~ 3e9) this branch always fires; the random-tests suite provides
+    // coverage there.
     if (n > 5'000'000) {
         std::cerr << "    (skipping full-BWT structural check: n=" << n
                   << " too large)" << std::endl;

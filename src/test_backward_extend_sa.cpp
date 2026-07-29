@@ -32,9 +32,12 @@
 // Usage: bin/test_backward_extend_sa <r_index_file> [num_random_trials=5000]
 //                                    [num_text_trials=5000] [seed=42]
 //
-// IMPORTANT: use trusted r-index files only (yeast chrII index at
-// runs/v1-current/yeast235_chrII_100kb_normalized.ri, or HPRCv1 chr6 on
-// vesuvio). Do NOT use xy-test/xy.ri -- it is a known-bad fixture.
+// IMPORTANT: use the canonical validation r-index listed in
+// VALIDATION_GUIDE.md:
+//   ../mem-projection/pangenome-pipeline/runs/v2-yeast235/
+//       yeast235_chrII_100kb_normalized.ri
+// or HPRCv1 chr6 on vesuvio (runs/hprc-chr6-2026-06-02/). Do NOT use
+// xy-test/xy.ri -- it is a known-bad fixture.
 
 #include <pangenome_index/r-index.hpp>
 

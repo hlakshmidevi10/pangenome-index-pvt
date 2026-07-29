@@ -11,7 +11,11 @@
 - `xy-test/mem-prototype/compare_mem_algorithms.py` — Python prototype (1,014/1,014 tests establish algorithm correctness)
 - `src/test_r_index_sa.cpp` — Tier-1 unit test pattern (validated `leftmost_c_in_interval` on yeast, 105K+ tests, 0 failures)
 
-**Do not** validate against `xy-test/xy.ri` — it is a known-bad fixture. Use the yeast index at `../mem-projection/pangenome-pipeline/runs/v1-current/yeast235_chrII_100kb_normalized.ri` for local Tier-1 unit tests, and HPRC chr6 (`configs/hprcv1-chr6-alt-reads.env` on the pangenome-pipeline side) for E2E validation via `./query.sh`.
+**Do not** validate against `xy-test/xy.ri` — it is a known-bad fixture. Use the canonical validation datasets from `VALIDATION_GUIDE.md`:
+- Yeast (fast iteration): `../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri` with reads at `../mem-projection/yeast-235/yeast-235-chrI/S288C_chrII_N100K_R1_200_reads.txt` (config `configs/yeast235-chrII-normalized.env`).
+- HPRC chr6 (production scale): `../mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/hprcv1_chr6.ri` with reads at `../mem-projection/hprcv1/chr6.alt.reads.txt` (config `configs/hprcv1-chr6-alt-reads.env`).
+
+Any subsetting (e.g., a "500 reads" quick loop) must be a deterministic prefix of the canonical reads file — pass `[max_reads=N]` to the test binaries rather than committing a separate on-disk subset.
 
 ---
 
@@ -222,7 +226,7 @@ For the HPRC 100k dataset: seed cost was 22.7M `locateNext` calls; Step 1' walk 
 - Committed as `1eb0139`: `test: add test_r_index_sa for leftmost_c_in_interval validation` (Tier-1 unit tests + selective exposure of `bwt_char_at_encoded` for tests to reach ground truth).
 
 **Validation of Stage 0.85:**
-- Unit: `bin/test_r_index_sa` on yeast chrII (`../mem-projection/pangenome-pipeline/runs/v1-current/yeast235_chrII_100kb_normalized.ri`, n=337M, 14M runs) — 105K+ tests including structural point queries, edge cases, 100K random `(c, sp, ep)` triples. **Zero failures.**
+- Unit: `bin/test_r_index_sa` on yeast chrII (`../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri`, n=337M, 14M runs) — 105K+ tests including structural point queries, edge cases, 100K random `(c, sp, ep)` triples. **Zero failures.**
 - E2E: `./query.sh configs/hprcv1-chr6-alt-reads.env hprc-chr6-2026-06-02 local-validate --gaf` on HPRC chr6 100K alt reads — **100% valid (2000/2000), 0 invalid, 10.23M GAF entries.** find_mems wall 48s vs baseline 48s (0% delta), RSS 4.599 GB vs baseline 4.6 GB (0% delta). Expected zero regression since the new primitive has no callers yet on the hot path.
 
 ### 5.1 Files to modify (remaining stages)
@@ -257,7 +261,7 @@ Verification bars per CLAUDE.md + VALIDATION_GUIDE.md — every stage that touch
 
 **Stage 2: Flipped MEM finder.**
 - Implement `find_all_mems_flipped` in `include/pangenome_index/algorithm.hpp` using `backward_extend_encoded_with_sa` for Step 1' and existing `forward_extend_encoded` for Step 2'. Step 2' doesn't need SA carry (its purpose is only to identify next-x, not to emit MEMs).
-- Write a test that runs both `find_all_mems` and `find_all_mems_flipped` on yeast reads (`xy-test/yeast_500reads.txt` is fine; the reads themselves aren't part of the "xy" ban), diffs MEM sets.
+- Write a test that runs both `find_all_mems` and `find_all_mems_flipped` on the canonical yeast reads (`../mem-projection/yeast-235/yeast-235-chrI/S288C_chrII_N100K_R1_200_reads.txt`, subsetted via `max_reads` for iteration speed), diffs MEM sets.
 - Bar: bitwise-identical `(start, end, bwt_start, size)` tuples across every yeast read. Also verify `sa_sp` returned by flipped equals `locate_sa_value(bwt_start)` computed via the legacy path — this is the correctness check that ties the algorithm-level result back to the primitive-level guarantee.
 - E2E: not applicable yet (find_mems still uses the legacy path).
 
