@@ -875,6 +875,57 @@ namespace panindexer {
         return bi_interval(k, k_prime, s);
     }
 
+    // Rank-in variant of backward_extend_encoded: the caller supplies the two
+    // rank_at_cached_encoded outputs (at k and at k + s) that the original
+    // computes internally.  Body is otherwise byte-identical to
+    // backward_extend_encoded above -- lifting the two rank calls out lets
+    // backward_extend_encoded_with_sa (sub-step 7) reuse the ranks it already
+    // produces via scan_at, eliminating one full pred+block-walk per SA-carry
+    // step (JR-010 root-cause fix).
+    //
+    // Encoded path only -- callers are the flipped-MEM code path, which is
+    // never entered on non-encoded indices (find_mems asserts encoded=true).
+    // Non-encoded consumers keep using backward_extend_encoded's own wrapper
+    // to backward_extend.
+    //
+    // Contract on the rank vectors: both must be sym_map-ordered vectors of
+    // size C.size(), i.e. exactly what rank_at_cached_encoded returns and
+    // what scan_at populates in block_scan_result::ranks.  No shape check
+    // in release builds; the caller carries the invariant.
+    FastLocate::bi_interval FastLocate::backward_extend_encoded_with_ranks(
+            const bi_interval& bint, size_t a,
+            const std::vector<size_t>& rank_cache_k,
+            const std::vector<size_t>& rank_cache_ks) const {
+        size_t k = bint.forward;
+        size_t k_prime = bint.reverse;
+        int64_t s = bint.size;
+
+        // Advance over codes strictly smaller than complement(a) in sym_map order.
+        const size_t comp_sym = this->complement(a);
+        const size_t comp_idx = this->sym_map[comp_sym];
+        std::vector<size_t> code_to_symbol_vec(this->C.size(), static_cast<size_t>(NENDMARKER));
+        for (size_t i = 0; i < nuc.size(); i++) {
+            size_t sym = static_cast<size_t>(nuc[i]);
+            size_t code = static_cast<size_t>(this->sym_map[sym]);
+            if (code < code_to_symbol_vec.size()) { code_to_symbol_vec[code] = sym; }
+        }
+        for (size_t code = 0; code < comp_idx; ++code) {
+            size_t sym = code_to_symbol_vec[code];
+            size_t comp_of_sym = this->complement(sym);
+            size_t comp_code = static_cast<size_t>(this->sym_map[comp_of_sym]);
+            if (comp_code < rank_cache_ks.size()) {
+                k_prime += (rank_cache_ks[comp_code] - rank_cache_k[comp_code]);
+            }
+        }
+
+        auto rank_ks = rank_cache_ks[this->sym_map[a]];
+        auto rank_k = rank_cache_k[this->sym_map[a]];
+        if (rank_k >= rank_ks) { return bi_interval(0, 0, 0); }
+        s = rank_ks - rank_k;
+        k = rank_k + this->C[this->sym_map[a]];
+        return bi_interval(k, k_prime, s);
+    }
+
     FastLocate::bi_interval FastLocate::forward_extend_encoded(const bi_interval& bint, size_t symbol) {
         if (!this->is_encoded()) { return this->forward_extend(bint, symbol); }
         bi_interval tmp = bi_interval(bint.reverse, bint.forward, bint.size);

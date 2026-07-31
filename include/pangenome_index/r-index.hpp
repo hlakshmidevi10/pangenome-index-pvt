@@ -452,6 +452,18 @@ namespace panindexer {
         bi_interval backward_extend_encoded(const bi_interval& bint, size_t symbol);
         bi_interval forward_extend_encoded(const bi_interval& bint, size_t symbol);
 
+        // Rank-in variant of backward_extend_encoded.  The two rank vectors
+        // must be rank_at_cached_encoded outputs (or scan_at.ranks) at
+        // bint.forward and bint.forward + bint.size respectively.  Body is
+        // otherwise byte-identical to backward_extend_encoded.  Used by
+        // backward_extend_encoded_with_sa (sub-step 7) to avoid recomputing
+        // ranks that scan_at already produced -- see DESIGN_FLIPPED_MEM.md
+        // section 5 / sub-step 4 for the JR-010 rationale.  Encoded path only.
+        bi_interval backward_extend_encoded_with_ranks(
+            const bi_interval& bint, size_t symbol,
+            const std::vector<size_t>& rank_cache_k,
+            const std::vector<size_t>& rank_cache_ks) const;
+
         // SA-carrying backward extend (see DESIGN_FLIPPED_MEM.md section 4).
         //
         // Carries SA[sp] through a chain of backward extends at O(rank) marginal
