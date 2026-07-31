@@ -428,6 +428,9 @@ namespace panindexer {
             this->blocks[i].load(in);
         }
 
+        // Eager parallel-array build; see load_encoded for rationale.  The
+        // non-encoded path exercises the same run walker.
+        this->ensure_run_head_c_built();
     }
 
     void
@@ -483,6 +486,13 @@ namespace panindexer {
         // Clear materialized blocks to save memory in encoded path
         this->blocks.clear();
         this->block_size = (this->encoded_block_size != 0 ? this->encoded_block_size : this->block_size);
+
+        // Eagerly build the parallel run-head-per-DNA-char bitvector.  Cost
+        // is one pass over all runs (a few MB of small allocations, once
+        // per load).  See ensure_run_head_c_built for why we don't
+        // serialize this to disk -- it's cheap to rebuild and lets old
+        // .ri files load without a format bump.
+        this->ensure_run_head_c_built();
     }
 
     void
@@ -1991,6 +2001,100 @@ size_t FastLocate::leftmost_c_in_interval(size_t c, size_t sp, size_t ep) const 
     const auto& bv = this->run_starts_by_char[idx];
     auto iter = bv.successor(sp + 1);
     if (iter == bv.one_end() || iter->second > ep) return SIZE_MAX;
+    return iter->second;
+}
+
+// ---------------------------------------------------------------------------
+// Parallel per-DNA-character RUN-HEAD bitvector (indexed by run id, not BWT
+// position).  Complement to run_starts_by_char, which is indexed by BWT
+// position.  See r-index.hpp for design intent (JR-010 Case B fast path).
+// ---------------------------------------------------------------------------
+
+void FastLocate::ensure_run_head_c_built() const {
+    std::call_once(this->run_head_c_once, [this]() {
+        const size_t total_runs = this->samples.size();
+
+        // First pass: count run-heads per DNA character.  Also verify that
+        // the run count matches samples.size() -- if it drifts we would
+        // silently corrupt Case B's SA lookups.
+        std::array<size_t, DNA_ALPHABET_SIZE> counts{};
+        counts.fill(0);
+
+        const size_t num_blocks = !this->blocks.empty()
+            ? this->blocks.size()
+            : this->blocks_encoded_start_bits.size();
+
+        size_t run_id_seen = 0;
+        {
+            std::vector<std::pair<size_t, size_t>> runs;
+            for (size_t bid = 0; bid < num_blocks; ++bid) {
+                this->get_block_runs(bid, runs);
+                for (const auto& r : runs) {
+                    size_t idx = FastLocate::dna_char_to_idx(r.first);
+                    if (idx < DNA_ALPHABET_SIZE) counts[idx]++;
+                    ++run_id_seen;
+                }
+            }
+        }
+
+        // Sanity: the run walk must land exactly on samples.size().  If the
+        // BWT stream had NENDMARKER runs those are counted here too --
+        // matches how run_id_and_offset_at numbers them.
+        if (run_id_seen != total_runs) {
+            std::cerr << "[run_head_c build] WARNING: run_id_seen=" << run_id_seen
+                      << " does not match samples.size()=" << total_runs
+                      << "; the successor-over-run-id fast path in "
+                      << "backward_extend_encoded_with_sa may be incorrect. "
+                      << "Continuing with the larger of the two."
+                      << std::endl;
+        }
+        const size_t universe = std::max(total_runs, run_id_seen);
+
+        // Allocate builders.
+        std::array<std::unique_ptr<sdsl::sd_vector_builder>, DNA_ALPHABET_SIZE> builders;
+        for (size_t i = 0; i < DNA_ALPHABET_SIZE; ++i) {
+            builders[i] = std::make_unique<sdsl::sd_vector_builder>(universe, counts[i]);
+        }
+
+        // Second pass: populate.
+        {
+            std::vector<std::pair<size_t, size_t>> runs;
+            size_t rid = 0;
+            for (size_t bid = 0; bid < num_blocks; ++bid) {
+                this->get_block_runs(bid, runs);
+                for (const auto& r : runs) {
+                    size_t idx = FastLocate::dna_char_to_idx(r.first);
+                    if (idx < DNA_ALPHABET_SIZE) {
+                        builders[idx]->set(rid);
+                    }
+                    ++rid;
+                }
+            }
+        }
+
+        for (size_t i = 0; i < DNA_ALPHABET_SIZE; ++i) {
+            this->run_head_c[i] = sdsl::sd_vector<>(*builders[i]);
+        }
+    });
+}
+
+int FastLocate::run_head_c_at(size_t c, size_t r) const {
+    size_t idx = FastLocate::dna_char_to_idx(c);
+    if (idx >= DNA_ALPHABET_SIZE) return 0;
+    this->ensure_run_head_c_built();
+    const auto& bv = this->run_head_c[idx];
+    if (r >= bv.size()) return 0;
+    return bv[r] ? 1 : 0;
+}
+
+size_t FastLocate::next_run_with_head_c(size_t c, size_t start_from) const {
+    size_t idx = FastLocate::dna_char_to_idx(c);
+    if (idx >= DNA_ALPHABET_SIZE) return SIZE_MAX;
+    this->ensure_run_head_c_built();
+    const auto& bv = this->run_head_c[idx];
+    if (start_from >= bv.size()) return SIZE_MAX;
+    auto iter = bv.successor(start_from);
+    if (iter == bv.one_end()) return SIZE_MAX;
     return iter->second;
 }
 

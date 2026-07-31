@@ -61,7 +61,7 @@ using size_type = FastLocate::size_type;
 // remains a self-contained TODO list -- grep for "TEST_..._IMPLEMENTED 0"
 // and you have the outstanding work.
 #define TEST_SCAN_AT_IMPLEMENTED 1
-#define TEST_RUN_HEAD_C_IMPLEMENTED 0
+#define TEST_RUN_HEAD_C_IMPLEMENTED 1
 
 namespace {
 

@@ -377,6 +377,45 @@ namespace panindexer {
         // leftmost_c_in_interval query. Idempotent.
         void ensure_run_starts_by_char_built() const;
 
+        // Parallel per-DNA-character run-head bitvector, indexed by RUN ID
+        // rather than BWT position.  run_head_c[c][r] == 1 iff run r's head
+        // character (BWT[run_start_of(r)]) equals c.
+        //
+        // Purpose: enable O(log r) 'find the next run whose head is c'
+        // via successor over samples-index space, replacing today's
+        // leftmost_c_in_interval walk (a bwt_char_at_encoded call +
+        // successor over BWT-position space) inside Case B of
+        // backward_extend_encoded_with_sa.  Because samples[r] is the SA
+        // value at run r's start, once we know the next c-headed run's
+        // id we can read the SA directly with no extra locate walk.
+        //
+        // Built eagerly at load time (see ensure_run_head_c_built,
+        // called from load_encoded / load).  Sized over
+        // samples.size() -- the same run count that indexes samples[].
+        // Not serialized: rebuilt from the block stream on each load.
+        mutable std::array<sdsl::sd_vector<>, DNA_ALPHABET_SIZE> run_head_c;
+        mutable std::array<sdsl::sd_vector<>::rank_1_type, DNA_ALPHABET_SIZE> run_head_c_rank;
+        mutable std::once_flag run_head_c_once;
+        // Per-character flags for lazy successor-support construction.
+        mutable std::array<std::once_flag, DNA_ALPHABET_SIZE> run_head_c_rank_once;
+
+        // Build run_head_c[0..4].  Idempotent (guarded by run_head_c_once).
+        // Called eagerly at the end of load_encoded / load, but safe to
+        // call from anywhere -- accessors like run_head_c_at do call it
+        // defensively.
+        void ensure_run_head_c_built() const;
+
+        // Test-facing accessor: return 1 iff run r's head character is c.
+        // c is a raw DNA byte ('A','C','G','T','N').  Returns 0 for any
+        // non-DNA c or out-of-range r.  Safe to call before the eager
+        // build (triggers the lazy build).
+        int run_head_c_at(size_t c, size_t r) const;
+
+        // Sub-step 7 will use this to answer 'smallest run id > start_from
+        // whose head char equals c'.  Returns SIZE_MAX if no such run
+        // exists.  O(log r) via successor.
+        size_t next_run_with_head_c(size_t c, size_t start_from) const;
+
         // Find the leftmost BWT position p in [sp, ep] such that BWT[p] == c,
         // where c is a raw DNA character byte ('A','C','G','T','N'). Returns
         // SIZE_MAX if no such position exists in the interval.
