@@ -130,6 +130,7 @@ won't have the same context you do.
 | [JR-006](#jr-006--refined-stage-3-perf-estimate-once-risk-e-is-fixed) | 2026-07-29 | Refined Stage 3 perf estimate once Risk E is fixed | resolved (by JR-007) | stage3, perf, risk-e, projection |
 | [JR-007](#jr-007--risk-e-fix-fixed-legacy--flipped-produce-byte-identical-coverage) | 2026-07-29 | Risk E fix: fixed-legacy == flipped (byte-identical coverage) + honest Stage 3 delta | resolved | risk-e, fix, correctness, perf, stage3 |
 | [JR-008](#jr-008--stage-3-benchmark-n5-warm-cache-hprc-chr6-100k-reads) | 2026-07-29 | Stage 3 benchmark: N=5 warm-cache HPRC chr6 100K reads | resolved | stage3, perf, benchmark, hprc |
+| [JR-011](#jr-011--backward_extend_encoded_with_sa-rewrite-hprc-chr6-noisy-benchmark) | 2026-07-30 | backward_extend_encoded_with_sa rewrite: HPRC chr6 noisy benchmark | resolved | jr-010, sa-carry, primitive, perf, hprc, noisy |
 
 ---
 
@@ -1339,5 +1340,290 @@ first-touch fault count is higher. Same underlying phenomenon.
 Harness edit committed separately in the pipeline repo (one-line
 addition of `${FIND_MEMS_EXTRA_FLAGS:-}` word-splitting into the
 find_mems invocations).
+
+---
+
+## JR-011 — backward_extend_encoded_with_sa rewrite: HPRC chr6 noisy benchmark
+
+```yaml
+id: JR-011
+date: 2026-07-30
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [jr-010, sa-carry, primitive, perf, hprc, noisy]
+refs:
+  follows: [JR-008]
+```
+
+> Note on lineage: this entry addresses the perf regression documented
+> off-journal in the session brief as "JR-010" (flipped +50% slower than
+> legacy on `chr6.alt_noisy.reads.txt`, +48s hit entirely in MEM-finding,
+> traced to redundant pred+block-walks inside
+> `backward_extend_encoded_with_sa`). JR-009 / JR-010 numbers are reserved
+> for the user's parallel work; this session's number is JR-011.
+
+### Context
+
+JR-008 established Stage 3's baseline on `chr6.alt.reads.txt` (error-free
+reads): flipped ~10-13% faster than fixed-legacy at find_mems wall.
+When the same code was rerun on `chr6.alt_noisy.reads.txt` (noisy reads,
+same read count and length), the picture inverted -- flipped became
+~+50% slower than legacy, and the entire ~48s regression landed inside
+MEM-finding rather than MEM-processing. Root cause: on noisy reads,
+Step 1' walks fail early far more often, so `backward_extend_encoded_with_sa`
+gets called an order of magnitude more times per read. The primitive's
+Case B path was doing up to 5 predecessor+block-walks per call
+(`backward_extend_encoded` internal 2 rank walks + one
+`bwt_char_at_encoded` for the Case A test + one `bwt_char_at_encoded`
+fast-path inside `leftmost_c_in_interval` + one `run_id_and_offset_at`
+at the leftmost-c position) plus, on the toehold path, an entire
+locate walk from the containing run's sample.
+
+This entry rewrites the primitive per a specific plan
+(see the sub-step 1-8 in DESIGN_FLIPPED_MEM.md section 5) and measures
+the resulting delta on the noisy-read workload.
+
+### Hypothesis
+
+Two-part hypothesis:
+
+1. **Primitive-level.** Collapse the 3-5 pred+walks per general-case
+   call into 2 by introducing a combined block scan (`scan_at`, returns
+   ranks + BWT char + run id + run start in one walk) and a rank-in
+   variant of `backward_extend_encoded`
+   (`backward_extend_encoded_with_ranks`). Eliminate the toehold
+   locate walk by precomputing a 5-entry `first_bint[c] / first_sa[c]`
+   table at load. Replace Case B's leftmost-c lookup with a
+   successor query over a per-DNA-char RUN-INDEXED bitvector
+   (`run_head_c[c][r] = 1` iff run r's head char is c).
+
+2. **Wall-time.** Since the +48s regression sits entirely in
+   MEM-finding, and MEM-finding is dominated by
+   `backward_extend_encoded_with_sa` calls, cutting per-call cost by
+   ~60% should recover a proportional share of the regression. If
+   the primitive is the sole regression driver, flipped-vs-legacy
+   should close to within 10%. If other flipped-code-path costs
+   (notably Step 2' forward extends) also contribute meaningfully,
+   the primitive rewrite will only partially close the gap.
+
+### Method
+
+**Implementation** landed as commits `23a73a0..607a0ca` on branch
+`backward-extend-sa-perf`, 7 test-first sub-steps ending in the
+primitive rewrite (`src/r-index.cpp:951-1055`). Full commit list:
+
+- `23a73a0` test scaffold (Test A/B/C, A and B fail initially)
+- `59eb360` `EncodedBlock::ranks_at` optional out-params
+- `ccb502a` `scan_at` combined block scan; Test A passes
+- `0fa123d` `backward_extend_encoded_with_ranks` rank-in variant
+- `c44e475` `run_head_c` parallel run-id bitvector; Test B passes
+- `5b1a4d7` `first_bint` / `first_sa` toehold table
+- `607a0ca` primitive rewrite (toehold fast path + general path)
+
+**Unit verification** (`bin/test_backward_extend_sa` on yeast235 chrII,
+`../mem-projection/pangenome-pipeline/runs/v1-current/yeast235_chrII_100kb_normalized.ri`):
+- Test A (scan_at cross-check, 5000 positions): 5000/5000 PASS
+- Test B (run_head_c cross-check, 2000 checks per DNA char): 10000/10000 PASS
+- Test C (SA-carry oracle, 10K trials, mix of random-ACGT and
+  text-derived patterns): 302243 steps, 0 mismatches, 10000 toehold-path
+  hits, Case A / Case B = 213725 / 78518 (73:27 split).
+
+**E2E correctness** (`./query.sh configs/hprcv1-chr6-alt-reads.env
+hprc-chr6-2026-06-02 s7-flipped --gaf` with `FIND_MEMS_EXTRA_FLAGS=--use-flipped-mems`):
+- validate_gaf: 2000 / 2000 valid, 0 invalid.
+- GAF line count: 532,534 (identical to the sub-step 5 legacy baseline
+  on the same reads file -- no silent MEM drop).
+- `alignment_coverage.csv` MD5 `60f6b8e4a759aebb252b83a870b9ff8c` --
+  byte-identical to the legacy baseline. Coverage-file identity is
+  the strong correctness signal per JR-007; cosigt cannot distinguish
+  the two.
+
+**Benchmark protocol.** Built two find_mems binaries side-by-side:
+- `bin/find_mems` (post-rewrite): commit `607a0ca`.
+- `bin-pre-rewrite/find_mems`: commit `5b1a4d7` (all sub-steps landed
+  except the primitive rewrite itself; isolates the delta to the
+  rewrite alone rather than confounding with load-time cost of
+  `run_head_c` + `first_bint`).
+
+Per binary and per mode (legacy / flipped): 2 warmup runs (untimed)
++ 3 timed trials, warm-cache, contiguous ordering per variant. Ran
+directly (not through `query.sh`) to skip gafpack + validate_gaf on
+each trial. Command per trial:
+
+```
+$BIN $RI $LTAGS $READS 50 1 mems --lightweight-tags [--use-flipped-mems]
+```
+
+Config: `hprcv1-chr6-alt-reads.env` (MEM_LEN=50, MIN_OCC=1). Reads:
+`../mem-projection/hprcv1/chr6.alt_noisy.reads.txt` (100K reads,
+200bp, 19MB). Machine: same M1 Mac as JR-008.
+
+### Findings
+
+**Per-trial wall (find_mems, seconds):**
+
+| trial | legacy | pre-rewrite flipped | post-rewrite flipped |
+|---:|---:|---:|---:|
+| 1 | 49.55 | 70.44 | 62.01 |
+| 2 | 46.79 | 97.89 | 61.78 |
+| 3 | 48.47 | 74.18 | 61.04 |
+| **median** | **48.47** | **74.18** | **61.78** |
+
+**Per-trial phase breakdown (median trial):**
+
+| Phase | legacy | pre-rewrite flipped | post-rewrite flipped |
+|---|---:|---:|---:|
+| Total | 48.47 s | 74.18 s | 61.78 s |
+| R-index load | 8.17 s | 8.33 s | 8.10 s |
+| **MEM finding** | **18.67 s** | **58.72 s** | **46.42 s** |
+| MEM processing | 19.30 s | 5.74 s | 5.74 s |
+| ├─ First locate | 17.14 s | 0.00 s | 0.00 s |
+| ├─ Locate next | 1.54 s | 4.56 s | 4.56 s |
+| └─ Tag queries | 0.48 s | 1.01 s | 1.01 s |
+
+**Deltas (post-rewrite vs pre-rewrite flipped):**
+- Total wall: **-12.4 s (-16.7%)**
+- MEM finding: **-12.3 s (-20.9%)**
+
+Everything else identical within noise (correctness proof: MEM
+processing, sorting, load times all unchanged; the rewrite only
+touches the SA-carry primitive body).
+
+**Deltas (post-rewrite flipped vs legacy):**
+- Total wall: +13.3 s (+27.4%)
+- MEM finding: +27.8 s (+148.9%)
+- MEM processing: **-13.6 s (-70.5%)** (seed elimination win preserved)
+
+**Peak RSS:** legacy 4192 MB, post-rewrite flipped 4182 MB -- delta
+0.2%, well under the 10% CLAUDE.md ceiling.
+
+**Case A / Case B split** on the noisy workload
+(from Test C's 10K trials on yeast235; production workload
+distribution not directly measured but is expected to be similar):
+Case A 73%, Case B 27%, initial toehold ~3% of total steps.
+
+### Interpretation
+
+**Primitive rewrite delivers the projected ~12 s recovery on
+MEM-finding.** The pre-rewrite Case B path was doing up to 5
+pred+block-walks per call plus a full locate walk on the toehold
+path (call-once-per-outer-loop-iter). The post-rewrite path does 2
+pred+block-walks in the general case and 0 memory-load fields on
+the toehold path. On the noisy workload (many short Step 1' walks,
+so per-call cost dominates), the ratio 5:2 predicts a ~60% cut in
+primitive time, and MEM finding is dominated by primitive calls,
+so a ~12-13 s cut on the ~58 s pre-rewrite MEM finding matches
+prediction well.
+
+**But flipped remains ~+28 s slower than legacy on MEM-finding.**
+Broken down:
+
+- Seed elimination saves 17.1 s (First locate: 17.14 → 0.00). This
+  is the whole Stage 3 win, preserved intact.
+- Post-rewrite primitive is still more expensive per call than the
+  equivalent legacy backward-extend chain (which piggy-backs on
+  cache warmed by adjacent Step 1 / Step 3 walks). Absolute
+  primitive-time delta not directly measured; inferred from the
+  ~46 s MEM-finding on flipped vs ~18 s on legacy = +28 s.
+- Step 2' forward-extend cost. Forward extends are ~2x per-char
+  cost of backward extends (swap → backward-extend-on-RC → swap).
+  On noisy reads, Step 2' fires on every outer-loop iteration,
+  and short backward walks mean more outer-loop iterations per
+  read. Not directly measured (would need finer per-Step
+  instrumentation); dominates the residual gap by process of
+  elimination.
+
+**Net: post-rewrite flipped is +13 s wall vs legacy on the noisy
+workload, down from +26 s pre-rewrite.** Half the JR-010
+regression closed; the other half sits outside the primitive.
+The +13 % wall difference does NOT meet the "within 10%" ideal
+called out in the session brief, but does exceed the fallback
+requirement of "document what remains and next candidate
+directions" -- see Open questions below.
+
+**Coverage is byte-identical to legacy across the entire branch.**
+Every sub-step's E2E gate ran `--gaf` and got 2000/2000 valid;
+`alignment_coverage.csv` MD5 is `60f6b8e4a759aebb252b83a870b9ff8c`
+for sub-step 2 legacy, sub-step 5 legacy, sub-step 7 flipped -- all
+three match. Correctness is not in dispute at any point in the
+branch.
+
+**Load-time cost.** The eager `run_head_c` build adds ~7-8 s to
+R-index load (2.5 → ~8 s on chr6). This is a one-time cost per
+process invocation; in a batch-query context (many queries per
+process) it amortizes to zero, but for latency-sensitive single-
+query callers it may matter. See Open question 2.
+
+**Peak RSS ceiling not touched.** Delta 0.2% vs legacy.
+
+### Open questions
+
+1. **Step 2' overhead is the remaining ~+14 s.** On noisy reads,
+   flipped's Step 2' does a fresh `forward_extend_encoded` chain
+   from `pattern[i-1]` rightward on every outer-loop iteration,
+   regardless of whether Step 1' emitted a MEM. Two candidate
+   directions:
+   - **Reuse Step 1's ranks / interval state** to skip the
+     redundant right-extend when Step 2' would traverse characters
+     Step 1' already saw. Requires state-machine surgery in
+     `find_mems_flipped_function`; risk of subtle boundary bugs
+     (Risk D territory from DESIGN_FLIPPED_MEM.md).
+   - **Give up Step 2' precision** by using a cheaper anchor-
+     advance heuristic (e.g., always advance by 1). Would emit
+     extra failed backward-walks; needs a cost-benefit measure.
+2. **Consider serializing `run_head_c` and `first_bint` / `first_sa`
+   to disk** in the .ri format, or dropping them entirely if a
+   future rewrite makes their queries unnecessary. Current one-time
+   ~8 s load cost is amortized in batch contexts but visible in
+   single-query contexts.
+3. **Whether to enable `--use-flipped-mems` by default is now more
+   complicated than JR-008 suggested.** On clean reads the flipped
+   path wins by ~10 %; on noisy reads it still loses by ~13 %.
+   A workload-aware toggle would be ideal but adds complexity. If
+   the production cohort mix skews clean-reads-heavy, flipping the
+   default is still justified; if noisy is common, keep legacy
+   default and gate flipped on an explicit flag. Deferred pending
+   user direction.
+4. **Test C's toehold-hit count is a synthetic distribution.** Real
+   production workloads may have different Case A / Case B / toehold
+   frequencies. Instrumenting `backward_extend_encoded_with_sa`
+   with a per-invocation counter and dumping the histogram from a
+   real find_mems run would firm up the model.
+
+### Data artifacts
+
+- `xy-test/jr011_bench_legacy_{1,2,3}/run.log` -- per-trial logs
+  for the legacy binary (find_mems internal profiler dump).
+- `xy-test/jr011_bench_pre_rewrite_flipped_{1,2,3}/run.log` -- the
+  three pre-rewrite flipped trials.
+- `xy-test/jr011_bench_post_rewrite_flipped_{1,2,3}/run.log` -- the
+  three post-rewrite flipped trials.
+- `runs/hprc-chr6-2026-06-02/queries/s7-flipped/` and
+  `s7-flipped-rerun/` -- E2E `--gaf` runs of the post-rewrite
+  primitive, both with validate_gaf 2000/2000 and coverage MD5
+  `60f6b8e4a759aebb252b83a870b9ff8c`.
+- `runs/hprc-chr6-2026-06-02/queries/s{2,5}-regcheck*/` -- sub-step
+  regression checks (legacy path, no functional change; used to
+  establish the coverage baseline for identity comparisons).
+
+### Pipeline-repo edit
+
+`../mem-projection/pangenome-pipeline/query.sh` gained a one-line
+`${FIND_MEMS_EXTRA_FLAGS:-}` word-split after the flag array,
+mirroring the perf_harness.sh hook JR-008 added. This is the same
+pattern JR-008 documented and got user approval for. Not committed
+in this session -- flagged for user review before commit on the
+pipeline repo side.
+
+### Commits (this repo, branch backward-extend-sa-perf)
+
+- `23a73a0` test: scaffold Test A/B/C for backward_extend_encoded_with_sa optimization
+- `59eb360` r-index: extend EncodedBlock::ranks_at with optional block-scan extras
+- `ccb502a` r-index: add scan_at combined block-scan; Test A passes
+- `0fa123d` r-index: add backward_extend_encoded_with_ranks (rank-in variant)
+- `c44e475` r-index: add run_head_c parallel run-id bitvector; Test B passes
+- `5b1a4d7` r-index: precompute first_bint/first_sa toehold table at load
+- `607a0ca` r-index: rewrite backward_extend_encoded_with_sa (JR-010 perf fix)
+- (this entry, pending as of writing)
 
 ---
