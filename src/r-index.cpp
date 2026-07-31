@@ -135,11 +135,15 @@ namespace panindexer {
         return rank;
     }
 
-    void FastLocate::EncodedBlock::ranks_at(gbwt::size_type &loc, size_t end_pos, size_t rel, size_t out[6]) const {
+    void FastLocate::EncodedBlock::ranks_at(gbwt::size_type &loc, size_t end_pos, size_t rel, size_t out[6],
+                                            int* out_code_at_pos,
+                                            size_t* out_run_num_in_block,
+                                            size_t* out_run_start_rel) const {
         size_t cum[6] = {0,0,0,0,0,0};
         this->read_cumulative(loc, cum);
         for (size_t i = 0; i < 6; ++i) { out[i] = cum[i]; }
         size_t cur = 0;
+        size_t runnum = 0;   // block-relative run index of the run currently being decoded
         while (static_cast<size_t>(loc) < end_pos) {
             gbwt::byte_type header = (*this->stream)[loc];
             loc++;
@@ -149,15 +153,33 @@ namespace panindexer {
             if (prefix < 31) {
                 run_length = prefix + 1;
             } else {
-                // auto loc_before = loc;
                 auto extra = static_cast<size_t>(gbwt::ByteCode::read(*this->stream, loc));
                 run_length = 32 + extra;
             }
-            if (cur + run_length > rel) { out[code] += (rel - cur); return; }
+            if (cur + run_length > rel) {
+                // Partial consumption of the current run: rel lies inside it.
+                // The three extras describe *this* run because it is the one
+                // containing position rel.
+                out[code] += (rel - cur);
+                if (out_code_at_pos) *out_code_at_pos = code;
+                if (out_run_num_in_block) *out_run_num_in_block = runnum;
+                if (out_run_start_rel) *out_run_start_rel = cur;
+                return;
+            }
             out[code] += run_length;
             cur += run_length;
+            runnum++;
         }
-        // If we reach here, rel is at end of block; out already equals totals
+        // rel is exactly at the end of the block (cur == rel).  This happens
+        // for callers that request ranks at bwt_size or at a block boundary.
+        // In that case there is no "current run at rel"; report sentinels so
+        // buggy consumption is caught rather than silently continued.  The
+        // primary caller (rank_at_cached_encoded via scan_at) only inspects
+        // the extras for positions strictly inside the interval, so this
+        // sentinel is safe on the hot path.
+        if (out_code_at_pos) *out_code_at_pos = -1;
+        if (out_run_num_in_block) *out_run_num_in_block = runnum;
+        if (out_run_start_rel) *out_run_start_rel = cur;
     }
 
     size_type

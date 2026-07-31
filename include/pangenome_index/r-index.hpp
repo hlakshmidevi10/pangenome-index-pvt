@@ -834,7 +834,22 @@ namespace panindexer {
             void read_cumulative(gbwt::size_type &loc, size_t cum_nuc[6]) const;
             size_t char_at(gbwt::size_type loc, size_t end_pos, size_t rel) const;
             size_t rank_of_code(gbwt::size_type &loc, size_t end_pos, int target_code, size_t rel, size_t &runnum, size_t &cur) const;
-            void ranks_at(gbwt::size_type &loc, size_t end_pos, size_t rel, size_t out[6]) const;
+            // Walk the block from `loc` up to relative offset `rel`,
+            // accumulating per-code rank counts into out[6].  The three
+            // optional out-parameters describe the run that contains rel
+            // (i.e. the last run touched, possibly partially):
+            //   *out_code_at_pos     -- code of that run (BWT char at rel)
+            //   *out_run_num_in_block -- block-relative run index (0..)
+            //   *out_run_start_rel   -- block-relative offset where the
+            //                            run starts
+            // All three default to nullptr; existing callers keep their
+            // behaviour unchanged and pay no extra cost (the walk already
+            // tracks cur and runnum internally).  When rel lands exactly at
+            // the block end, out_code_at_pos is set to -1 (no current run).
+            void ranks_at(gbwt::size_type &loc, size_t end_pos, size_t rel, size_t out[6],
+                          int* out_code_at_pos = nullptr,
+                          size_t* out_run_num_in_block = nullptr,
+                          size_t* out_run_start_rel = nullptr) const;
             void skip_header(gbwt::size_type &loc) const;
         };
 
