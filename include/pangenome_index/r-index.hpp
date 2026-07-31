@@ -809,6 +809,45 @@ namespace panindexer {
         // Handles both encoded and legacy formats.
         size_t bwt_char_at_encoded(size_t idx) const;
 
+        // Combined block-scan result populated by scan_at (below).
+        //
+        //   ranks           -- exactly what rank_at_cached_encoded(pos)
+        //                       returns: cumulative counts in sym_map order,
+        //                       one entry per symbol in C.
+        //   bwt_char_at_pos -- BWT[pos] as a raw byte (e.g. 'A'), or 0 when
+        //                       pos is at a block boundary (no current run).
+        //   run_id          -- global run index of the run containing pos.
+        //   run_start_bwt   -- global BWT position where that run starts
+        //                       (inclusive; equals pos when pos is the
+        //                       run's first position).
+        //
+        // All four are computed in a single predecessor + block-walk.
+        // Purpose: eliminate the two redundant walks in
+        // backward_extend_encoded_with_sa (JR-010 root cause).
+        struct block_scan_result {
+            std::vector<size_t> ranks;
+            size_t bwt_char_at_pos = 0;
+            size_t run_id = 0;
+            size_t run_start_bwt = 0;
+        };
+
+        // Single-pass block scan at position pos.  Populates all four fields
+        // of `out`.  Cost: one predecessor + one block walk, matching
+        // rank_at_cached_encoded exactly -- the three extras are free.
+        //
+        // See DESIGN_FLIPPED_MEM.md section 5 for how this feeds the
+        // rewritten backward_extend_encoded_with_sa (sub-step 7).
+        void scan_at(size_t pos, block_scan_result& out) const;
+
+        // Public thin re-exposure of rank_at_cached_encoded for the
+        // scan_at correctness test.  The private declaration below is
+        // still the sole implementation; this const-const wrapper keeps
+        // the test's ground truth self-contained without touching any
+        // other caller.
+        std::vector<size_t> rank_at_cached_encoded_public(size_t pos) const {
+            return this->rank_at_cached_encoded(pos);
+        }
+
     private:
         void copy(const FastLocate &source);
 

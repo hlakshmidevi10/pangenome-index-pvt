@@ -700,6 +700,75 @@ namespace panindexer {
         return rank_vec;
     }
 
+    // Combined block scan: one predecessor + one block walk, returning
+    // rank_at_cached_encoded's output plus the three per-position extras
+    // (BWT char at pos, containing run's global id, run's global start).
+    //
+    // The rank projection loop is a byte-identical copy of the one in
+    // rank_at_cached_encoded on purpose: the SA-carry primitive
+    // (backward_extend_encoded_with_sa, sub-step 7) will use scan_at's
+    // ranks in place of one rank_at_cached_encoded call, and any drift
+    // between the two would silently corrupt every subsequent interval.
+    //
+    // Legacy (non-encoded) fallback: build the extras from the same
+    // primitives used by the ground truth, since Run_blocks has no
+    // combined-scan variant.  That path is only hit on very small
+    // fixtures (test_r_index_sa on yeast still uses the encoded path),
+    // so simplicity beats micro-optimizing here.
+    void FastLocate::scan_at(size_t pos, block_scan_result& out) const {
+        out.ranks.assign(this->C.size(), 0);
+
+        if (!this->is_encoded()) {
+            out.ranks = this->rank_at_cached(pos);
+            out.bwt_char_at_pos = this->bwt_char_at(pos);
+            this->run_id_and_offset_at(pos, out.run_id, out.run_start_bwt);
+            return;
+        }
+
+        auto iter = this->blocks_start_pos.predecessor(pos);
+        const size_t block_id = iter->first;
+        const size_t block_start = iter->second;
+        gbwt::size_type loc = static_cast<gbwt::size_type>(this->blocks_encoded_start_bits[block_id]);
+        const size_t end_pos = (block_id + 1 < this->blocks_encoded_start_bits.size())
+                                   ? this->blocks_encoded_start_bits[block_id + 1]
+                                   : this->blocks_encoded_stream.size();
+        EncodedBlock blk(this->blocks_encoded_stream, this->encoded_has_N, this->C.size(), &this->sym_map);
+        const size_t rel = pos - block_start;
+
+        size_t counts6[6] = {0, 0, 0, 0, 0, 0};
+        int code_at_pos = -1;
+        size_t run_num_in_block = 0;
+        size_t run_start_rel = 0;
+        blk.ranks_at(loc, end_pos, rel, counts6,
+                     &code_at_pos, &run_num_in_block, &run_start_rel);
+
+        // Project counts6 into sym_map-order ranks (mirrors
+        // rank_at_cached_encoded exactly -- see that function for the
+        // 'N missing from encoded' short-circuit rationale).
+        for (size_t j = 0; j < out.ranks.size(); ++j) {
+            size_t sym = static_cast<size_t>(NENDMARKER);
+            for (size_t i = 0; i < nuc.size(); ++i) {
+                size_t s = static_cast<size_t>(nuc[i]);
+                if (static_cast<size_t>(this->sym_map[s]) == j) { sym = s; break; }
+            }
+            if (sym == static_cast<size_t>('N') && !this->encoded_has_N) {
+                out.ranks[j] = 0;
+            } else {
+                size_t code_nuc = static_cast<size_t>(this->symbol_to_code(sym));
+                out.ranks[j] = counts6[code_nuc];
+            }
+        }
+
+        // Extras.  code_at_pos == -1 means pos == block end -- report 0 for
+        // the char (matches bwt_char_at_encoded's "past end" convention) and
+        // keep runnum / start as the block-total values from the walker.
+        out.bwt_char_at_pos = (code_at_pos < 0) ? 0
+                                                : this->code_to_symbol(code_at_pos);
+        const size_t bsize = (this->encoded_block_size != 0) ? this->encoded_block_size
+                                                             : this->block_size;
+        out.run_id = block_id * bsize + run_num_in_block;
+        out.run_start_bwt = block_start + run_start_rel;
+    }
 
 
 
