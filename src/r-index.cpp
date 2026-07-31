@@ -951,74 +951,132 @@ namespace panindexer {
         return bi_interval(tmp.reverse, tmp.forward, tmp.size);
     }
 
-    // SA-carrying backward extend. See declaration comment in r-index.hpp and
-    // DESIGN_FLIPPED_MEM.md section 4 for the algorithm. Correctness invariant:
-    // when this function returns a non-empty interval, the returned sa_sp
-    // equals SA[returned bint.forward] -- i.e. exactly what locate_sa_value
-    // would compute, at O(rank) marginal cost instead of an O(run-length) walk.
+    // SA-carrying backward extend.  See declaration comment in r-index.hpp
+    // and DESIGN_FLIPPED_MEM.md section 4 for the algorithm.  Correctness
+    // invariant: when this function returns a non-empty interval, the
+    // returned sa_sp equals SA[returned bint.forward] -- byte-identical to
+    // what locate_sa_value would produce, but at O(rank) marginal cost
+    // instead of an O(run-length) walk.
+    //
+    // Rewritten in sub-step 7 (JR-010 fix) to eliminate three redundant
+    // predecessor+block-walks per call versus the pre-rewrite version:
+    //
+    //   Pre-rewrite (Stage 1 baseline, up to 5 pred+walks per Case B call):
+    //     1x backward_extend_encoded  = 2 pred+walks (rank at k and k+s)
+    //     1x bwt_char_at_encoded(old_sp)             = 1 pred+walk (Case A test)
+    //     1x leftmost_c_in_interval    = up to 2 (one bwt_char_at + one successor)
+    //     Toehold: 1x run_id_and_offset_at + locateNext walk
+    //
+    //   Post-rewrite (this version, 2 pred+walks per general-case call):
+    //     1x scan_at(old_sp)           = 1 pred+walk (ranks + BWT char + run id)
+    //     1x rank_at_cached_encoded(old_sp+old_size) = 1 pred+walk
+    //     backward_extend_encoded_with_ranks uses the two rank vectors above
+    //     Case A test uses scan_at's bwt_char_at_pos (no extra walk)
+    //     Case B uses run_head_c[a].successor(scan_at.run_id + 1) (O(log r))
+    //     Toehold: precomputed first_bint[c] / first_sa[c] table (0 walks)
+    //
+    // Preserves the same three-branch structure conceptually (toehold,
+    // Case A, Case B) so the correctness argument in DESIGN_FLIPPED_MEM.md
+    // section 4 still applies verbatim.  Only the mechanics of *how* each
+    // branch obtains its inputs changed.
     FastLocate::bi_interval_with_sa FastLocate::backward_extend_encoded_with_sa(
             const bi_interval& bint, size_type sa_sp_prev, size_t a) {
-        const size_t old_sp = bint.forward;
-        const size_t old_ep = bint.forward + (bint.size > 0 ? bint.size - 1 : 0);
-
-        // Delegate the interval math to the existing primitive -- no duplication
-        // of the FMD RC-side accounting or empty-case handling. All the added
-        // work here is the SA update.
-        bi_interval new_bint = this->backward_extend_encoded(bint, a);
-        bi_interval_with_sa result{new_bint, FastLocate::NO_POSITION};
-        if (new_bint.size <= 0) {
-            return result;  // failure: caller must terminate the walk.
+        // -- Toehold fast path -----------------------------------------------
+        // The common caller (find_mems_flipped_function) starts every Step 1'
+        // walk with bint == whole-BWT interval and sa_sp_prev == NO_POSITION.
+        // The result of extending by a single DNA character from that state
+        // was precomputed at load time in first_bint / first_sa (sub-step 6),
+        // so we can return it with zero rank ops and zero locate walks.
+        if (sa_sp_prev == FastLocate::NO_POSITION &&
+            bint.forward == 0 && bint.reverse == 0 &&
+            static_cast<size_t>(bint.size) == this->bwt_size()) {
+            const size_t idx = FastLocate::dna_char_to_idx(a);
+            if (idx < DNA_ALPHABET_SIZE) {
+                bi_interval_with_sa fast{this->first_bint[idx], this->first_sa[idx]};
+                // If a is absent from the index (rare: 'N' when encoded_has_N
+                // is false), first_bint[i].size is 0 -- caller sees an empty
+                // result exactly as if we had walked the general path.
+                return fast;
+            }
+            // Non-DNA a: fall through.  Extremely unusual (find_mems only
+            // ever passes DNA characters), but preserved for safety.
         }
 
-        const size_t new_sp = new_bint.forward;
+        // -- General path ----------------------------------------------------
+        const size_t old_sp = bint.forward;
+        const size_t old_size = static_cast<size_t>(bint.size > 0 ? bint.size : 0);
 
-        // Initial toehold path: no valid prior SA to carry. Seed by locating
-        // new_sp directly from its containing run's sample. This is a one-time
-        // cost per Step 1' walk (called once at the start), amortized over all
-        // subsequent extends which use the O(1) or O(log r) LF-decrement path.
+        // Single-pass block scan at old_sp: returns ranks, BWT char, and the
+        // containing run's global id in one predecessor + block walk.
+        // Replaces the pair (rank_at_cached_encoded(old_sp),
+        // bwt_char_at_encoded(old_sp)) + the leftmost_c_in_interval fast-path
+        // check that the old code performed.
+        block_scan_result at_k;
+        this->scan_at(old_sp, at_k);
+
+        // Second rank vector at old_sp + old_size.  Cannot fold this into
+        // scan_at because it needs the extras at old_sp, not at old_sp+size.
+        // This is the one remaining unavoidable pred+walk in the general path.
+        std::vector<size_t> at_ks_ranks = this->rank_at_cached_encoded(old_sp + old_size);
+
+        bi_interval new_bint = this->backward_extend_encoded_with_ranks(
+            bint, a, at_k.ranks, at_ks_ranks);
+
+        bi_interval_with_sa result{new_bint, FastLocate::NO_POSITION};
+        if (new_bint.size <= 0) return result;  // failure: caller stops walk.
+
+        // Defensive: if sa_sp_prev is NO_POSITION but bint wasn't the whole-
+        // BWT interval, the toehold fast path didn't fire and we don't have
+        // a valid SA to LF-decrement.  Seed via the legacy locate walk from
+        // new_sp's containing run.  This branch is unreachable from
+        // find_mems_flipped_function (which always starts on the whole-BWT
+        // interval), but keeps the primitive's contract intact for other
+        // callers -- notably test_backward_extend_sa's occasional coverage
+        // of non-standard states.
         if (sa_sp_prev == FastLocate::NO_POSITION) {
-            size_t run_id = 0;
-            size_t offset_of_first = 0;
+            const size_t new_sp = new_bint.forward;
+            size_t run_id = 0, offset_of_first = 0;
             this->run_id_and_offset_at(new_sp, run_id, offset_of_first);
             size_type sa = this->getSample(run_id);
             while (offset_of_first < new_sp) {
                 sa = this->locateNext(sa);
-                offset_of_first++;
+                ++offset_of_first;
             }
             result.sa_sp = sa;
             return result;
         }
 
-        // Case A: BWT[old_sp] == a. Then old_sp is itself the leftmost a in
-        // [old_sp, old_ep] (BWT[old_sp] == a is the boundary condition), so
-        // LF(old_sp) = new_sp and SA[new_sp] = SA[old_sp] - 1 by the LF
-        // identity. Costs one bwt_char_at_encoded call (predecessor + block
-        // decode) on top of what backward_extend_encoded already did.
-        if (this->bwt_char_at_encoded(old_sp) == a) {
-            // sa_sp_prev is SA[old_sp]; subtract 1 for LF-decrement. SA values
-            // are >= 1 for all non-endmarker positions (they map to seqOffset
-            // plus a positive seq_id bias), so underflow would indicate a
-            // corrupted carry -- an assert would fire below, but we trust the
-            // invariant here.
+        // Case A: BWT[old_sp] == a.  Then old_sp is the leftmost a in
+        // [old_sp, old_ep] and LF(old_sp) == new_sp, giving
+        // SA[new_sp] = SA[old_sp] - 1 by the LF identity.  No extra rank
+        // or select ops: at_k.bwt_char_at_pos was populated by scan_at.
+        if (at_k.bwt_char_at_pos == a) {
             result.sa_sp = sa_sp_prev - 1;
             return result;
         }
 
-        // Case B: BWT[old_sp] != a. The leftmost a in [old_sp, old_ep] is at
-        // some j > old_sp. By construction BWT[j-1] != a (else j-1 would be
-        // leftmost), so j starts a run of a and SA[j] = samples[run_id_at(j)]
-        // -- no locate walk needed. Then SA[new_sp] = SA[j] - 1.
+        // Case B: BWT[old_sp] != a.  We need the leftmost a in
+        // [old_sp, old_ep].  Since old_sp's own run has head != a (else
+        // Case A would have fired), the leftmost a-position sits at the
+        // start of some run r' > at_k.run_id.  Find r' via successor over
+        // the RUN-INDEXED run_head_c[a] bitvector (sub-step 5).  Then
+        // SA[start-of-run-r'] = samples[r'] (samples stores SA at run
+        // starts by construction), and SA[new_sp] = samples[r'] - 1.
         //
-        // In debug builds an assertion fires if leftmost_c_in_interval returns
-        // SIZE_MAX: since new_bint is non-empty, at least one a-position must
-        // exist in [old_sp, old_ep]; a miss here indicates a primitive bug.
-        size_t j = this->leftmost_c_in_interval(a, old_sp, old_ep);
-        assert(j != SIZE_MAX && "backward_extend_encoded_with_sa: Case B could not locate leftmost a despite non-empty result interval");
-        size_t j_run_id = 0;
-        size_t j_run_offset = 0;
-        this->run_id_and_offset_at(j, j_run_id, j_run_offset);
-        assert(j_run_offset == j && "backward_extend_encoded_with_sa: leftmost a-position in interval is not at a run start (invariant violated)");
-        result.sa_sp = this->getSample(j_run_id) - 1;
+        // Invariant: new_bint is non-empty ==> at least one a-position
+        // exists in [old_sp, old_ep] ==> the successor is guaranteed to
+        // land at or before old_ep.  We do not verify the bound at run
+        // time because verifying it would require converting r' back to
+        // its BWT position (an extra select); we trust the primitive.
+        //
+        // If the successor misses (returns SIZE_MAX), that means our
+        // model of the data is inconsistent -- fire an assert in debug
+        // builds so a bug is caught rather than silently corrupting SA.
+        const size_t next_run_id = this->next_run_with_head_c(a, at_k.run_id + 1);
+        assert(next_run_id != SIZE_MAX &&
+               "backward_extend_encoded_with_sa: Case B could not locate next "
+               "a-headed run despite non-empty result interval");
+        result.sa_sp = this->getSample(next_run_id) - 1;
         return result;
     }
 
