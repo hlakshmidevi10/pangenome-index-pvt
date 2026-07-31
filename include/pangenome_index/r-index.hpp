@@ -416,6 +416,29 @@ namespace panindexer {
         // exists.  O(log r) via successor.
         size_t next_run_with_head_c(size_t c, size_t start_from) const;
 
+        // Precomputed 'first backward-extend from an empty match' table.
+        // Indexed by dna_char_to_idx(c) in [0, DNA_ALPHABET_SIZE).
+        //   first_bint[i] = backward_extend_encoded({0, 0, bwt_size}, c),
+        //                    where c is the DNA char at index i.
+        //   first_sa[i]   = SA[first_bint[i].forward] via locate_sa_value.
+        //
+        // Used by backward_extend_encoded_with_sa's toehold fast path
+        // (sub-step 7): when the caller passes sa_sp_prev == NO_POSITION
+        // and bint == the whole-BWT interval, the answer is exactly
+        // (first_bint[i], first_sa[i]) -- zero rank ops, zero locate walks.
+        //
+        // Built eagerly at load time via ensure_first_toehold_built.
+        // Storage: 5 bi_interval + 5 size_type ~ 160 bytes total.  Not
+        // serialized (trivial to recompute).  Empty extend for a
+        // character absent from the index leaves first_bint[i].size == 0
+        // and first_sa[i] == NO_POSITION; the toehold fast path bails
+        // on size == 0 (mirrors the general-path empty result).
+        mutable std::array<bi_interval, DNA_ALPHABET_SIZE> first_bint;
+        mutable std::array<size_type, DNA_ALPHABET_SIZE> first_sa;
+        mutable std::once_flag first_toehold_once;
+
+        void ensure_first_toehold_built() const;
+
         // Find the leftmost BWT position p in [sp, ep] such that BWT[p] == c,
         // where c is a raw DNA character byte ('A','C','G','T','N'). Returns
         // SIZE_MAX if no such position exists in the interval.

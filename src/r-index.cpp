@@ -431,6 +431,7 @@ namespace panindexer {
         // Eager parallel-array build; see load_encoded for rationale.  The
         // non-encoded path exercises the same run walker.
         this->ensure_run_head_c_built();
+        this->ensure_first_toehold_built();
     }
 
     void
@@ -493,6 +494,12 @@ namespace panindexer {
         // serialize this to disk -- it's cheap to rebuild and lets old
         // .ri files load without a format bump.
         this->ensure_run_head_c_built();
+        // Precompute the 5-entry toehold table (first_bint[c], first_sa[c]).
+        // Sub-step 7's toehold fast path consults this table to answer the
+        // very first backward-extend of a Step 1' walk without any rank
+        // ops or locate walks.  Cost here: 5 backward extends + one
+        // locate_sa_value-equivalent walk each, effectively zero.
+        this->ensure_first_toehold_built();
     }
 
     void
@@ -2096,6 +2103,50 @@ size_t FastLocate::next_run_with_head_c(size_t c, size_t start_from) const {
     auto iter = bv.successor(start_from);
     if (iter == bv.one_end()) return SIZE_MAX;
     return iter->second;
+}
+
+// Precompute (first_bint[c], first_sa[c]) for each DNA character.  Called
+// eagerly at load time; guarded by std::once_flag for idempotence.  Storage
+// is a fixed 160 bytes so we build unconditionally rather than lazily --
+// simplifies the hot-path branch in backward_extend_encoded_with_sa.
+//
+// The build uses backward_extend_encoded and a locate walk (mirrors
+// find_mems.cpp::locate_sa_value).  This is a one-time cost of
+// DNA_ALPHABET_SIZE (=5) backward extends + up to a few dozen locateNext
+// calls -- immeasurable next to the ~7s run_head_c build.
+void FastLocate::ensure_first_toehold_built() const {
+    std::call_once(this->first_toehold_once, [this]() {
+        // Cast away const for backward_extend_encoded (historically
+        // non-const; documented in r-index.hpp as read-only in practice).
+        FastLocate* self = const_cast<FastLocate*>(this);
+        const bi_interval full{0, 0, this->bwt_size()};
+
+        for (size_t i = 0; i < DNA_ALPHABET_SIZE; ++i) {
+            const char dna_chars[DNA_ALPHABET_SIZE] = {'A', 'C', 'G', 'T', 'N'};
+            const size_t c = static_cast<size_t>(dna_chars[i]);
+
+            bi_interval bi = self->backward_extend_encoded(full, c);
+            this->first_bint[i] = bi;
+            if (bi.size <= 0) {
+                // Character absent from the index (typical for 'N' when
+                // encoded_has_N is false).  Toehold fast path will see
+                // size == 0 and delegate through to the general path.
+                this->first_sa[i] = FastLocate::NO_POSITION;
+                continue;
+            }
+
+            // Locate SA[bi.forward] the legacy way: containing run's
+            // sample + a walk over locateNext up to bi.forward.
+            size_t run_id = 0, offset_of_first = 0;
+            this->run_id_and_offset_at(bi.forward, run_id, offset_of_first);
+            size_type sa = this->getSample(run_id);
+            while (offset_of_first < bi.forward) {
+                sa = this->locateNext(sa);
+                ++offset_of_first;
+            }
+            this->first_sa[i] = sa;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
