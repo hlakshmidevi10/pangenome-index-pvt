@@ -856,8 +856,46 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
                                               size_t min_occ, size_t x,
                                               FastLocate& fmd_index,
                                               std::vector<MEM_with_sa>& output) {
+        // Guard: caller's outer loop enforces x + 1 >= min_len, but be
+        // defensive in case of standalone callers.
+        if (x + 1 < min_len) return SIZE_MAX;
+
+        // Step 0': forward-extend the length-min_len window pattern[x-min_len+1..x]
+        // as a pre-check.  Mirror of legacy Step 1's min_len bound: if this window
+        // has count < min_occ, no MEM of length >= min_len ends anywhere in
+        // [j, x] where j is the position that caused the failure -- so we can
+        // safely jump the next anchor to j - 1 and skip Step 1' / Step 2'.
+        //
+        // Correctness: Step 0' failure at position j means
+        //   count(P[x-min_len+1..j]) < min_occ.
+        // For any candidate MEM [a..y] with length >= min_len and y in [j, x-1]:
+        //   length >= min_len && y <= x-1  =>  a <= y-min_len+1 <= x-min_len.
+        // Hence P[a..y] contains P[x-min_len+1..j] as a substring, so
+        //   count(P[a..y]) <= count(P[x-min_len+1..j]) < min_occ.
+        // So no MEM of length >= min_len can end in [j, x-1]; the next anchor
+        // worth processing is j - 1.  (An emitted MEM ending at x itself is
+        // impossible if the length-min_len window already fails.)
+        //
+        // On Step 0' success, we DISCARD the forward interval and restart Step 1'
+        // from empty via backward_extend_encoded_with_sa (JR-011).  This is
+        // "Option A" (chosen in design discussion): the SA carry via the toehold
+        // table means restarting is cheap and avoids the bookkeeping needed to
+        // convert a forward interval into a backward-extend context.
+        {
+            FastLocate::bi_interval step0_fwd{0, 0, fmd_index.bwt_size()};
+            for (size_t j = x - min_len + 1; j <= x; ++j) {
+                step0_fwd = fmd_index.forward_extend_encoded(step0_fwd, static_cast<size_t>(pattern[j]));
+                if (step0_fwd.size < static_cast<int64_t>(min_occ) || step0_fwd.size <= 0) {
+                    // No MEM of length >= min_len ends in [j, x]. Next anchor = j - 1.
+                    return (j == 0) ? SIZE_MAX : j - 1;
+                }
+            }
+        }
+
         // Step 1': backward-extend from x leftward. Track the leftmost
         // successful position (i) and the interval's SA-carry state.
+        // Step 0' guarantees a match of length >= min_len ends at x, so
+        // Step 1' is guaranteed to succeed at least through x - min_len + 1.
         FastLocate::bi_interval bint{0, 0, fmd_index.bwt_size()};
         FastLocate::bi_interval last_good_bint = bint;  // holds the last-successful interval
         FastLocate::size_type last_good_sa = FastLocate::NO_POSITION;
@@ -878,55 +916,15 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         }
         if ((x - i + 1) >= min_len) {
             output.push_back({
-/* start     */ i,
-/* end       */ x + 1,
-/* bwt_start */ last_good_bint.forward,
-/* size      */ last_good_bint.size,
-/* sa_sp     */ last_good_sa
+                /* start     */ i,
+                /* end       */ x + 1,
+                /* bwt_start */ last_good_bint.forward,
+                /* size      */ last_good_bint.size,
+                /* sa_sp     */ last_good_sa
             });
         }
 
         return flipped_advance_anchor(pattern, min_occ, i, fmd_index, x);
-
-        // for (size_t j_plus_one = x + 1; j_plus_one > 0; --j_plus_one) {
-        //     const size_t j = j_plus_one - 1;
-        //     auto step = fmd_index.backward_extend_encoded_with_sa(bint, sa_sp, static_cast<size_t>(pattern[j]));
-        //     if (step.bint.size < static_cast<int64_t>(min_occ) || step.bint.size <= 0) {
-        //         break;  // extension at j failed; the last successful interval is at position (j + 1)..x
-        //     }
-        //     // Extension succeeded through position j.
-        //     bint = step.bint;
-        //     sa_sp = step.sa_sp;
-        //     last_good_bint = bint;
-        //     last_good_sa = sa_sp;
-        //     i = j;
-        // }
-        //
-        // // If Step 1' never succeeded (even the very first backward-extend at
-        // // pattern[x] dropped below min_occ), no MEM at this anchor; advance to
-        // // x - 1. This matches the Python prototype's `if i > x: return x - 1`
-        // // branch. Guard against x == 0 (which would underflow).
-        // if (i > x) {
-        //     if (x == 0) return SIZE_MAX;
-        //     return x - 1;
-        // }
-        //
-        // // Emit MEM only if its length meets the min_len bar. If it doesn't,
-        // // we STILL run Step 2' below to compute the next anchor -- that's
-        // // the state machine the Python prototype implements and that the
-        // // brute-force verification validates.
-        // const size_t mem_len = x - i + 1;
-        // if (mem_len >= min_len) {
-        //     output.push_back({
-        //         /* start     */ i,
-        //         /* end       */ x + 1,
-        //         /* bwt_start */ last_good_bint.forward,
-        //         /* size      */ last_good_bint.size,
-        //         /* sa_sp     */ last_good_sa
-        //     });
-        // }
-        //
-        // return flipped_advance_anchor(pattern, min_occ, i, fmd_index);
     }
 
     // Outer loop for the flipped finder. Mirror of find_all_mems, iterating
