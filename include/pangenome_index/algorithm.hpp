@@ -824,17 +824,16 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
     // Step 1' match was too short to emit; inlining twice would duplicate the
     // termination logic and risk drift.
     inline size_t flipped_advance_anchor(const std::string& pattern, size_t min_occ,
-                                          size_t i, FastLocate& fmd_index) {
+                                          size_t i, FastLocate& fmd_index, size_t x) {
         // MEM (or short match) covered the pattern's left edge -- no seed
         // character available for the forward extend. All anchors to the
         // left of i are inside the just-emitted (or attempted) match, so we
         // are done enumerating.
-        if (i == 0) return SIZE_MAX;
+        if (i == 0) return i;
 
-        const size_t len = pattern.length();
         FastLocate::bi_interval fwd{0, 0, fmd_index.bwt_size()};
         size_t j = i - 1;
-        while (j < len) {
+        while (j <= x) {
             fwd = fmd_index.forward_extend_encoded(fwd, static_cast<size_t>(pattern[j]));
             if (fwd.size < static_cast<int64_t>(min_occ) || fwd.size <= 0) {
                 // Failed at j; last successful extend ended at j - 1. That
@@ -842,15 +841,12 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
                 // very first character (j == i - 1) is at least min_occ
                 // occurring in the text (it's a single character; unless the
                 // char literally doesn't appear at all), typically j > 0 here.
-                if (j == 0) return SIZE_MAX;
                 return j - 1;
             }
             ++j;
         }
-        // Reached the pattern's right boundary without failure. Every position
-        // from i-1 onward is inside a successful extension; no more distinct
-        // right-anchors to process.
-        return SIZE_MAX;
+        // should never reach here, as you should only able to extend it till x-1.
+        return i - 1;
     }
 
     // Process a single right-anchor x. Emits at most one MEM into output and
@@ -860,18 +856,13 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
                                               size_t min_occ, size_t x,
                                               FastLocate& fmd_index,
                                               std::vector<MEM_with_sa>& output) {
-        const size_t len = pattern.length();
-        // Guard: if the remaining prefix pattern[0..x] is shorter than min_len,
-        // no MEM can start at or before x. Terminate.
-        if (x + 1 < min_len) return SIZE_MAX;
-
         // Step 1': backward-extend from x leftward. Track the leftmost
         // successful position (i) and the interval's SA-carry state.
         FastLocate::bi_interval bint{0, 0, fmd_index.bwt_size()};
         FastLocate::bi_interval last_good_bint = bint;  // holds the last-successful interval
         FastLocate::size_type last_good_sa = FastLocate::NO_POSITION;
         FastLocate::size_type sa_sp = FastLocate::NO_POSITION;
-        size_t i = x + 1;  // sentinel meaning "never succeeded"; will become the leftmost successful pos
+        size_t i = x;  // sentinel meaning "never succeeded"; will become the leftmost successful pos
         for (size_t j_plus_one = x + 1; j_plus_one > 0; --j_plus_one) {
             const size_t j = j_plus_one - 1;
             auto step = fmd_index.backward_extend_encoded_with_sa(bint, sa_sp, static_cast<size_t>(pattern[j]));
@@ -885,32 +876,57 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
             last_good_sa = sa_sp;
             i = j;
         }
-
-        // If Step 1' never succeeded (even the very first backward-extend at
-        // pattern[x] dropped below min_occ), no MEM at this anchor; advance to
-        // x - 1. This matches the Python prototype's `if i > x: return x - 1`
-        // branch. Guard against x == 0 (which would underflow).
-        if (i > x) {
-            if (x == 0) return SIZE_MAX;
-            return x - 1;
-        }
-
-        // Emit MEM only if its length meets the min_len bar. If it doesn't,
-        // we STILL run Step 2' below to compute the next anchor -- that's
-        // the state machine the Python prototype implements and that the
-        // brute-force verification validates.
-        const size_t mem_len = x - i + 1;
-        if (mem_len >= min_len) {
+        if ((x - i + 1) >= min_len) {
             output.push_back({
-                /* start     */ i,
-                /* end       */ x + 1,
-                /* bwt_start */ last_good_bint.forward,
-                /* size      */ last_good_bint.size,
-                /* sa_sp     */ last_good_sa
+/* start     */ i,
+/* end       */ x + 1,
+/* bwt_start */ last_good_bint.forward,
+/* size      */ last_good_bint.size,
+/* sa_sp     */ last_good_sa
             });
         }
 
-        return flipped_advance_anchor(pattern, min_occ, i, fmd_index);
+        return flipped_advance_anchor(pattern, min_occ, i, fmd_index, x);
+
+        // for (size_t j_plus_one = x + 1; j_plus_one > 0; --j_plus_one) {
+        //     const size_t j = j_plus_one - 1;
+        //     auto step = fmd_index.backward_extend_encoded_with_sa(bint, sa_sp, static_cast<size_t>(pattern[j]));
+        //     if (step.bint.size < static_cast<int64_t>(min_occ) || step.bint.size <= 0) {
+        //         break;  // extension at j failed; the last successful interval is at position (j + 1)..x
+        //     }
+        //     // Extension succeeded through position j.
+        //     bint = step.bint;
+        //     sa_sp = step.sa_sp;
+        //     last_good_bint = bint;
+        //     last_good_sa = sa_sp;
+        //     i = j;
+        // }
+        //
+        // // If Step 1' never succeeded (even the very first backward-extend at
+        // // pattern[x] dropped below min_occ), no MEM at this anchor; advance to
+        // // x - 1. This matches the Python prototype's `if i > x: return x - 1`
+        // // branch. Guard against x == 0 (which would underflow).
+        // if (i > x) {
+        //     if (x == 0) return SIZE_MAX;
+        //     return x - 1;
+        // }
+        //
+        // // Emit MEM only if its length meets the min_len bar. If it doesn't,
+        // // we STILL run Step 2' below to compute the next anchor -- that's
+        // // the state machine the Python prototype implements and that the
+        // // brute-force verification validates.
+        // const size_t mem_len = x - i + 1;
+        // if (mem_len >= min_len) {
+        //     output.push_back({
+        //         /* start     */ i,
+        //         /* end       */ x + 1,
+        //         /* bwt_start */ last_good_bint.forward,
+        //         /* size      */ last_good_bint.size,
+        //         /* sa_sp     */ last_good_sa
+        //     });
+        // }
+        //
+        // return flipped_advance_anchor(pattern, min_occ, i, fmd_index);
     }
 
     // Outer loop for the flipped finder. Mirror of find_all_mems, iterating
@@ -923,7 +939,7 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         const size_t len = pattern.length();
         if (len == 0) return mems;
         size_t x = len - 1;
-        while (x != SIZE_MAX && x < len) {
+        while (x >= min_len - 1) {
             x = find_mems_flipped_function(pattern, min_len, min_occ, x, fmd_index, mems);
         }
         return mems;
