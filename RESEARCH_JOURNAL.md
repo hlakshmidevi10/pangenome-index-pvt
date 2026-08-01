@@ -1558,19 +1558,13 @@ query callers it may matter. See Open question 2.
 
 ### Open questions
 
-1. **Step 2' overhead is the remaining ~+14 s.** On noisy reads,
-   flipped's Step 2' does a fresh `forward_extend_encoded` chain
-   from `pattern[i-1]` rightward on every outer-loop iteration,
-   regardless of whether Step 1' emitted a MEM. Two candidate
-   directions:
-   - **Reuse Step 1's ranks / interval state** to skip the
-     redundant right-extend when Step 2' would traverse characters
-     Step 1' already saw. Requires state-machine surgery in
-     `find_mems_flipped_function`; risk of subtle boundary bugs
-     (Risk D territory from DESIGN_FLIPPED_MEM.md).
-   - **Give up Step 2' precision** by using a cheaper anchor-
-     advance heuristic (e.g., always advance by 1). Would emit
-     extra failed backward-walks; needs a cost-benefit measure.
+1. **Step 2' overhead is the remaining ~+14 s.** **RESOLVED in JR-012**
+   via Step 0' pre-check: the outer-iteration count dropped 4.3x
+   (1.39M → 326K), and flipped's total wall now beats legacy on
+   both noisy (−20%) and clean (−28%). See JR-012 for details.
+   Original hypothesis directions (Step 1'/Step 2' state reuse,
+   or cheaper anchor-advance heuristic) were not needed; the
+   min_len pre-check turned out to be the right lever.
 2. **Consider serializing `run_head_c` and `first_bint` / `first_sa`
    to disk** in the .ri format, or dropping them entirely if a
    future rewrite makes their queries unnecessary. Current one-time
@@ -1624,6 +1618,217 @@ pipeline repo side.
 - `c44e475` r-index: add run_head_c parallel run-id bitvector; Test B passes
 - `5b1a4d7` r-index: precompute first_bint/first_sa toehold table at load
 - `607a0ca` r-index: rewrite backward_extend_encoded_with_sa (JR-010 perf fix)
+- `9e728de` journal: JR-011 backward_extend_encoded_with_sa rewrite + noisy-chr6 bench
+
+---
+
+## JR-012 — Step 0' min_len pre-check in find_mems_flipped: HPRC chr6 noisy + clean
+
+```yaml
+id: JR-012
+date: 2026-08-01
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [flipped, algorithm, perf, hprc, noisy, clean, step0]
+refs:
+  follows: [JR-011]
+  supersedes-perf-numbers-of: [JR-011]
+```
+
+### Context
+
+JR-011 fixed the JR-010 primitive-level regression but left flipped's
+outer-loop iteration count at 3.79x legacy on `chr6.alt_noisy.reads.txt`
+(1,389,639 iters vs 366,797) and its extend-call count at 2.51x legacy
+(58.8M vs 23.4M).  Post-JR-011 flipped MEM-finding on noisy chr6
+was ~44.5s vs legacy ~19.1s — +133%, entirely inside the outer loop.
+
+Profiling (bin/debug_flipped_perf, bin/debug_anchor_distribution)
+showed 88.8% of outer iterations were "short-match" iterations: Step 1'
+backward-extending ~11-20 characters before failing (min_len is 50), and
+Step 2' then advancing `x` by a very small anchor gap (gap=2 in 48% of
+cases, 82.7% ≤ 10).  Each such iteration cost ~27 bwe + ~15 fwe with
+no MEM emission.  Legacy's Step 1 avoids exactly this class of work
+via its length-`min_len` bound pre-check: it forward-extends the
+length-`min_len` window; on failure at position j, it can jump the next
+right endpoint to `j + 1` because no MEM of length ≥ `min_len` can
+straddle j.  The flipped algorithm inherited no analogous pre-check.
+
+### Hypothesis
+
+Mirror legacy Step 1's `min_len` bound in the flipped finder as **Step 0'**:
+before running Step 1', forward-extend the length-`min_len` window
+`pattern[x - min_len + 1 .. x]`.  On failure at position j, no MEM of
+length ≥ `min_len` can end anywhere in [j, x], so the next anchor can
+safely be `j - 1` (mirror of legacy's `j + 1` in the reverse
+direction) and Step 1' + Step 2' can be skipped entirely for this
+outer iteration.
+
+**Correctness argument** (also embedded as inline comment).  Step 0'
+failure at j means `count(P[x - min_len + 1 .. j]) < min_occ`.  For
+any candidate MEM `[a..y]` with `length ≥ min_len` and `y ∈ [j, x-1]`:
+`length ≥ min_len` and `y ≤ x - 1` imply `a ≤ y - min_len + 1 ≤ x - min_len`.
+Hence `P[a..y]` contains `P[x - min_len + 1 .. j]` as a substring, so
+`count(P[a..y]) ≤ count(P[x - min_len + 1 .. j]) < min_occ`.
+So no MEM of length ≥ `min_len` can end in [j, x-1].  (A MEM ending
+at x itself is also impossible since the length-`min_len` window
+containing x already fails.)
+
+**Design choice — Option A on success.**  When Step 0' succeeds
+(the length-`min_len` window has ≥ `min_occ` occurrences), we discard
+the accumulated forward interval and restart Step 1' from an empty
+interval via `backward_extend_encoded_with_sa` (JR-011).  The
+alternative — carrying the forward interval into Step 1' and
+avoiding the redundant re-extension — requires converting a forward
+interval into backward-extend context and re-establishing the SA
+carry from scratch.  Option A costs at most `min_len` extra
+forward-extends per emitted MEM, which is small relative to Step 1'
++ Step 2' cost.  The SA carry via the JR-011 toehold table makes
+the Step 1' restart itself cheap.
+
+### Method
+
+Implemented in `find_mems_flipped_function` (algorithm.hpp) as a
+prefix block before the existing Step 1'.  No changes to
+`flipped_advance_anchor` (Step 2') or `find_all_mems_flipped` outer
+loop.  Simulation prior to implementation (bin/debug_step0_perf on
+100K noisy chr6 reads) predicted:
+
+- outer iterations: 1,389,639 → 325,601 (−77%)
+- backward_extend calls: 37.9M → 16.6M (−56%)
+- forward_extend calls: 20.9M → 14.6M (−30%)
+- total extends: 58.8M → 31.2M (−47%)
+
+Empirical measurement used the JR-011 3-trial warm-cache protocol
+(2 warmups + 3 timed trials, warm-cache after the warmups),
+median-of-3, on both `chr6.alt_noisy.reads.txt` and `chr6.alt.reads.txt`.
+
+### Findings
+
+**Correctness (byte-identical output preserved).**
+- test_backward_extend_sa on yeast chrII: A 5000/5000, B 10000/10000,
+  C 100140 steps / 0 mismatches (JR-011 primitives unchanged).
+- test_flipped_mems on 100K yeast reads: 109520/109520 MEMs match
+  legacy, 0 SA mismatches, 0 flipped_missed, 0 flipped_extra.
+- E2E `./query.sh --gaf` on HPRC chr6 noisy: 2000/2000 valid,
+  GAF 532,534 lines, coverage MD5
+  `60f6b8e4a759aebb252b83a870b9ff8c` matches legacy s2-regcheck
+  baseline byte-for-byte.
+
+**Perf: HPRC chr6 3-trial warm-cache median (find_mems --lightweight-tags).**
+
+| workload | metric        | legacy | pre-Step 0' flipped | Step 0' flipped | vs legacy | vs pre-Step 0' |
+|:---------|:--------------|-------:|--------------------:|----------------:|----------:|---------------:|
+| noisy    | MEM finding   | 21.4s  | 44.5s               | **28.9s**       | +35%      | −35%           |
+| noisy    | total wall    | 55.6s  | ~60s                | **44.5s**       | **−20%**  | −26%           |
+| clean    | MEM finding   | 20.3s  | ~19.0s              | **23.0s**       | +13%      | +21%           |
+| clean    | total wall    | 50.2s  | ~35.2s              | **35.9s**       | **−28%**  | +2%            |
+
+Wall-time headlines:
+- **Noisy**: total wall −20% vs legacy, MEM finding down 15.6s from
+  the pre-Step 0' baseline (44.5s → 28.9s).  Step 0''s per-iter fwe
+  overhead pays off handsomely because most Step 0' calls fail
+  quickly (~29-30 fwe per fail per bin/debug_step0_perf) and each
+  failure prunes a whole Step 1' + Step 2' iteration.
+- **Clean**: total wall −28% vs legacy, essentially unchanged from
+  the pre-Step 0' clean baseline (35.9s vs ~35.2s).  On clean reads
+  Step 0' succeeds most of the time, adding `min_len` fwe overhead
+  per emit iter, but this is small and does not regress total wall
+  meaningfully; the pipeline downstream savings (present in the
+  flipped path since JR-008) still dominate.
+
+**Extend-call counts (bin/debug_step0_perf simulation model).**
+
+| metric               | legacy | pre-Step 0' flipped | Step 0' flipped |
+|:---------------------|-------:|--------------------:|----------------:|
+| outer iterations     | 366,797 | 1,389,639 | 325,601 |
+| backward_extend calls | 14.6M | 37.9M | 16.6M |
+| forward_extend calls  |  8.9M | 20.9M | 14.6M |
+| **total extends**     | **23.4M** | **58.8M** | **31.2M** |
+| MEMs emitted          | 155,551 | 155,551 | 155,551 |
+
+Post-Step 0' outer iteration count (325,601) is now slightly *below*
+legacy (366,797) because Step 0''s `j - 1` jump on failure is
+tighter than legacy's `j + 1` jump on the corresponding forward
+direction.  Emit rate rises to 47.8% of iters (155K / 326K), close
+to legacy's 42% (155K / 367K).  The remaining +33% extend gap
+vs legacy comes from Step 1' backward walks emitting MEMs of avg
+length 106 chars — bigger MEMs cost more backward extends per emit
+than legacy's bounded incremental growth pattern.
+
+### Verification chain
+
+Same three gates as JR-011, all PASS with byte-identical output.
+Data artifacts under `xy-test/step0_noisy_*_${VARIANT}_${trial}/` and
+`xy-test/step0_clean_*_${VARIANT}_${trial}/`.
+
+### Discussion
+
+**Wall-time beats legacy on both workloads.** JR-008's original
+finding (flipped ~10-13% faster than legacy on clean chr6 at wall
+time) is now stronger: −28% on clean, −20% on noisy.  Recommendation
+in JR-011 open question #3 ("workload-aware toggle") is superseded —
+flipped can be enabled unconditionally without workload-specific
+regression risk.
+
+**MEM finding still lags legacy per-iter on noisy.** Step 0' gets
+flipped's noisy MEM finding from +133% (pre-Step 0') to +35% vs
+legacy.  The residual gap is intrinsic to model (b) enumeration
+(one MEM per qualifying right-endpoint): flipped must run Step 1'
+fully from scratch for every emitted MEM to get correct SA carry
+via the toehold table, while legacy's Step 3 preserves interval
+state across MEM emissions.  Closing this gap would require a
+different flipped state machine — deferred.
+
+**JR-011's noisy perf numbers are historical.** The pre-Step 0' 
+flipped column in the table above is the same code JR-011 measured.
+Under Step 0', JR-011's specific outcome ("flipped +27% wall vs
+legacy on noisy") is superseded by JR-012's ("flipped −20% wall vs
+legacy on noisy").  JR-011's primitive rewrite remains the enabling
+foundation (Step 0''s Option A design depends on cheap SA-carrying
+backward-extend from empty, which JR-011 delivered).
+
+### Open questions
+
+1. **Bigger-MEM growth pattern** in Step 1'. Avg emitted MEM length
+   on noisy chr6 is 106 chars, meaning each emit costs ~106 bwe.
+   Legacy's Step 2 grows matches incrementally within its outer
+   loop and can share state across emissions.  A "grow only" Step 1'
+   variant that skips the length-`min_len` characters Step 0' already
+   forward-extended (converting the forward interval into a backward
+   context) could save the first `min_len` bwe per emit — ~7.8M
+   bwe (155K × 50) at cost of some algorithmic complexity.  Not yet
+   attempted.
+2. **`FIND_MEMS_EXTRA_FLAGS` hook** in pipeline `query.sh` (added
+   in JR-011 session, uncommitted on that repo side) is now used
+   by both JR-011 and JR-012 gate 3.  Should be committed on the
+   pipeline repo per the JR-008 perf_harness.sh precedent.
+3. **Default toggle for `--use-flipped-mems`.** Given the JR-012
+   findings (flipped beats legacy on wall time on both noisy and
+   clean workloads by 20-28%, load-time cost ~8s amortized in
+   batch), flipping the default seems justified.  Deferred pending
+   user direction.
+
+### Data artifacts
+
+- `xy-test/step0_noisy_bench_{legacy,step0_flipped}_{1,2,3}/run.log`
+  — 3-trial noisy benchmark logs.
+- `xy-test/step0_clean_bench_{legacy,step0_flipped}_{1,2,3}/run.log`
+  — 3-trial clean benchmark logs.
+- `runs/hprc-chr6-2026-06-02/queries/step0-flipped-noisy/` — E2E
+  --gaf run of Step 0' flipped on chr6 noisy (correctness gate 3).
+- `runs/hprc-chr6-2026-06-02/queries/s2-regcheck/` — legacy
+  baseline (coverage MD5 reference).
+- `src/debug_step0_perf.cpp` — simulation harness used to model
+  Step 0' cost prior to implementation (Option A logic).
+- `src/debug_flipped_perf.cpp`, `src/debug_legacy_perf.cpp`,
+  `src/debug_anchor_distribution.cpp` — instrumented profilers
+  used to identify the outer-iteration overhead.
+
+### Commits (this repo, branch backward-extend-sa-perf)
+
+- `37dc2d9` algorithm: rewrite find_mems_flipped state machine (correctness)
+- `83ef433` algorithm: add Step 0' min_len pre-check to find_mems_flipped (perf)
 - (this entry, pending as of writing)
 
 ---
