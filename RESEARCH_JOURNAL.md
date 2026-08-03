@@ -1629,10 +1629,11 @@ id: JR-012
 date: 2026-08-01
 author: claude-opus-4-7 (session with hlakshmidevi)
 status: resolved
-tags: [flipped, algorithm, perf, hprc, noisy, clean, step0]
+tags: [flipped, algorithm, perf, hprc, noisy, clean, step0, vesuvio]
 refs:
   follows: [JR-011]
   supersedes-perf-numbers-of: [JR-011]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
 ```
 
 ### Context
@@ -1699,45 +1700,63 @@ loop.  Simulation prior to implementation (bin/debug_step0_perf on
 - forward_extend calls: 20.9M → 14.6M (−30%)
 - total extends: 58.8M → 31.2M (−47%)
 
-Empirical measurement used the JR-011 3-trial warm-cache protocol
-(2 warmups + 3 timed trials, warm-cache after the warmups),
+Empirical measurement used the JR-008 `perf_harness.sh` protocol
+(2 untimed warmups + 3 timed trials, contiguous per-mode ordering),
 median-of-3, on both `chr6.alt_noisy.reads.txt` and `chr6.alt.reads.txt`.
+**All authoritative perf numbers reported here are from Vesuvio**
+(host `vesuvio`, Linux 6.12.73, x86_64 Debian) — the canonical
+benchmarking platform. Prototyping/design iteration was done on a
+darwin/arm64 developer Mac and is not reported.
 
 ### Findings
 
 **Correctness (byte-identical output preserved).**
-- test_backward_extend_sa on yeast chrII: A 5000/5000, B 10000/10000,
+- `test_backward_extend_sa` on yeast chrII: A 5000/5000, B 10000/10000,
   C 100140 steps / 0 mismatches (JR-011 primitives unchanged).
-- test_flipped_mems on 100K yeast reads: 109520/109520 MEMs match
+- `test_flipped_mems` on 100K yeast reads: 109520/109520 MEMs match
   legacy, 0 SA mismatches, 0 flipped_missed, 0 flipped_extra.
 - E2E `./query.sh --gaf` on HPRC chr6 noisy: 2000/2000 valid,
   GAF 532,534 lines, coverage MD5
   `60f6b8e4a759aebb252b83a870b9ff8c` matches legacy s2-regcheck
   baseline byte-for-byte.
 
-**Perf: HPRC chr6 3-trial warm-cache median (find_mems --lightweight-tags).**
+**Perf: HPRC chr6 on Vesuvio, `perf_harness.sh` median-of-3,
+find_mems --lightweight-tags (perf tags jr012-{noisy,clean}-{legacy,step0}).**
 
-| workload | metric        | legacy | pre-Step 0' flipped | Step 0' flipped | vs legacy | vs pre-Step 0' |
-|:---------|:--------------|-------:|--------------------:|----------------:|----------:|---------------:|
-| noisy    | MEM finding   | 21.4s  | 44.5s               | **28.9s**       | +35%      | −35%           |
-| noisy    | total wall    | 55.6s  | ~60s                | **44.5s**       | **−20%**  | −26%           |
-| clean    | MEM finding   | 20.3s  | ~19.0s              | **23.0s**       | +13%      | +21%           |
-| clean    | total wall    | 50.2s  | ~35.2s              | **35.9s**       | **−28%**  | +2%            |
+| workload | metric               | legacy | Step 0' flipped | Δ vs legacy |
+|:---------|:---------------------|-------:|----------------:|------------:|
+| noisy    | **total execution**  | **60.33s** | **53.29s**  | **−7.04s (−11.7%)** |
+| noisy    | R-index load         | 11.50s | 11.55s          | +0.05s |
+| noisy    | MEM finding          | 28.35s | 38.63s          | +10.28s (+36%) |
+| noisy    | MEM processing       | 19.80s | 2.48s           | **−17.32s (−87%)** |
+| noisy    | ├─ tag queries       | 0.11s  | 0.11s           |  0.00s |
+| noisy    | ├─ first locate      | 17.65s | **0.00s**       | **−17.65s** |
+| noisy    | └─ locate-next       | 1.88s  | 2.21s           | +0.33s |
+| noisy    | peak RSS             | 4512 MB| 4512 MB         |  0 MB |
+| clean    | **total execution**  | **49.13s** | **44.03s**  | **−5.10s (−10.4%)** |
+| clean    | R-index load         | 11.54s | 11.54s          |  0.00s |
+| clean    | MEM finding          | 24.67s | 30.96s          | +6.29s (+25%) |
+| clean    | MEM processing       | 12.26s | 0.88s           | **−11.38s (−93%)** |
+| clean    | ├─ tag queries       | 0.07s  | 0.07s           |  0.00s |
+| clean    | ├─ first locate      | 11.43s | **0.00s**       | **−11.43s** |
+| clean    | └─ locate-next       | 0.62s  | 0.67s           | +0.05s |
+| clean    | peak RSS             | 4520 MB| 4521 MB         | +1 MB |
 
 Wall-time headlines:
-- **Noisy**: total wall −20% vs legacy, MEM finding down 15.6s from
-  the pre-Step 0' baseline (44.5s → 28.9s).  Step 0''s per-iter fwe
-  overhead pays off handsomely because most Step 0' calls fail
-  quickly (~29-30 fwe per fail per bin/debug_step0_perf) and each
-  failure prunes a whole Step 1' + Step 2' iteration.
-- **Clean**: total wall −28% vs legacy, essentially unchanged from
-  the pre-Step 0' clean baseline (35.9s vs ~35.2s).  On clean reads
-  Step 0' succeeds most of the time, adding `min_len` fwe overhead
-  per emit iter, but this is small and does not regress total wall
-  meaningfully; the pipeline downstream savings (present in the
-  flipped path since JR-008) still dominate.
+- **Noisy**: total wall −11.7% (60.33s → 53.29s). MEM finding costs
+  +10.3s more (Step 0' + Step 1' + Step 2' > legacy 3-phase), but MEM
+  processing collapses by 17.3s (−87%) because flipped's SA-carry
+  (JR-011 toehold table) eliminates the 155.5K `locate_sa_value`
+  first-locate calls entirely (17.65s → 0.00s).
+- **Clean**: total wall −10.4% (49.13s → 44.03s). Same mechanism —
+  MEM finding pays +6.3s to save +11.4s in MEM processing (−93%),
+  with first-locate collapsing from 11.43s to 0.00s.
+- Peak RSS is identical between paths (within 1 MB); no memory
+  regression.
 
-**Extend-call counts (bin/debug_step0_perf simulation model).**
+**Extend-call counts (bin/debug_step0_perf simulation model, 100K
+noisy chr6 reads, Mac prototyping platform — algorithmic totals
+architecture-independent).**
 
 | metric               | legacy | pre-Step 0' flipped | Step 0' flipped |
 |:---------------------|-------:|--------------------:|----------------:|
@@ -1750,8 +1769,8 @@ Wall-time headlines:
 Post-Step 0' outer iteration count (325,601) is now slightly *below*
 legacy (366,797) because Step 0''s `j - 1` jump on failure is
 tighter than legacy's `j + 1` jump on the corresponding forward
-direction.  Emit rate rises to 47.8% of iters (155K / 326K), close
-to legacy's 42% (155K / 367K).  The remaining +33% extend gap
+direction. Emit rate rises to 47.8% of iters (155K / 326K), close
+to legacy's 42% (155K / 367K). The remaining +33% extend gap
 vs legacy comes from Step 1' backward walks emitting MEMs of avg
 length 106 chars — bigger MEMs cost more backward extends per emit
 than legacy's bounded incremental growth pattern.
@@ -1759,34 +1778,50 @@ than legacy's bounded incremental growth pattern.
 ### Verification chain
 
 Same three gates as JR-011, all PASS with byte-identical output.
-Data artifacts under `xy-test/step0_noisy_*_${VARIANT}_${trial}/` and
-`xy-test/step0_clean_*_${VARIANT}_${trial}/`.
+Vesuvio perf artifacts under
+`../mem-projection/pangenome-pipeline/perf/jr012-{noisy,clean}-{legacy,step0}/`
+(SUMMARY.tsv + per-trial find_mems.log/.time/.stderr + PROVENANCE.txt).
 
 ### Discussion
 
 **Wall-time beats legacy on both workloads.** JR-008's original
 finding (flipped ~10-13% faster than legacy on clean chr6 at wall
-time) is now stronger: −28% on clean, −20% on noisy.  Recommendation
-in JR-011 open question #3 ("workload-aware toggle") is superseded —
-flipped can be enabled unconditionally without workload-specific
-regression risk.
+time) is confirmed and extended: −10.4% on clean and −11.7% on
+noisy on Vesuvio. Recommendation in JR-011 open question #3
+("workload-aware toggle") is superseded — flipped can be enabled
+unconditionally without workload-specific regression risk.
 
-**MEM finding still lags legacy per-iter on noisy.** Step 0' gets
-flipped's noisy MEM finding from +133% (pre-Step 0') to +35% vs
-legacy.  The residual gap is intrinsic to model (b) enumeration
-(one MEM per qualifying right-endpoint): flipped must run Step 1'
-fully from scratch for every emitted MEM to get correct SA carry
-via the toehold table, while legacy's Step 3 preserves interval
-state across MEM emissions.  Closing this gap would require a
-different flipped state machine — deferred.
+**MEM finding still lags legacy on both workloads.** Step 0' gets
+flipped's noisy MEM finding to +36% vs legacy (down from +133%
+pre-Step 0' on the same code path). The residual gap is intrinsic to
+model (b) enumeration (one MEM per qualifying right-endpoint):
+flipped must run Step 1' fully from scratch for every emitted MEM
+to get correct SA carry via the toehold table, while legacy's Step 3
+preserves interval state across MEM emissions. Closing this gap
+would require a different flipped state machine — deferred (see
+Open question #1).
 
-**JR-011's noisy perf numbers are historical.** The pre-Step 0' 
-flipped column in the table above is the same code JR-011 measured.
-Under Step 0', JR-011's specific outcome ("flipped +27% wall vs
-legacy on noisy") is superseded by JR-012's ("flipped −20% wall vs
-legacy on noisy").  JR-011's primitive rewrite remains the enabling
-foundation (Step 0''s Option A design depends on cheap SA-carrying
-backward-extend from empty, which JR-011 delivered).
+**Trial-to-trial variance on Vesuvio is very tight** (per-trial
+totals within ±0.5s of the median across all four configurations),
+indicating the benchmark is CPU-bound with negligible OS/I/O jitter
+under `perf_harness.sh`'s warm-cache protocol. This makes small
+percentage deltas trustworthy.
+
+**Load-time cost is unchanged from JR-011.** R-index load is
+~11.5s on Vesuvio (JR-011's eager `run_head_c` bitvector build +
+`first_bint`/`first_sa` toehold table precompute). Both legacy and
+flipped paths pay this cost identically because they share the same
+r-index loader. JR-011 open question #2 (serialize the tables to
+disk) remains the natural follow-up if single-query latency matters;
+in batch contexts this amortizes to zero.
+
+**JR-011's noisy perf numbers are historical.** JR-011 measured the
+pre-Step 0' flipped code and reported "flipped +27% wall vs legacy on
+noisy". Under Step 0', that outcome is superseded by JR-012's "flipped
+−11.7% wall vs legacy on noisy" (Vesuvio). JR-011's primitive rewrite
+remains the enabling foundation — Step 0''s Option A design depends
+on cheap SA-carrying backward-extend from empty, which JR-011
+delivered.
 
 ### Open questions
 
@@ -1804,21 +1839,29 @@ backward-extend from empty, which JR-011 delivered).
    by both JR-011 and JR-012 gate 3.  Should be committed on the
    pipeline repo per the JR-008 perf_harness.sh precedent.
 3. **Default toggle for `--use-flipped-mems`.** Given the JR-012
-   findings (flipped beats legacy on wall time on both noisy and
-   clean workloads by 20-28%, load-time cost ~8s amortized in
-   batch), flipping the default seems justified.  Deferred pending
-   user direction.
+   Vesuvio findings (flipped beats legacy on wall time on both
+   noisy and clean workloads by 10-12%, byte-identical output,
+   identical peak RSS, load-time cost ~11.5s amortized in batch),
+   flipping the default seems justified. Deferred pending user
+   direction.
 
 ### Data artifacts
 
-- `xy-test/step0_noisy_bench_{legacy,step0_flipped}_{1,2,3}/run.log`
-  — 3-trial noisy benchmark logs.
-- `xy-test/step0_clean_bench_{legacy,step0_flipped}_{1,2,3}/run.log`
-  — 3-trial clean benchmark logs.
+**Vesuvio perf benchmark (canonical / source of truth):**
+- `../mem-projection/pangenome-pipeline/perf/jr012-noisy-legacy/`
+  — SUMMARY.tsv, PROVENANCE.txt, and lightweight/trial-{1,2,3}/
+    (find_mems.log, find_mems.stderr, find_mems.time, gafpack.*).
+- `../mem-projection/pangenome-pipeline/perf/jr012-noisy-step0/`
+- `../mem-projection/pangenome-pipeline/perf/jr012-clean-legacy/`
+- `../mem-projection/pangenome-pipeline/perf/jr012-clean-step0/`
+
+**Correctness gate artifacts:**
 - `runs/hprc-chr6-2026-06-02/queries/step0-flipped-noisy/` — E2E
-  --gaf run of Step 0' flipped on chr6 noisy (correctness gate 3).
+  `--gaf` run of Step 0' flipped on chr6 noisy (correctness gate 3).
 - `runs/hprc-chr6-2026-06-02/queries/s2-regcheck/` — legacy
   baseline (coverage MD5 reference).
+
+**Prototyping / design artifacts (Mac):**
 - `src/debug_step0_perf.cpp` — simulation harness used to model
   Step 0' cost prior to implementation (Option A logic).
 - `src/debug_flipped_perf.cpp`, `src/debug_legacy_perf.cpp`,
@@ -1829,6 +1872,7 @@ backward-extend from empty, which JR-011 delivered).
 
 - `37dc2d9` algorithm: rewrite find_mems_flipped state machine (correctness)
 - `83ef433` algorithm: add Step 0' min_len pre-check to find_mems_flipped (perf)
-- (this entry, pending as of writing)
+- `ecd8483` journal: JR-012 Step 0' min_len pre-check in find_mems_flipped
+- (Vesuvio verification amendment, pending as of writing)
 
 ---
