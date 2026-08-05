@@ -831,16 +831,23 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         // are done enumerating.
         if (i == 0) return i;
 
-        FastLocate::bi_interval fwd{0, 0, fmd_index.bwt_size()};
+        // Step 2' first extend uses the precomputed first_forward(c) table
+        // (O(1), zero rank ops) rather than paying for
+        // forward_extend_encoded on an empty interval.  See r-index.hpp
+        // first_forward for the O(1) precomputation.
         size_t j = i - 1;
+        FastLocate::bi_interval fwd = fmd_index.first_forward(static_cast<size_t>(pattern[j]));
+        if (fwd.size < static_cast<int64_t>(min_occ) || fwd.size <= 0) {
+            // The seed character itself has fewer than min_occ occurrences
+            // in the index. Same failure semantics as the main loop below.
+            return (j == 0) ? SIZE_MAX : j - 1;
+        }
+        ++j;
         while (j <= x) {
             fwd = fmd_index.forward_extend_encoded(fwd, static_cast<size_t>(pattern[j]));
             if (fwd.size < static_cast<int64_t>(min_occ) || fwd.size <= 0) {
                 // Failed at j; last successful extend ended at j - 1. That
-                // becomes the next anchor. j >= i - 1 >= 0, and since the
-                // very first character (j == i - 1) is at least min_occ
-                // occurring in the text (it's a single character; unless the
-                // char literally doesn't appear at all), typically j > 0 here.
+                // becomes the next anchor. j >= i (from ++j), so j - 1 >= i - 1 >= 0.
                 return j - 1;
             }
             ++j;
@@ -881,9 +888,16 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         // "Option A" (chosen in design discussion): the SA carry via the toehold
         // table means restarting is cheap and avoids the bookkeeping needed to
         // convert a forward interval into a backward-extend context.
+        //
+        // First iteration of Step 0' uses first_forward(c) (O(1) precomputed)
+        // rather than paying for forward_extend_encoded on an empty interval.
         {
-            FastLocate::bi_interval step0_fwd{0, 0, fmd_index.bwt_size()};
-            for (size_t j = x - min_len + 1; j <= x; ++j) {
+            const size_t j0 = x - min_len + 1;
+            FastLocate::bi_interval step0_fwd = fmd_index.first_forward(static_cast<size_t>(pattern[j0]));
+            if (step0_fwd.size < static_cast<int64_t>(min_occ) || step0_fwd.size <= 0) {
+                return (j0 == 0) ? SIZE_MAX : j0 - 1;
+            }
+            for (size_t j = j0 + 1; j <= x; ++j) {
                 step0_fwd = fmd_index.forward_extend_encoded(step0_fwd, static_cast<size_t>(pattern[j]));
                 if (step0_fwd.size < static_cast<int64_t>(min_occ) || step0_fwd.size <= 0) {
                     // No MEM of length >= min_len ends in [j, x]. Next anchor = j - 1.
@@ -896,12 +910,28 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         // successful position (i) and the interval's SA-carry state.
         // Step 0' guarantees a match of length >= min_len ends at x, so
         // Step 1' is guaranteed to succeed at least through x - min_len + 1.
+        //
+        // First iteration uses first_backward_with_sa(c) (O(1) precomputed
+        // toehold) rather than paying for backward_extend_encoded_with_sa
+        // on the whole-BWT interval.  Subsequent iterations use the primitive
+        // proper (which now has a tightened contract that requires a valid
+        // sa_sp seed -- see r-index.hpp).
         FastLocate::bi_interval bint{0, 0, fmd_index.bwt_size()};
         FastLocate::bi_interval last_good_bint = bint;  // holds the last-successful interval
         FastLocate::size_type last_good_sa = FastLocate::NO_POSITION;
         FastLocate::size_type sa_sp = FastLocate::NO_POSITION;
-        size_t i = x;  // sentinel meaning "never succeeded"; will become the leftmost successful pos
-        for (size_t j_plus_one = x + 1; j_plus_one > 0; --j_plus_one) {
+        size_t i = x;
+
+        // Seed: first Step 1' extend via the precomputed table
+        auto seed = fmd_index.first_backward_with_sa(static_cast<size_t>(pattern[x]));
+        bint = seed.bint;
+        sa_sp = seed.sa_sp;
+        last_good_bint = bint;
+        last_good_sa = sa_sp;
+        i = x;
+
+        // Continue Step 1' from j = x - 1 downward
+        for (size_t j_plus_one = x; j_plus_one > 0; --j_plus_one) {
             const size_t j = j_plus_one - 1;
             auto step = fmd_index.backward_extend_encoded_with_sa(bint, sa_sp, static_cast<size_t>(pattern[j]));
             if (step.bint.size < static_cast<int64_t>(min_occ) || step.bint.size <= 0) {
@@ -914,15 +944,15 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
             last_good_sa = sa_sp;
             i = j;
         }
-        if ((x - i + 1) >= min_len) {
-            output.push_back({
-                /* start     */ i,
-                /* end       */ x + 1,
-                /* bwt_start */ last_good_bint.forward,
-                /* size      */ last_good_bint.size,
-                /* sa_sp     */ last_good_sa
-            });
-        }
+
+        // Should be at least min_len at this point
+        output.push_back({
+            /* start     */ i,
+            /* end       */ x + 1,
+            /* bwt_start */ last_good_bint.forward,
+            /* size      */ last_good_bint.size,
+            /* sa_sp     */ last_good_sa
+        });
 
         return flipped_advance_anchor(pattern, min_occ, i, fmd_index, x);
     }

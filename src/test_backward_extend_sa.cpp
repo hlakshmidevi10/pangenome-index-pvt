@@ -101,6 +101,10 @@ struct TrialStats {
 
 enum class StepCase { INITIAL, CASE_A, CASE_B };
 
+// Classify the step BEFORE it executes so we can bucket case-A / case-B
+// stats.  The INITIAL case is only produced by the very first iteration
+// of a fresh walk (i == 0), which now goes through the O(1) precomputed
+// first_backward_with_sa(c) accessor rather than the primitive itself.
 StepCase classify_step(const FastLocate& idx, const FastLocate::bi_interval& bint,
                        size_type sa_sp_prev, size_t a) {
     if (sa_sp_prev == FastLocate::NO_POSITION) return StepCase::INITIAL;
@@ -108,6 +112,13 @@ StepCase classify_step(const FastLocate& idx, const FastLocate::bi_interval& bin
     return StepCase::CASE_B;
 }
 
+// Exercise the SA-carry chain: first step goes through the precomputed
+// toehold accessor (first_backward_with_sa), subsequent steps through
+// backward_extend_encoded_with_sa proper.  This mirrors the production
+// hot path in algorithm.hpp after the 2026-08-06 contract tightening
+// (see r-index.hpp: backward_extend_encoded_with_sa now asserts that
+// bint is non-empty and sa_sp_prev is a valid SA, so the "start from
+// whole-BWT + NO_POSITION" pattern must use the accessor).
 void run_one_bwe_trial(FastLocate& idx, const std::vector<size_t>& chars,
                        TrialStats& stats, const std::string& label) {
     stats.trials++;
@@ -118,11 +129,21 @@ void run_one_bwe_trial(FastLocate& idx, const std::vector<size_t>& chars,
     for (size_t i = 0; i < chars.size(); ++i) {
         StepCase which = classify_step(idx, bint, sa_sp, chars[i]);
 
-        auto out = idx.backward_extend_encoded_with_sa(bint, sa_sp, chars[i]);
+        FastLocate::bi_interval_with_sa out;
+        FastLocate::bi_interval gt_bint;
+        if (which == StepCase::INITIAL) {
+            // Fresh walk: use the precomputed accessor.  Ground truth is
+            // backward_extend_encoded on the whole-BWT interval.
+            out = idx.first_backward_with_sa(chars[i]);
+            gt_bint = idx.backward_extend_encoded(bint, chars[i]);
+        } else {
+            // Continuation: primitive with a valid (bint, sa_sp) pair.
+            out = idx.backward_extend_encoded_with_sa(bint, sa_sp, chars[i]);
+            gt_bint = idx.backward_extend_encoded(bint, chars[i]);
+        }
 
         if (out.bint.size <= 0) return;  // walk terminated
 
-        FastLocate::bi_interval gt_bint = idx.backward_extend_encoded(bint, chars[i]);
         if (gt_bint.forward != out.bint.forward || gt_bint.reverse != out.bint.reverse ||
             gt_bint.size != out.bint.size) {
             stats.record_mismatch(label + " step=" + std::to_string(i) +

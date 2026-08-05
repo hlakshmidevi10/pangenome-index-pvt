@@ -416,28 +416,31 @@ namespace panindexer {
         // exists.  O(log r) via successor.
         size_t next_run_with_head_c(size_t c, size_t start_from) const;
 
-        // Precomputed 'first backward-extend from an empty match' table.
+        // Precomputed 'first extend from an empty match' table.
         // Indexed by dna_char_to_idx(c) in [0, DNA_ALPHABET_SIZE).
         //   first_bint[i] = backward_extend_encoded({0, 0, bwt_size}, c),
         //                    where c is the DNA char at index i.
         //   first_sa[i]   = SA[first_bint[i].forward] via locate_sa_value.
         //
-        // Used by backward_extend_encoded_with_sa's toehold fast path
-        // (sub-step 7): when the caller passes sa_sp_prev == NO_POSITION
-        // and bint == the whole-BWT interval, the answer is exactly
-        // (first_bint[i], first_sa[i]) -- zero rank ops, zero locate walks.
+        // Consumed exclusively through the public accessors
+        // first_backward(c) / first_backward_with_sa(c) / first_forward(c)
+        // (see below).  All three flipped-finder call sites in
+        // algorithm.hpp use these accessors to skip the first extend of
+        // each fresh walk (Step 0', Step 1', Step 2') with zero rank
+        // ops or locate walks.
         //
         // Built eagerly at load time via ensure_first_toehold_built.
         // Storage: 5 bi_interval + 5 size_type ~ 160 bytes total.  Not
         // serialized (trivial to recompute).  Empty extend for a
         // character absent from the index leaves first_bint[i].size == 0
-        // and first_sa[i] == NO_POSITION; the toehold fast path bails
-        // on size == 0 (mirrors the general-path empty result).
+        // and first_sa[i] == NO_POSITION; the accessors bail on size == 0
+        // (mirrors the general-path empty result).
         mutable std::array<bi_interval, DNA_ALPHABET_SIZE> first_bint;
         mutable std::array<size_type, DNA_ALPHABET_SIZE> first_sa;
         mutable std::once_flag first_toehold_once;
 
         void ensure_first_toehold_built() const;
+
 
         // Find the leftmost BWT position p in [sp, ep] such that BWT[p] == c,
         // where c is a raw DNA character byte ('A','C','G','T','N'). Returns
@@ -534,23 +537,23 @@ namespace panindexer {
         // MEM emission -- eliminating the seed cost measured in
         // FINDINGS_SEED_COST.md (32% of walk time).
         //
-        // Two modes, distinguished by the sentinel FastLocate::NO_POSITION in
-        // `sa_sp_prev`:
+        // Contract (tightened 2026-08-06 -- see design notes on hoisting the
+        // toehold check to callers):
+        //   * bint must be a non-empty interval produced by a prior extend
+        //     (i.e. bint.size > 0).
+        //   * sa_sp_prev must be a valid SA[bint.forward] value, NOT the
+        //     sentinel NO_POSITION.
         //
-        //   1) Initial toehold: caller passes `sa_sp_prev = NO_POSITION`. Any
-        //      prior interval works; typically the whole-BWT interval
-        //      {0, 0, bwt_size()}. After computing the new interval, the
-        //      function seeds SA[new_sp] via a one-time locate walk from the
-        //      containing run's sample. Equivalent cost to a single legacy
-        //      locate_sa_value at the start of each Step 1' walk.
+        // Callers that want to *start* a fresh walk from the whole-BWT
+        // interval must obtain their first (bint, sa_sp) pair from
+        // first_backward_with_sa(c), which returns the precomputed answer
+        // in O(1).  This primitive then handles all subsequent steps.
         //
-        //   2) Subsequent step: caller passes the previous step's sa_sp. If the
-        //      new interval is non-empty, sa_sp is updated via one of:
-        //        Case A (BWT[old_sp] == c): sa_sp' = sa_sp - 1 (LF-decrement).
-        //        Case B (BWT[old_sp] != c): find leftmost c-position j in
-        //          [old_sp, old_ep] via leftmost_c_in_interval; j is at a
-        //          c-run start so SA[j] = samples[run_id_at(j)]; then
-        //          sa_sp' = SA[j] - 1.
+        // Case A (BWT[old_sp] == c): sa_sp' = sa_sp - 1 (LF-decrement).
+        // Case B (BWT[old_sp] != c): find leftmost c-position j in
+        //   [old_sp, old_ep] via successor over run_head_c[c]; j is at a
+        //   c-run start so SA[j] = samples[run_id_at(j)]; then
+        //   sa_sp' = SA[j] - 1.
         //
         // Return value: bi_interval_with_sa with sa_sp set only when the new
         // interval is non-empty (bint.size > 0). On empty result, sa_sp is
@@ -565,6 +568,52 @@ namespace panindexer {
         // run_id_and_offset_at, locateNext, leftmost_c_in_interval) are const.
         bi_interval_with_sa backward_extend_encoded_with_sa(
             const bi_interval& bint, size_type sa_sp_prev, size_t symbol);
+
+        // Public accessors for the precomputed 'first extend from whole-BWT'
+        // table (first_bint / first_sa).  These replace the whole-BWT
+        // toehold fast paths that used to live inside
+        // backward_extend_encoded_with_sa (see contract change above).
+        // Hoisting these to the caller lets three flipped-finder call sites
+        // (Step 0', Step 1', Step 2') skip the first extend of every fresh
+        // walk uniformly, with zero rank ops and zero locate walks.
+        //
+        // Semantics:
+        //   first_backward_with_sa(c) == backward_extend_encoded_with_sa(
+        //       {0, 0, bwt_size}, NO_POSITION, c)  -- Step 1' seed.
+        //   first_backward(c)         == backward_extend_encoded(
+        //       {0, 0, bwt_size}, c)               -- interval only.
+        //   first_forward(c)          == forward_extend_encoded(
+        //       {0, 0, bwt_size}, c)               -- Step 0' / Step 2' seed.
+        //
+        // On a character absent from the index (or non-DNA c) the returned
+        // bi_interval has size == 0 -- callers observe an empty extend and
+        // stop the walk, matching what the general path would produce.
+        //
+        // O(1) after the eager first_toehold_built pass at load time.
+        inline bi_interval_with_sa first_backward_with_sa(size_t c) const {
+            const size_t idx = FastLocate::dna_char_to_idx(c);
+            if (idx >= DNA_ALPHABET_SIZE) {
+                return {bi_interval(0, 0, 0), FastLocate::NO_POSITION};
+            }
+            return {this->first_bint[idx], this->first_sa[idx]};
+        }
+
+        inline bi_interval first_backward(size_t c) const {
+            const size_t idx = FastLocate::dna_char_to_idx(c);
+            if (idx >= DNA_ALPHABET_SIZE) return bi_interval(0, 0, 0);
+            return this->first_bint[idx];
+        }
+
+        inline bi_interval first_forward(size_t c) const {
+            // forward_extend(whole_bwt, c) == swap(backward_extend(swap(whole_bwt), complement(c)))
+            //                              == swap(backward_extend(whole_bwt, complement(c)))
+            // because swap(whole_bwt) == whole_bwt (forward and reverse both 0).
+            const size_t comp = this->complement(c);
+            const size_t idx = FastLocate::dna_char_to_idx(comp);
+            if (idx >= DNA_ALPHABET_SIZE) return bi_interval(0, 0, 0);
+            const bi_interval& bwd = this->first_bint[idx];
+            return bi_interval(bwd.reverse, bwd.forward, bwd.size);
+        }
 
         // Format check
         inline bool is_encoded() const { return !this->blocks_encoded_start_bits.empty(); }

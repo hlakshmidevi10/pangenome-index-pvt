@@ -5,6 +5,7 @@
 
 #include "../include/pangenome_index/r-index.hpp"
 #include <gbwt/utils.h>
+#include <cassert>
 #include <cstdlib>
 
 
@@ -958,6 +959,19 @@ namespace panindexer {
     // what locate_sa_value would produce, but at O(rank) marginal cost
     // instead of an O(run-length) walk.
     //
+    // Contract (tightened 2026-08-06 -- see r-index.hpp):
+    //   * bint must be non-empty (bint.size > 0).
+    //   * sa_sp_prev must be a valid SA[bint.forward], NOT NO_POSITION.
+    //
+    // Callers that want to start a fresh walk from the whole-BWT interval
+    // must seed via first_backward_with_sa(c) in O(1); this primitive then
+    // handles all subsequent steps.  Removing the whole-BWT + NO_POSITION
+    // toehold path from here lets us shed the general-path SA-seed
+    // fallback (a run_id_and_offset_at + locateNext walk) that only
+    // existed to backstop toehold-check misses.  Net: primitive body is
+    // now purely Case A / Case B, matching the two-branch decision in
+    // DESIGN_FLIPPED_MEM.md section 4.
+    //
     // Rewritten in sub-step 7 (JR-010 fix) to eliminate three redundant
     // predecessor+block-walks per call versus the pre-rewrite version:
     //
@@ -967,44 +981,26 @@ namespace panindexer {
     //     1x leftmost_c_in_interval    = up to 2 (one bwt_char_at + one successor)
     //     Toehold: 1x run_id_and_offset_at + locateNext walk
     //
-    //   Post-rewrite (this version, 2 pred+walks per general-case call):
+    //   Post-rewrite (2 pred+walks per call):
     //     1x scan_at(old_sp)           = 1 pred+walk (ranks + BWT char + run id)
     //     1x rank_at_cached_encoded(old_sp+old_size) = 1 pred+walk
     //     backward_extend_encoded_with_ranks uses the two rank vectors above
     //     Case A test uses scan_at's bwt_char_at_pos (no extra walk)
     //     Case B uses run_head_c[a].successor(scan_at.run_id + 1) (O(log r))
-    //     Toehold: precomputed first_bint[c] / first_sa[c] table (0 walks)
-    //
-    // Preserves the same three-branch structure conceptually (toehold,
-    // Case A, Case B) so the correctness argument in DESIGN_FLIPPED_MEM.md
-    // section 4 still applies verbatim.  Only the mechanics of *how* each
-    // branch obtains its inputs changed.
     FastLocate::bi_interval_with_sa FastLocate::backward_extend_encoded_with_sa(
             const bi_interval& bint, size_type sa_sp_prev, size_t a) {
-        // -- Toehold fast path -----------------------------------------------
-        // The common caller (find_mems_flipped_function) starts every Step 1'
-        // walk with bint == whole-BWT interval and sa_sp_prev == NO_POSITION.
-        // The result of extending by a single DNA character from that state
-        // was precomputed at load time in first_bint / first_sa (sub-step 6),
-        // so we can return it with zero rank ops and zero locate walks.
-        if (sa_sp_prev == FastLocate::NO_POSITION &&
-            bint.forward == 0 && bint.reverse == 0 &&
-            static_cast<size_t>(bint.size) == this->bwt_size()) {
-            const size_t idx = FastLocate::dna_char_to_idx(a);
-            if (idx < DNA_ALPHABET_SIZE) {
-                bi_interval_with_sa fast{this->first_bint[idx], this->first_sa[idx]};
-                // If a is absent from the index (rare: 'N' when encoded_has_N
-                // is false), first_bint[i].size is 0 -- caller sees an empty
-                // result exactly as if we had walked the general path.
-                return fast;
-            }
-            // Non-DNA a: fall through.  Extremely unusual (find_mems only
-            // ever passes DNA characters), but preserved for safety.
-        }
+        // Precondition: bint is non-empty and sa_sp_prev is a valid SA value.
+        // Fresh walks from the whole-BWT interval must be seeded via
+        // first_backward_with_sa(c) -- see r-index.hpp for the contract.
+        assert(bint.size > 0 &&
+               "backward_extend_encoded_with_sa: bint.size must be > 0 "
+               "(seed fresh walks via first_backward_with_sa)");
+        assert(sa_sp_prev != FastLocate::NO_POSITION &&
+               "backward_extend_encoded_with_sa: sa_sp_prev must be a valid "
+               "SA value (seed fresh walks via first_backward_with_sa)");
 
-        // -- General path ----------------------------------------------------
         const size_t old_sp = bint.forward;
-        const size_t old_size = static_cast<size_t>(bint.size > 0 ? bint.size : 0);
+        const size_t old_size = static_cast<size_t>(bint.size);
 
         // Single-pass block scan at old_sp: returns ranks, BWT char, and the
         // containing run's global id in one predecessor + block walk.
@@ -1024,27 +1020,6 @@ namespace panindexer {
 
         bi_interval_with_sa result{new_bint, FastLocate::NO_POSITION};
         if (new_bint.size <= 0) return result;  // failure: caller stops walk.
-
-        // Defensive: if sa_sp_prev is NO_POSITION but bint wasn't the whole-
-        // BWT interval, the toehold fast path didn't fire and we don't have
-        // a valid SA to LF-decrement.  Seed via the legacy locate walk from
-        // new_sp's containing run.  This branch is unreachable from
-        // find_mems_flipped_function (which always starts on the whole-BWT
-        // interval), but keeps the primitive's contract intact for other
-        // callers -- notably test_backward_extend_sa's occasional coverage
-        // of non-standard states.
-        if (sa_sp_prev == FastLocate::NO_POSITION) {
-            const size_t new_sp = new_bint.forward;
-            size_t run_id = 0, offset_of_first = 0;
-            this->run_id_and_offset_at(new_sp, run_id, offset_of_first);
-            size_type sa = this->getSample(run_id);
-            while (offset_of_first < new_sp) {
-                sa = this->locateNext(sa);
-                ++offset_of_first;
-            }
-            result.sa_sp = sa;
-            return result;
-        }
 
         // Case A: BWT[old_sp] == a.  Then old_sp is the leftmost a in
         // [old_sp, old_ep] and LF(old_sp) == new_sp, giving
