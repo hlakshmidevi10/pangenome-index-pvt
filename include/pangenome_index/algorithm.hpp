@@ -6,6 +6,7 @@
 #define PANGENOME_INDEX_ALGORITHM_HPP
 
 
+#include <cassert>
 #include <vector>
 #include <queue>
 #include <mutex>
@@ -863,10 +864,6 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
                                               size_t min_occ, size_t x,
                                               FastLocate& fmd_index,
                                               std::vector<MEM_with_sa>& output) {
-        // Guard: caller's outer loop enforces x + 1 >= min_len, but be
-        // defensive in case of standalone callers.
-        if (x + 1 < min_len) return SIZE_MAX;
-
         // Step 0': forward-extend the length-min_len window pattern[x-min_len+1..x]
         // as a pre-check.  Mirror of legacy Step 1's min_len bound: if this window
         // has count < min_occ, no MEM of length >= min_len ends anywhere in
@@ -928,7 +925,6 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
         sa_sp = seed.sa_sp;
         last_good_bint = bint;
         last_good_sa = sa_sp;
-        i = x;
 
         // Continue Step 1' from j = x - 1 downward
         for (size_t j_plus_one = x; j_plus_one > 0; --j_plus_one) {
@@ -945,7 +941,13 @@ size_t search(FastLocate& fmd_index, const std::string& Q, size_t len) {
             i = j;
         }
 
-        // Should be at least min_len at this point
+        // Should be at least min_len at this point.  Step 0' success +
+        // Step 1' seed via first_backward_with_sa guarantee this invariant
+        // (FMD-index count is direction-invariant, so a min_len forward
+        // match implies a min_len backward walk succeeds).  Assert defends
+        // against regressions in Step 0' or the seed accessor.
+        assert((x - i + 1) >= min_len &&
+               "find_mems_flipped_function: emitted MEM shorter than min_len");
         output.push_back({
             /* start     */ i,
             /* end       */ x + 1,
