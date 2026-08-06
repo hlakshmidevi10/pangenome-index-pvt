@@ -114,6 +114,14 @@ namespace panindexer {
 
             // Flag bits
             constexpr static std::uint64_t ENCODED_BLOCKS = 0x1ULL;
+            // Set when serialize_encoded has appended the precomputed
+            // run_head_c[] sd_vectors after the encoded block stream.
+            // See JR-014 -- moves the ~8.7s ensure_run_head_c_built work
+            // from load time to build time (build_rindex).  All new .ri
+            // files must have this flag set; load_encoded throws if it
+            // is missing (no backward-compat fallback rebuild -- see
+            // JR-014 design rationale, dev-phase policy).
+            constexpr static std::uint64_t HAS_RUN_HEAD_C = 0x2ULL;
         };
 
 

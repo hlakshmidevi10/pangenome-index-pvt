@@ -218,7 +218,9 @@ namespace panindexer {
         std::uint64_t mask = 0;
         switch (this->version) {
             case VERSION:
-                mask = 0;
+                // Flag bits currently defined for this VERSION.  Keep in sync
+                // with the constants in r-index.hpp Header struct.
+                mask = Header::ENCODED_BLOCKS | Header::HAS_RUN_HEAD_C;
                 break;
         }
         if ((this->flags & mask) != this->flags) {
@@ -330,6 +332,10 @@ namespace panindexer {
         // Common metadata
         Header hdr = this->header;
         hdr.set(Header::ENCODED_BLOCKS);
+        // JR-014: run_head_c[] is always serialized alongside encoded blocks
+        // now, so the flag is set unconditionally.  Ensure the structure is
+        // populated below (via ensure_run_head_c_built) before we write it.
+        hdr.set(Header::HAS_RUN_HEAD_C);
         written_bytes += hdr.serialize(out, child, "header");
         written_bytes += this->samples.serialize(out, child, "samples");
         written_bytes += this->last.serialize(out, child, "last");
@@ -399,6 +405,16 @@ namespace panindexer {
             written_bytes += bytes_sz;
         }
 
+        // JR-014: append the 5 per-DNA-character run-head sd_vectors so the
+        // load path can skip the ~8.7s ensure_run_head_c_built rebuild.
+        // Populate them first (idempotent -- call_once); build_rindex hits
+        // this fresh, load-path replays hit a no-op.
+        this->ensure_run_head_c_built();
+        for (size_t i = 0; i < DNA_ALPHABET_SIZE; ++i) {
+            const std::string label = std::string("run_head_c_") + std::to_string(i);
+            written_bytes += this->run_head_c[i].serialize(out, child, label);
+        }
+
         sdsl::structure_tree::add_size(child, written_bytes);
         return written_bytes;
     }
@@ -450,12 +466,16 @@ namespace panindexer {
                     std::string(", got v") + std::to_string(this->header.version);
             throw sdsl::simple_sds::InvalidData(msg);
         }
-        // Fallback: if not encoded, rewind and load in standard format
+        // JR-014: non-encoded .ri files are also expected to carry
+        // HAS_RUN_HEAD_C; the pre-JR-014 fallback of rewinding to load()
+        // and rebuilding at load time is no longer supported.  Reject
+        // any file lacking ENCODED_BLOCKS with the same regenerate hint
+        // used for the missing HAS_RUN_HEAD_C case below.
         if ((this->header.flags & Header::ENCODED_BLOCKS) == 0) {
-            in.clear();
-            in.seekg(start_pos);
-            this->load(in);
-            return;
+            throw sdsl::simple_sds::InvalidData(
+                "FastLocate::load_encoded: .ri file is missing ENCODED_BLOCKS "
+                "(pre-encoded-blocks format).  Regenerate the index with "
+                "`build_rindex` against the same .rl_bwt input.");
         }
         this->header.setVersion();
 
@@ -489,17 +509,31 @@ namespace panindexer {
         this->blocks.clear();
         this->block_size = (this->encoded_block_size != 0 ? this->encoded_block_size : this->block_size);
 
-        // Eagerly build the parallel run-head-per-DNA-char bitvector.  Cost
-        // is one pass over all runs (a few MB of small allocations, once
-        // per load).  See ensure_run_head_c_built for why we don't
-        // serialize this to disk -- it's cheap to rebuild and lets old
-        // .ri files load without a format bump.
-        this->ensure_run_head_c_built();
+        // JR-014: run_head_c[] must be present in the .ri file.  During
+        // development we do not support the pre-JR-014 fallback of
+        // rebuilding at load time -- fail loudly so users know to
+        // regenerate their .ri via build_rindex.
+        if (!this->header.get(Header::HAS_RUN_HEAD_C)) {
+            throw sdsl::simple_sds::InvalidData(
+                "FastLocate::load_encoded: .ri file is missing HAS_RUN_HEAD_C "
+                "(pre-JR-014 format).  Regenerate the index with `build_rindex` "
+                "against the same .rl_bwt input.");
+        }
+        for (size_t i = 0; i < DNA_ALPHABET_SIZE; ++i) {
+            this->run_head_c[i].load(in);
+        }
+        // Mark the lazy-build once_flag as fired so any stray call to
+        // ensure_run_head_c_built (e.g. from run_head_c_at debug helpers)
+        // is a no-op that trusts the on-disk data.
+        std::call_once(this->run_head_c_once, [](){});
+
         // Precompute the 5-entry toehold table (first_bint[c], first_sa[c]).
         // Sub-step 7's toehold fast path consults this table to answer the
         // very first backward-extend of a Step 1' walk without any rank
         // ops or locate walks.  Cost here: 5 backward extends + one
-        // locate_sa_value-equivalent walk each, effectively zero.
+        // locate_sa_value-equivalent walk each, effectively zero.  Kept
+        // as an at-load build (not serialized) per JR-014 design -- 160
+        // bytes and ~1 ms, not worth the format surface area.
         this->ensure_first_toehold_built();
     }
 

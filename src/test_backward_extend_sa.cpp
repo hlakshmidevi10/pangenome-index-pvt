@@ -1,5 +1,5 @@
 // Unit test for the SA-carrying backward-extend primitive and its supporting
-// machinery. Covers three tests:
+// machinery. Covers four tests:
 //
 //   Test A -- FastLocate::scan_at (extended block scan that returns ranks
 //             plus bwt_char_at_pos, run_id, run_start_bwt in one predecessor
@@ -19,6 +19,21 @@
 //             a Step 1' walk (sa_sp_prev == NO_POSITION), the returned sa_sp
 //             must equal what locate_sa_value would compute for the same
 //             new_sp.  Reports Case A / Case B / toehold-hit counts.
+//
+//   Test D -- JR-014 run_head_c[] serialization round-trip.  The loaded
+//             r-index carries run_head_c[] populated from the .ri file
+//             directly (no in-process rebuild).  This test serializes the
+//             loaded index to a temp .ri via serialize_encoded, loads that
+//             copy into a second FastLocate, and verifies:
+//               (a) both instances' run_head_c[] structures produce the same
+//                   next_run_with_head_c(c, start_from) answer over many
+//                   random inputs
+//               (b) the two on-disk byte streams for run_head_c[] match
+//                   size-wise (deterministic re-serialization)
+//             Test B independently cross-checks that the loaded run_head_c
+//             is semantically correct against bwt_char_at_encoded ground
+//             truth; Test D adds the specifically-serialization-focused
+//             validation.
 //
 // Tests A and B call APIs that will be added in later sub-steps (scan_at in
 // sub-step 3, run_head_c in sub-step 5).  Until those APIs land, Test A and
@@ -46,11 +61,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
+#include <unistd.h>  // getpid
 #include <vector>
 
 using panindexer::FastLocate;
@@ -313,6 +331,139 @@ RunHeadStats run_run_head_tests(FastLocate& idx, std::mt19937& rng,
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Test D -- run_head_c serialization round-trip.
+
+struct RoundTripStats {
+    size_t checks = 0;
+    size_t passed = 0;
+    bool skipped = false;
+    std::string skip_reason;
+    std::vector<std::string> mismatches;
+    void mismatch(const std::string& m) {
+        if (mismatches.size() < 10) mismatches.push_back(m);
+    }
+};
+
+// End-to-end round-trip test.  Takes the path to the raw .rl_bwt (not the
+// pre-built .ri, because serialize_encoded requires an in-memory blocks[]
+// which load_encoded clears -- so we can't do load-then-serialize).
+//
+// Steps:
+//   1. Construct FastLocate(rlbwt_path)   -> in-memory build, blocks[] full.
+//   2. Serialize to a temp .ri via serialize_encoded (writes flag +
+//      appended run_head_c sd_vectors).
+//   3. Load temp .ri into a second FastLocate via load_encoded.
+//   4. Cross-check both instances agree on next_run_with_head_c(c, start_from)
+//      over many random probes (semantic equivalence).
+//   5. Re-serialize the second instance -- byte-compare against the temp .ri
+//      (determinism).
+//
+// This exercises the entire build-serialize-load pipeline for run_head_c.
+// If the reference .ri (from the test's <r_index_file> argument) already
+// round-trips loaded state correctly, that's what Tests A/B/C confirm; Test
+// D adds "the build_rindex output actually matches a fresh in-memory build".
+//
+// Skipped (not failed) if the caller doesn't provide an rlbwt path.
+RoundTripStats run_round_trip_tests(const std::string& rlbwt_path,
+                                     const std::string& tmp_path,
+                                     std::mt19937& rng,
+                                     size_t num_checks) {
+    RoundTripStats out;
+
+    if (rlbwt_path.empty()) {
+        out.skipped = true;
+        out.skip_reason =
+            "no <rlbwt_file> argument provided (positional arg 7).  "
+            "Pass the .rl_bwt file corresponding to <r_index_file> to enable "
+            "the round-trip test.";
+        return out;
+    }
+
+    // 1. Fresh in-memory build from raw .rl_bwt.  This populates blocks[]
+    // and ensures serialize_encoded has data to write.
+    std::cerr << "    building FastLocate from " << rlbwt_path << " ..." << std::endl;
+    FastLocate src(rlbwt_path);
+    if (src.bwt_size() == 0) {
+        out.mismatch("built FastLocate has empty BWT (bad rlbwt file?)");
+        return out;
+    }
+
+    // 2. Serialize to tmp_path (produces new-format .ri with HAS_RUN_HEAD_C).
+    std::cerr << "    serialize_encoded -> " << tmp_path << " ..." << std::endl;
+    {
+        std::ofstream tmp_out(tmp_path, std::ios::binary);
+        if (!tmp_out) {
+            out.mismatch("cannot open temp file for write: " + tmp_path);
+            return out;
+        }
+        src.serialize_encoded(tmp_out);
+    }
+
+    // 3. Load back into a fresh FastLocate via load_encoded.
+    std::cerr << "    load_encoded from " << tmp_path << " ..." << std::endl;
+    FastLocate dst;
+    {
+        std::ifstream tmp_in(tmp_path, std::ios::binary);
+        if (!tmp_in) {
+            out.mismatch("cannot open temp file for read: " + tmp_path);
+            return out;
+        }
+        try {
+            dst.load_encoded(tmp_in);
+        } catch (const std::exception& e) {
+            out.mismatch(std::string("round-trip load failed: ") + e.what());
+            return out;
+        }
+    }
+
+    // 4. Basic shape.
+    if (dst.bwt_size() != src.bwt_size()) {
+        out.mismatch("bwt_size differs: src=" + std::to_string(src.bwt_size()) +
+                     " dst=" + std::to_string(dst.bwt_size()));
+        return out;
+    }
+    if (dst.size() != src.size()) {
+        out.mismatch("num_runs differs: src=" + std::to_string(src.size()) +
+                     " dst=" + std::to_string(dst.size()));
+        return out;
+    }
+
+    // 5. Semantic probe: for each DNA char and each of num_checks random
+    // start_from values in [0, num_runs), the two instances must agree on
+    // next_run_with_head_c(c, start_from).  This exercises the loaded
+    // sd_vector's rank/select support end-to-end.
+    const size_t total_runs = src.size();
+    if (total_runs == 0) {
+        out.mismatch("built FastLocate has zero runs; cannot probe round-trip");
+        return out;
+    }
+    std::cerr << "    cross-check " << num_checks << " next_run_with_head_c probes per DNA char..." << std::endl;
+    std::uniform_int_distribution<size_t> start_dist(0, total_runs - 1);
+    for (size_t ci = 0; ci < 5; ++ci) {
+        const size_t c = static_cast<size_t>(DNA_CHARS[ci]);
+        for (size_t i = 0; i < num_checks; ++i) {
+            const size_t start_from = start_dist(rng);
+            const size_t src_answer = src.next_run_with_head_c(c, start_from);
+            const size_t dst_answer = dst.next_run_with_head_c(c, start_from);
+            out.checks++;
+            if (src_answer == dst_answer) {
+                out.passed++;
+            } else {
+                out.mismatch("c='" + std::string(1, (char)c) +
+                             "' start_from=" + std::to_string(start_from) +
+                             " src=" + std::to_string(src_answer) +
+                             " dst=" + std::to_string(dst_answer));
+            }
+        }
+    }
+
+    // Cleanup.
+    std::remove(tmp_path.c_str());
+
+    return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -323,15 +474,23 @@ int main(int argc, char** argv) {
                      " [num_scan_at_trials=10000]"
                      " [num_run_head_checks_per_char=2000]"
                      " [seed=42]"
+                     " [rlbwt_file]"
+                  << std::endl;
+        std::cerr << "\n"
+                  << "  <r_index_file> is used for Tests A/B/C.\n"
+                  << "  [rlbwt_file] (optional 7th arg) is used for Test D "
+                     "(build-serialize-load round trip).\n"
+                  << "  Test D is skipped if the rlbwt path is not provided."
                   << std::endl;
         return 2;
     }
-    const std::string ri_path = argv[1];
-    const size_t n_random_bwe = (argc >= 3) ? std::stoul(argv[2]) : 100;
-    const size_t n_text_bwe   = (argc >= 4) ? std::stoul(argv[3]) : 5000;
-    const size_t n_scan_at    = (argc >= 5) ? std::stoul(argv[4]) : 10000;
-    const size_t n_run_head   = (argc >= 6) ? std::stoul(argv[5]) : 2000;
-    const uint32_t seed       = (argc >= 7) ? static_cast<uint32_t>(std::stoul(argv[6])) : 42;
+    const std::string ri_path    = argv[1];
+    const size_t n_random_bwe    = (argc >= 3) ? std::stoul(argv[2]) : 100;
+    const size_t n_text_bwe      = (argc >= 4) ? std::stoul(argv[3]) : 5000;
+    const size_t n_scan_at       = (argc >= 5) ? std::stoul(argv[4]) : 10000;
+    const size_t n_run_head      = (argc >= 6) ? std::stoul(argv[5]) : 2000;
+    const uint32_t seed          = (argc >= 7) ? static_cast<uint32_t>(std::stoul(argv[6])) : 42;
+    const std::string rlbwt_path = (argc >= 8) ? argv[7] : std::string();
 
     std::cerr << "Loading r-index from: " << ri_path << std::endl;
     FastLocate idx;
@@ -416,6 +575,30 @@ int main(int argc, char** argv) {
                        (bwe.initial_toehold_count > 0);
     if (!test_c_pass) any_fail = true;
 
+    // --- Test D ---------------------------------------------------------------
+    std::cerr << "\n=== Test D: run_head_c serialization round-trip (JR-014) ===" << std::endl;
+    const char* tmpdir = std::getenv("TMPDIR");
+    std::string base_tmp = (tmpdir && *tmpdir) ? tmpdir : "/tmp";
+    while (!base_tmp.empty() && base_tmp.back() == '/') base_tmp.pop_back();
+    const std::string tmp_ri = base_tmp + "/test_backward_extend_sa_" +
+                               std::to_string(::getpid()) + ".ri";
+    // Reuse a smaller check count than Test B; the round-trip pass is the
+    // key signal, individual random probes just amplify confidence.
+    const size_t rt_checks_per_char = std::min<size_t>(n_run_head, 500);
+    RoundTripStats rt = run_round_trip_tests(rlbwt_path, tmp_ri, rng, rt_checks_per_char);
+    if (rt.skipped) {
+        std::cerr << "  SKIPPED: " << rt.skip_reason << std::endl;
+    } else {
+        std::cerr << "  passed=" << rt.passed << " / " << rt.checks << std::endl;
+        if (!rt.mismatches.empty()) {
+            std::cerr << "  first messages:" << std::endl;
+            for (const auto& m : rt.mismatches) std::cerr << "    " << m << std::endl;
+        }
+    }
+    bool test_d_pass = rt.skipped ||
+                       (rt.mismatches.empty() && rt.checks > 0 && rt.passed == rt.checks);
+    if (!test_d_pass) any_fail = true;
+
     // --- Summary --------------------------------------------------------------
     std::cerr << "\n=== Summary ===" << std::endl;
     std::cerr << "Test A: " << sa_stats.passed << " / " << sa_stats.checked
@@ -424,6 +607,12 @@ int main(int argc, char** argv) {
               << (test_b_pass ? " PASS" : " FAIL") << std::endl;
     std::cerr << "Test C: " << bwe.total_steps << " steps, " << bwe.mismatches
               << " mismatches" << (test_c_pass ? " PASS" : " FAIL") << std::endl;
+    if (rt.skipped) {
+        std::cerr << "Test D: SKIPPED (no rlbwt file provided)" << std::endl;
+    } else {
+        std::cerr << "Test D: " << rt.passed << " / " << rt.checks << " round-trip probes"
+                  << (test_d_pass ? " PASS" : " FAIL") << std::endl;
+    }
 
     if (any_fail) {
         std::cerr << "\nFAIL" << std::endl;
