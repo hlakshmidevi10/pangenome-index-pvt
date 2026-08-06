@@ -1873,6 +1873,190 @@ delivered.
 - `37dc2d9` algorithm: rewrite find_mems_flipped state machine (correctness)
 - `83ef433` algorithm: add Step 0' min_len pre-check to find_mems_flipped (perf)
 - `ecd8483` journal: JR-012 Step 0' min_len pre-check in find_mems_flipped
-- (Vesuvio verification amendment, pending as of writing)
+- `412b9c8` journal: JR-012 promote Vesuvio to source of truth (perf numbers)
+
+---
+
+## JR-013 — Toehold hoist into callers: perf null, contract cleanup
+
+```yaml
+id: JR-013
+date: 2026-08-06
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [flipped, r-index, primitive, contract, refactor, vesuvio, perf-null]
+refs:
+  follows: [JR-012]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+`backward_extend_encoded_with_sa` (JR-011) had a "toehold fast path"
+inline branch at the top: if the caller passed the whole-BWT interval
+plus `sa_sp_prev == NO_POSITION`, return the precomputed
+`(first_bint[c], first_sa[c])` directly.  This branch fired on the
+very first call of every Step 1' walk in the flipped finder.
+
+Two other flipped-finder call sites paid analogous overheads for
+their first extend:
+- Step 0' (`find_mems_flipped_function`): first `forward_extend_encoded`
+  on the whole-BWT interval per outer iter.
+- Step 2' (`flipped_advance_anchor`): first `forward_extend_encoded`
+  on the whole-BWT interval per emit iter.
+
+Neither was using the precomputed table -- `forward_extend_encoded`
+does a full pred+walk internally (via swap + `backward_extend_encoded`)
+even though the answer for whole-BWT + one character is knowable in
+O(1) via `first_bint[dna_char_to_idx(complement(c))]` swapped.
+
+Estimated 481K + 155K + 325K ≈ 961K first-extend calls per 100K
+noisy chr6 reads that could be short-circuited.
+
+### Hypothesis
+
+Add three public O(1) accessors on `FastLocate` and hoist the
+"first extend from whole-BWT" logic out of the primitives:
+- `first_backward_with_sa(c)` -- Step 1' seed
+- `first_backward(c)`         -- interval only
+- `first_forward(c)`          -- Step 0' / Step 2' seed
+  (derived via FMD-index identity: `forward(whole_bwt, c) ==
+  swap(backward(whole_bwt, complement(c)))`, and
+  `swap(whole_bwt) == whole_bwt`).
+
+Callers use the accessor for the first extend of each walk, then
+loop with the primitive for subsequent extends.
+
+The primitive's contract can then be tightened: require
+`bint.size > 0` and `sa_sp_prev != NO_POSITION`.  The general-path
+SA-seed fallback (`run_id_and_offset_at` + `locateNext` walk),
+which only existed to backstop toehold-check misses, can be
+removed entirely.
+
+Estimated wall-time impact: ~500-700 ms MEM-finding saved on
+noisy chr6 (Mac back-of-envelope, ~1-2% of MEM-finding).
+
+### Method
+
+Implemented in commits `987f0b7` (accessors + contract tightening)
+and `1d118e9` (dead-code cleanup + defensive assert).
+`test_backward_extend_sa` Test C updated to seed the initial step
+via `first_backward_with_sa(c)`, mirroring the production path.
+
+Perf measured on Vesuvio via `perf_harness.sh` protocol
+(2 warmups + 3 timed trials, median-of-3), tags
+`jr013-{noisy,clean}-hoist`.  Baseline for comparison: JR-012's
+`jr012-{noisy,clean}-{legacy,step0}` runs (same host, protocol,
+config).
+
+### Findings
+
+**Correctness (byte-identical output preserved).**
+- test_backward_extend_sa yeast: A 5000/5000, B 10000/10000,
+  C 100140 steps / 0 mismatches (Test C now flows through the
+  accessor for INITIAL; same numbers as JR-012).
+- test_flipped_mems 100K yeast reads: 109520/109520 MEMs match
+  legacy, 0 SA mismatches, 0 flipped_missed, 0 flipped_extra.
+- E2E chr6 noisy `--gaf`: 2000/2000 valid, coverage MD5
+  `60f6b8e4a759aebb252b83a870b9ff8c` (noisy baseline).
+- E2E chr6 clean `--gaf` (via perf_harness gafpack): coverage MD5
+  `8c242732c837d697fb18c52fd0c0cf6e` (clean baseline from JR-012
+  legacy).
+
+**Perf: Vesuvio median-of-3, hoist vs JR-012 step0 flipped.**
+
+| workload | metric               | JR-012 step0 | JR-013 hoist | delta      |
+|:---------|:---------------------|-------------:|-------------:|-----------:|
+| noisy    | total execution      | 53.29s       | **53.01s**   | −0.28s (−0.5%) |
+| noisy    | MEM finding          | 38.63s       | **38.43s**   | −0.20s (−0.5%) |
+| noisy    | MEM processing       | 2.48s        | 2.49s        | +0.01s (noise) |
+| noisy    | locate ops           | 2.21s        | 2.22s        | +0.01s (noise) |
+| noisy    | first locate         | 0.00s        | 0.00s        | 0 |
+| noisy    | peak RSS             | 4512 MB      | 4496 MB      | −16 MB |
+| clean    | total execution      | 44.03s       | **44.42s**   | +0.39s (+0.9%) |
+| clean    | MEM finding          | 30.96s       | **31.11s**   | +0.15s (+0.5%) |
+| clean    | MEM processing       | 0.88s        | 0.89s        | +0.01s (noise) |
+| clean    | locate ops           | 0.67s        | 0.69s        | +0.02s (noise) |
+| clean    | first locate         | 0.00s        | 0.00s        | 0 |
+| clean    | peak RSS             | 4520 MB      | 4516 MB      | −5 MB |
+
+**Perf delta is essentially null.** Both workloads' totals lie
+within the trial-to-trial variance floor of Vesuvio measurements
+(~±0.3-0.5s from JR-012 warm-cache trials).  The noisy MEM-finding
+saw a real but tiny improvement (−0.2s ≈ −0.5%); the clean
+MEM-finding saw an equally-tiny regression (+0.15s).  Neither is
+distinguishable from noise at the wall-time scale.
+
+### Discussion
+
+**Why the perf estimate was optimistic.**  The Mac back-of-envelope
+projected ~500-700 ms saved.  Three factors overcounted:
+1. **Branch prediction already near-perfect.**  The toehold check
+   was `[TRUE, FALSE, FALSE, ..., FALSE]` per Step 1' walk --
+   the branch predictor nails this after warm-up.  Cost per call
+   was ~2-4 ns, not the ~700 ns/call implicit in the estimate.
+2. **Forward extends do real work regardless.**  Skipping the
+   first Step 0' / Step 2' forward extend saves only the fixed
+   per-call overhead, not the full block-walk cost -- the
+   accessor still returns a computed answer.
+3. **Accessor has its own cost.**  Global 5-entry array lookup +
+   inline function call cost is comparable to the removed inline
+   branch check.  Trading one predictable branch for one load.
+
+The tiny clean-reads regression (+0.15s MEM finding) may reflect
+cache placement of `first_bint`/`first_sa` vs the inline check
+against a compile-time constant.  Below the threshold for further
+investigation.
+
+**The real wins are code-quality, not perf.**
+- **Primitive contract is now clean.**  `backward_extend_encoded_with_sa`
+  no longer has dual "toehold or general" modes; caller must
+  provide a valid (bint, sa_sp) seed.  Enforced by `assert()` in
+  debug builds.
+- **Dead code removed.**  The general-path SA-seed fallback
+  (`run_id_and_offset_at` + `locateNext` walk, ~10 lines in
+  r-index.cpp) that only existed to backstop toehold misses is
+  gone entirely.
+- **All three flipped call sites use the same pattern.**  Step 0',
+  Step 1', Step 2' each start with an O(1) accessor for the first
+  extend, then loop with the primitive.  Uniform and greppable.
+- **Test C mirrors production.**  The old Test C exercised a
+  code path (whole-BWT + NO_POSITION at the primitive) that
+  production no longer takes.  Now Test C's INITIAL case flows
+  through `first_backward_with_sa(c)` exactly like Step 1'.
+
+**JR-012 numbers remain the source-of-truth headline.**  The
+JR-013 changes are a code-quality refactor that preserves the
+JR-012 perf profile within noise.  Any perf story going forward
+should quote the JR-012 numbers (noisy −11.7% wall, clean −10.4%
+wall vs legacy) and mention JR-013 only as "primitive contract
+cleanup, perf-neutral".
+
+### Open questions
+
+1. **Grow-only Step 1' variant** (still JR-012 Q1).  This remains
+   the highest-leverage flipped-finder optimization opportunity
+   (~5.5s estimated saving on noisy MEM finding).  Not attempted
+   in JR-013.
+2. **Default toggle for `--use-flipped-mems`** (still JR-012 Q3).
+   JR-013 doesn't change the answer; JR-012 findings still apply.
+
+### Data artifacts
+
+**Vesuvio perf benchmark (canonical / source of truth):**
+- `../mem-projection/pangenome-pipeline/perf/jr013-noisy-hoist-vesuvio/`
+  -- SUMMARY.tsv, PROVENANCE.txt, and lightweight/trial-1/
+  (find_mems.log, find_mems.time -- other trials shipped as
+  SUMMARY rows only).
+- `../mem-projection/pangenome-pipeline/perf/jr013-clean-hoist-vesuvio/`
+
+**JR-012 baseline (for delta comparison):**
+- `../mem-projection/pangenome-pipeline/perf/jr012-{noisy,clean}-{legacy,step0}/`
+
+### Commits (this repo, branch backward-extend-sa-perf)
+
+- `987f0b7` r-index+algorithm: hoist first-extend toehold check into callers
+- `1d118e9` algorithm: simplify find_mems_flipped_function (guard/assign + assert)
+- (this entry, pending as of writing)
 
 ---
