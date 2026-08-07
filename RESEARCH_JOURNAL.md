@@ -2057,6 +2057,208 @@ cleanup, perf-neutral".
 
 - `987f0b7` r-index+algorithm: hoist first-extend toehold check into callers
 - `1d118e9` algorithm: simplify find_mems_flipped_function (guard/assign + assert)
+- `20a3683` journal: JR-013 toehold hoist -- perf null, contract cleanup
+
+---
+
+## JR-014 — Serialize run_head_c[] into .ri: load time collapse
+
+```yaml
+id: JR-014
+date: 2026-08-07
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [r-index, format, load-time, serialization, perf, hprc, vesuvio]
+refs:
+  follows: [JR-013]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+JR-011 introduced `run_head_c[]` -- 5 per-DNA-character run-head
+`sd_vector`s indexed by run id -- and built them eagerly at load
+time inside `ensure_run_head_c_built()`.  On Vesuvio, this build cost
+~8.7s per `load_encoded` invocation (two full passes over ~249M
+BWT runs, decoding byte-encoded run headers on each pass).  Total
+r-index load was ~11.5s, of which ~80% was `run_head_c[]` build
+and ~20% was actual deserialization.
+
+Load time is paid once per process invocation, so at HPRC chr6
+scale (~155K MEMs per read, ~100K reads per file) it amortized to
+low per-query overhead in batch settings.  But it inflated total
+wall time on single-query and small-batch workloads by an amount
+that dominated the JR-012 / JR-013 flipped-vs-legacy delta
+(~10-12% win vs ~9s of load-time overhead on both paths).
+
+### Hypothesis
+
+Move `run_head_c[]` construction from query-time (`load_encoded`)
+to build-time (`build_rindex`), serialize the resulting `sd_vector`s
+into the .ri file, and deserialize them verbatim on load.
+
+Expected outcomes:
+- Load: ~11.5s -> ~2s (deserialization only; ~135 MB read on chr6).
+- Total wall: both legacy and flipped paths drop by ~9s uniformly.
+- Byte-identical query-time behavior: same `sd_vector`s, just loaded
+  from disk instead of rebuilt.
+
+### Method
+
+Format change (`Header::HAS_RUN_HEAD_C = 0x2ULL`):
+- `serialize_encoded`: sets the flag, calls `ensure_run_head_c_built()`
+  to populate (idempotent -- once_flag guards it), and appends the 5
+  `sd_vector`s at the end of the byte stream.
+- `load_encoded`: throws `sdsl::simple_sds::InvalidData` with a
+  clear "regenerate with build_rindex" message if the flag is not
+  set.  If set, reads the 5 `sd_vector`s directly from the stream
+  and fires the `run_head_c_once` flag as a no-op so any stray call
+  to `ensure_run_head_c_built()` is short-circuited.
+- `Header::check()` mask updated to accept both `ENCODED_BLOCKS`
+  and `HAS_RUN_HEAD_C`.
+
+No backward compat is retained (dev-phase policy).  All existing .ri
+files must be regenerated via `build_rindex`.  Toehold table
+(`first_bint`/`first_sa`) is left at at-load construction (~1 ms,
+160 bytes, not worth the format surface area).
+
+Test D added to `test_backward_extend_sa`: end-to-end round-trip.
+Takes an optional 7th positional arg (path to the raw `.rl_bwt`).
+When provided: builds a fresh `FastLocate` from the raw BWT,
+serializes to a temp .ri via `serialize_encoded`, loads back via
+`load_encoded`, and cross-checks both instances agree on
+`next_run_with_head_c(c, start_from)` over 2500 random probes (500
+per DNA character).  Skipped-not-failed when omitted.
+
+### Findings
+
+**Correctness (byte-identical output preserved).**  Verified against
+regenerated yeast chrII 100 kb .ri and HPRC chr6 .ri:
+- test_backward_extend_sa yeast: A 5000/5000, B 10000/10000,
+  C 100140 steps / 0 mismatches, **D 2500/2500 round-trip probes**
+  (new test).
+- test_flipped_mems 100K yeast reads: 109520/109520 match legacy,
+  0 SA mismatches.
+- E2E chr6 noisy: coverage MD5
+  `60f6b8e4a759aebb252b83a870b9ff8c` matches JR-013 baseline.
+- E2E chr6 clean: coverage MD5
+  `8c242732c837d697fb18c52fd0c0cf6e` matches JR-013 baseline.
+
+**Perf: HPRC chr6 on Vesuvio, median-of-3, find_mems --lightweight-tags.**
+
+| workload | metric               | JR-013     | JR-014     | delta       |
+|:---------|:---------------------|-----------:|-----------:|------------:|
+| noisy    | R-index load         | 11.50s     | **1.84s**  | −9.66s (−84%) |
+| noisy    | legacy total exec    | 60.33s     | **51.03s** | −9.30s (−15.4%) |
+| noisy    | flipped total exec   | 53.29s     | **42.90s** | −10.39s (−19.5%) |
+| noisy    | flipped MEM finding  | 38.63s     | 38.38s     | −0.25s (noise) |
+| noisy    | flipped MEM proc     | 2.48s      | 2.43s      | −0.05s (noise) |
+| noisy    | peak RSS (both)      | 4512 MB    | 4497 MB    | −15 MB |
+| clean    | R-index load         | 11.54s     | **1.80s**  | −9.74s (−84%) |
+| clean    | legacy total exec    | 49.13s     | **39.01s** | −10.12s (−20.6%) |
+| clean    | flipped total exec   | 44.03s     | **34.23s** | −9.80s (−22.3%) |
+| clean    | flipped MEM finding  | 30.96s     | 30.78s     | −0.18s (noise) |
+| clean    | flipped MEM proc     | 0.88s      | 0.89s      | +0.01s (noise) |
+| clean    | peak RSS (both)      | 4520 MB    | 4516 MB    | −4 MB |
+
+**Load time collapsed from ~11.5s to ~1.8s (−84%).**  Both legacy
+and flipped paths benefit equally since they share the loader.
+
+**Flipped's relative advantage is unchanged** (was −11.7% noisy /
+−10.4% clean pre-JR-014; still −15.9% noisy / −12.3% clean
+post-JR-014 -- larger relative percentages because the denominator
+shrank).  JR-014 lifted all boats uniformly by ~9-10s.
+
+**On-disk cost.**  HPRC chr6 .ri grew by ~5-6% (est. ~200 MB
+added to the ~3.6 GB baseline).  Yeast chrII 100 kb .ri grew from
+160 MB to 168 MB (+5%).
+
+### Cumulative story (JR-011 -> JR-012 -> JR-013 -> JR-014)
+
+| metric                          | pre-JR-011 baseline | JR-014 flipped | total delta |
+|:--------------------------------|-------------------:|---------------:|------------:|
+| noisy total exec                | ~74s               | **42.90s**     | **−42%**    |
+| noisy MEM finding               | ~58s               | 38.38s         | −34%        |
+| noisy MEM processing            | ~19s               | 2.43s          | −87%        |
+| R-index load                    | ~11s               | 1.84s          | −83%        |
+
+### Discussion
+
+**Format extension mechanics.**  Adding a flag bit to the existing
+64-bit `Header::flags` field, with a corresponding mask update in
+`Header::check()`, was the minimum-viable change to distinguish
+new-format from pre-format .ri files.  A `VERSION` bump would have
+provided stricter type-safety but required more coordinated migration;
+in dev-phase this trade-off was answered "no backward compat needed"
+by user.
+
+**Loud rejection worked as designed.**  On first Vesuvio invocation
+against the pre-JR-014 chr6 .ri, `load_encoded` threw with the
+"regenerate with build_rindex" message and the run aborted before
+producing any output.  Zero silent failure risk.
+
+**Test D scope.**  The initial implementation tried "load .ri ->
+serialize -> reload" as a round-trip.  This hung because
+`serialize_encoded` requires an in-memory `blocks[]` (built by the
+constructor from raw `.rl_bwt`), which `load_encoded` clears to
+save memory.  Test D was refactored to take the `.rl_bwt` path
+directly, exercising the full build->serialize->load pipeline
+(the same one `build_rindex` produces).  This is the correct
+scope: it validates that `build_rindex` output is loadable and
+semantically equivalent to a fresh in-memory build.
+
+**Toehold table (first_bint / first_sa) intentionally not
+serialized.**  At 160 bytes and ~1 ms to build, the load-time
+cost is invisible; the format-surface-area cost of serializing
+would exceed the benefit.  Documented in the r-index.hpp
+first_toehold section and in JR-014 design discussion.
+
+**No optimization of ensure_run_head_c_built() itself.**  We
+considered a one-pass build (~4s savings, at cost of ~1.6 GB peak
+scratch RAM) as a fallback if serialization proved infeasible.
+Since serialization landed cleanly, the two-pass build stays as-is:
+it now runs once at `.ri` build time, amortized over the lifetime
+of the file, so its ~8.7s cost is invisible to queries.
+
+### Open questions
+
+1. **Load-time budget is now dominated by tag_index load
+   (~0.5s on Vesuvio) and deserialization I/O (~1.3s reading
+   the ~135 MB `run_head_c` sd_vectors).**  Further load-time
+   reduction would target the encoded_stream I/O (~1 GB read,
+   already at near-memory-copy speed) or mmap-based load
+   (would eliminate the ~135 MB read entirely at cost of
+   demand-paging on first access).  Diminishing returns; not
+   pursued.
+2. **Default toggle for `--use-flipped-mems`** (JR-012/013 Q3
+   carried forward).  Post-JR-014, flipped's wall-time advantage
+   is stronger and load-time is no longer a mitigating factor.
+   Flip the default when convenient.
+3. **build_rindex incremental / parallel run_head_c build.**
+   Currently sequential and single-threaded; ~15-30 min on Vesuvio
+   for HPRC chr6.  Not a query-time concern but worth noting if
+   .ri regeneration becomes a bottleneck.
+
+### Data artifacts
+
+**Vesuvio perf benchmark (canonical / source of truth):**
+- `../mem-projection/pangenome-pipeline/perf/jr014-noisy-legacy-vesuvio/`
+- `../mem-projection/pangenome-pipeline/perf/jr014-noisy-flipped-vesuvio/`
+- `../mem-projection/pangenome-pipeline/perf/jr014-clean-legacy-vesuvio/`
+- `../mem-projection/pangenome-pipeline/perf/jr014-clean-flipped-vesuvio/`
+  -- each with SUMMARY.tsv, PROVENANCE.txt (noisy-flipped only),
+  and lightweight/trial-1/{find_mems.log, find_mems.time}.
+
+**JR-013 baseline (for delta comparison):**
+- `../mem-projection/pangenome-pipeline/perf/jr013-*-hoist-vesuvio/`
+
+**Regenerated .ri files (backup of pre-JR-014):**
+- `runs/hprc-chr6-2026-06-02/hprcv1_chr6.ri.pre-jr014`
+- `runs/v1-current/yeast235_chrII_100kb_normalized.ri.pre-jr014`
+
+### Commits (this repo, branch backward-extend-sa-perf)
+
+- `8b44a73` r-index: serialize run_head_c[] into .ri (JR-014, load ~11s -> ~2.5s)
 - (this entry, pending as of writing)
 
 ---
