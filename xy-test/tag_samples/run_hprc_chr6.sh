@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Run build_tag_head_samples against the HPRC chr6 index on Vesuvio.
 #
-# Prerequisites on Vesuvio:
+# Prerequisites:
 #   - This branch built: cd ~/pangenome-index-latest && make bin/build_tag_head_samples
-#   - Post-JR-014 r-index: needs to be regenerated from .rl_bwt if the on-disk
-#     .ri predates JR-014. Check the load error to know.
+#   - The .ri under $DATA must be post-JR-014 (has HAS_RUN_HEAD_C flag).
+#     The current Vesuvio index is expected to be post-JR-014 already; if the
+#     binary rejects the .ri with a "pre-JR-014 format" error, rebuild it:
+#       $REPO/bin/build_rindex $DATA/hprcv1_chr6.rl_bwt > $DATA/hprcv1_chr6.ri
 #
 # Usage: bash run_hprc_chr6.sh
 set -euo pipefail
@@ -15,21 +17,7 @@ OUT="$DATA/tag_head_samples"
 
 mkdir -p "$OUT"
 
-# Rebuild .ri from .rl_bwt if we have the .rl_bwt and the current .ri is stale.
-# On Vesuvio the .rl_bwt should exist (it wasn't shipped to Mac).
-if [ -f "$DATA/hprcv1_chr6.rl_bwt" ]; then
-    if [ ! -f "$OUT/hprcv1_chr6.ri" ] || [ "$DATA/hprcv1_chr6.rl_bwt" -nt "$OUT/hprcv1_chr6.ri" ]; then
-        echo "Rebuilding r-index from .rl_bwt (post-JR-014 format)..."
-        "$REPO/bin/build_rindex" "$DATA/hprcv1_chr6.rl_bwt" > "$OUT/hprcv1_chr6.ri" 2> "$OUT/build_rindex.log"
-        echo "Done. build_rindex.log tail:"
-        tail -5 "$OUT/build_rindex.log"
-    fi
-    RI="$OUT/hprcv1_chr6.ri"
-else
-    echo "No .rl_bwt on this host; using existing .ri (may need regeneration)."
-    RI="$DATA/hprcv1_chr6.ri"
-fi
-
+RI="$DATA/hprcv1_chr6.ri"
 LTAGS="$DATA/hprcv1_chr6.ltags"
 
 # Log output goes both to stdout and to a file for later reference.
