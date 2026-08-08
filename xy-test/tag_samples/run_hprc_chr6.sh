@@ -27,7 +27,7 @@ echo "  ri:    $RI"    | tee -a "$LOG"
 echo "  ltags: $LTAGS" | tee -a "$LOG"
 echo "  out:   $OUT/hprcv1_chr6" | tee -a "$LOG"
 
-/usr/bin/time -v "$REPO/bin/build_tag_head_samples" \
+"$HOME/.guix-profile/bin/time" -v "$REPO/bin/build_tag_head_samples" \
     "$RI" "$LTAGS" "$OUT/hprcv1_chr6" \
     --s 32,64,128,256 \
     2>&1 | tee -a "$LOG"
