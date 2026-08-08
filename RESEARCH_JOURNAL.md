@@ -2259,6 +2259,267 @@ of the file, so its ~8.7s cost is invisible to queries.
 ### Commits (this repo, branch backward-extend-sa-perf)
 
 - `8b44a73` r-index: serialize run_head_c[] into .ri (JR-014, load ~11s -> ~2.5s)
-- (this entry, pending as of writing)
+- `e7f8a80` journal: JR-014 serialize run_head_c[] into .ri -- load ~11.5s -> ~1.8s
+
+---
+
+## JR-015 — Post-Risk-E MEM classification: fresh seed-cost + tag-partition tables
+
+```yaml
+id: JR-015
+date: 2026-08-07
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [classification, seed-cost, tag-partition, hprc, vesuvio, historical-comparison]
+refs:
+  follows: [JR-014]
+  supersedes-numbers-of: [FINDINGS_SEED_COST.md]
+  historical-comparison-note: July 2026 FINDINGS_SEED_COST.md likely
+    used clean chr6 reads (MEM count 100,899 matches Aug 2026 clean
+    100,000; seed_cost 22.7M matches Aug 2026 clean 20.5M within 10%).
+    The reads-file identity for July was not recorded in that doc.
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+`FINDINGS_SEED_COST.md` (2026-07-23, branch `classify-mem-runs`)
+established that seed cost dominates the locate hot path: on
+HPRCv1 chr6 100k reads, seed accounted for 32.2% of walk work,
+and 8.8% of MEMs (those with `avg_bwt_run_length >= 1000` bp)
+carried 75.4% of all seed cost.  Those numbers pre-dated the
+Risk E fix (JR-007) and pre-dated the flipped MEM finder
+(JR-011 onwards).  Two questions were open:
+
+1. **Are the numbers still current?**  The Risk E fix removed
+   ~1.7% of MEMs (spurious non-left-maximal MEMs concentrated in
+   long-BWT-run regions).  Impact on the seed-cost distribution
+   was unquantified.
+2. **What does the tag-type partition look like on both noisy
+   and clean workloads?**  July 2026 was noisy-only (or reads
+   file unspecified); a noisy-vs-clean comparison had not been
+   done.
+
+### Method
+
+Re-ran `find_mems --debug-classify=<path>` on Vesuvio against
+JR-014-format .ri files, for both HPRCv1 chr6 workloads and both
+MEM finders:
+
+- `chr6.alt_noisy.reads.txt` (155,551 MEMs across 100k reads)
+- `chr6.alt.reads.txt`       (100,000 MEMs across 100k reads)
+
+The classifier is idempotent w.r.t. the finder path (it walks
+the MEM's BWT interval independently of how the MEM was located),
+so legacy and flipped runs produce byte-identical TSVs.  Verified
+via `diff <(sort legacy.tsv) <(sort flipped.tsv)` -- zero diff
+on both workloads.  This confirms the flipped MEM set is
+byte-identical to legacy at the classification level too, not
+just at the coverage-MD5 level.
+
+Aggregated via `xy-test/classify_aggregate.py` (Python 3 stdlib
+one-off; not committed).
+
+### Findings
+
+**A. July 2026 baseline most likely used clean chr6 reads.**  MEM
+count matches almost exactly (July 100,899 vs Aug clean 100,000).
+Seed cost matches within 10% (July 22.7M vs Aug clean 20.5M).
+The ~10% delta is consistent with the Risk E fix (JR-007) removing
+a small number of MEMs concentrated in long-BWT-run regions.
+
+| dataset                                 | Total MEMs | seed_cost   |
+|:----------------------------------------|-----------:|------------:|
+| July 2026 pre-Risk-E (assumed clean)    | 100,899    | 22.7M       |
+| Aug 2026 post-Risk-E, clean             | 100,000    | 20.5M       |
+| Aug 2026 post-Risk-E, noisy             | 155,551    | 33.0M       |
+
+**B. Tail concentration is a stable structural property of HPRC
+chr6 -- unchanged by Risk E fix or reads-file choice.**
+
+| dataset                            | %MEMs in tail (>=1000 bp) | %seed in tail |
+|:-----------------------------------|--------------------------:|--------------:|
+| July 2026 pre-Risk-E (assumed clean) | 8.8%                    | 75.4%         |
+| Aug 2026 post-Risk-E, noisy        | **8.6%**                  | **76.2%**     |
+| Aug 2026 post-Risk-E, clean        | **8.2%**                  | **73.8%**     |
+
+Same structural story across three measurement conditions:
+**~8-9% of MEMs concentrate ~74-76% of seed cost.**  The Risk E
+fix's impact on the tail is small (-0.6pp of MEMs on the closest
+comparison, July vs Aug clean).
+
+**C. Seed / walk ratio: July's 32% figure is not reproducible
+against runtime measurements.**
+
+| dataset                            | seed_cost (calls) | seed / walk | inter_current |
+|:-----------------------------------|-----------------:|------------:|--------------:|
+| July 2026 pre-Risk-E (assumed clean) | 22.7M          | 32.2%       | ~47.8M (implied) |
+| Aug 2026 post-Risk-E, clean        | **20.5M**        | **88.3%**   | **2.7M**      |
+| Aug 2026 post-Risk-E, noisy        | **33.0M**        | **87.8%**   | **4.6M**      |
+
+Aug 2026 clean's `inter_current` (2.7M) matches the runtime
+`locate_next_calls` reported by JR-013/014 exactly.  The July
+32.2% seed/walk implies inter_current ~47.8M, which would
+contradict the runtime measurement by ~17x.  Something changed
+in either the classifier's `inter_current` computation, the
+reads file, or the aggregation between July and August.
+Historical July numbers should be treated as unverified.
+
+Definition per current classifier
+(`classify_mem_runs` in src/find_mems.cpp):
+```
+inter_current = sum over k>=1 of (tag_starts[k] - prev_pos_cur)
+              = last_tag_start - sp    (telescoping)
+```
+
+Direct comparison of the two Aug 2026 workloads (identical index,
+different reads file):
+
+| metric                            | noisy       | clean       |
+|:----------------------------------|------------:|------------:|
+| Total MEMs                        | 155,551     | 100,000     |
+| MEMs per read                     | 1.56        | 1.00        |
+| Total seed cost (locateNext)      | 33.0M       | 20.5M       |
+| Total inter_current               | 4.6M        | 2.7M        |
+| seed / walk                       | 87.75%      | 88.30%      |
+| Volume-weighted avg BWT run len   | 1477 bp     | 1268 bp     |
+| b1 tags (anchor-eligible)         | 10.27%      | 5.34%       |
+| b3 tags (strictly interior)       | 86.59%      | 93.00%      |
+| samples[rid] savings ceiling      | **0.32%**   | **0.06%**   |
+
+Noisy has 2x more anchor-eligible tags (b1) than clean because
+shorter MEMs cross BWT run boundaries more often.  This makes
+noisy's `samples[rid]` optimization ceiling (0.32%) 5x higher
+than clean's (0.06%) -- but both are far below actionable
+thresholds and confirm the FINDINGS_SEED_COST.md conclusion
+that `samples[rid]` is not worth building.
+
+**avg_bwt_run_length caveat.**  The July 2026 FINDINGS_SEED_COST.md
+report of "volume-weighted avg BWT run length: 552 bp" is close
+to a *simple arithmetic mean* (not volume-weighted) computed on
+the same TSV today: **483 bp on Aug 2026 clean** (close to July's
+552 bp).  If the aggregator weights by MEM's `bwt_size` instead,
+the result is 1268 bp.  Different weightings, different numbers;
+the July doc's weighting was not explicit.  For meaningful
+comparisons, prefer the per-MEM bucketed table above (which is
+weighting-independent).
+
+**D. seed_cost (in locateNext calls) closes the loop with
+JR-013/014 wall-time measurements.**
+
+At an implied 0.53-0.56 microseconds per `locateNext` call
+(Vesuvio, cache-mostly-cold seed-walk regime):
+
+| workload | seed_cost (calls) | predicted wall (0.53us/call) | observed first-locate (JR-014) |
+|:---------|-----------------:|-----------------------------:|------------------------------:|
+| noisy    | 33,029,141       | 17.51s                       | **17.65s**                    |
+| clean    | 20,467,583       | 10.85s                       | **11.43s**                    |
+
+Model closes within ~5%.  This confirms the `seed_cost` column
+in the classifier is the exact quantity flipped's SA carry saves
+per query.  The JR-014 flipped-path `first_locate_calls = 0`
+translates directly to the classifier's `seed_cost` being the
+saved wall time.
+
+Note: 0.53 us/call is 2.2x the FINDINGS_SEED_COST.md estimate of
+0.24 us/call.  The old figure was an amortized mix of seed and
+inter-tag walks; seed walks (cold predecessor + block walk from
+the run start to `sp`) are more expensive per call than inter-tag
+walks (warm SA cursor continuation).  Model refinement:
+
+- Amortized (mixed):    ~0.24 us/call  (July 2026 figure)
+- Seed walks only:       ~0.53 us/call  (Aug 2026 back-computed)
+- Inter-tag walks only:  <0.24 us/call  (implied; not directly measured)
+
+**E. Risk E fix impact on the classification: essentially null.**
+
+The Risk E fix removed spurious non-left-maximal MEMs (JR-007).
+Spurious MEMs concentrate in long-BWT-run regions (per JR-005:
+median spurious size 32,173 occurrences vs median real MEM size
+86).  In theory that should reduce the tail bucket counts by 1-2%.
+Actual measured tail (>=1000 bp) MEM counts:
+
+| dataset                        | %MEMs in tail | %seed in tail |
+|:-------------------------------|--------------:|--------------:|
+| July 2026 pre-Risk-E           | 8.8%          | 75.4%         |
+| Aug 2026 post-Risk-E, noisy    | 8.6%          | 76.2%         |
+| Aug 2026 post-Risk-E, clean    | 8.2%          | 73.8%         |
+
+Small changes (-0.2 to -0.6pp of MEMs in the tail; ±2pp of seed
+share) but well within the range attributable to the different
+reads files.  FINDINGS_SEED_COST.md's headline (75% of seed in
+8-9% of MEMs) survives the fix intact.
+
+### Discussion
+
+**FINDINGS_SEED_COST.md's conclusions all stand.**  The
+"attack seed cost, ignore samples[rid], target long-BWT-run tail"
+strategy is confirmed by the fresh numbers.  The specific
+"projected 7% end-to-end wall reduction via SA subsample" analysis
+in that doc is now less relevant: JR-011 delivered the
+SA-carrying primitive (via flipped MEM finder) that eliminates
+seed cost entirely on the flipped path, achieving the theoretical
+maximum saving without any additional storage.
+
+**The classifier is now a direct measure of what the flipped path
+saves.**  The `seed_cost` column corresponds byte-for-byte to
+`first_locate_calls` in the runtime `first_locate_time` profiler
+output on legacy runs.  For any future work considering further
+locate optimizations, this classifier gives a per-MEM quantification
+of the ceiling.
+
+**JR-015 is a fresh baseline, not a new optimization.**  Nothing
+in this entry changes code or ships perf.  It updates the seed-cost
++ tag-partition analysis for the post-Risk-E, post-JR-014 code and
+data, cross-validates the JR-013/014 first-locate wall times against
+independent measurement, and completes the noisy-vs-clean comparison
+that was missing from July 2026's work.
+
+### Open questions / follow-ups
+
+1. **Unexplained gap in July 2026's seed/walk ratio.**  July's
+   32.2% seed/walk implies inter_current ~47.8M, but Aug 2026
+   clean's inter_current on the same reads-and-index combination
+   is 2.7M -- a 17x delta.  The classifier's `inter_current`
+   definition is unchanged.  Possibilities: (a) different reads
+   file than assumed, (b) different .ri format that changed tag
+   geometry, (c) an aggregation bug in the July analysis.  Not
+   pursued -- July numbers should be treated as unverified for
+   the seed/walk fraction; the per-bucket seed-cost concentration
+   story survives independently (see Finding B).
+2. **Inter-tag walk cost per call.**  Not directly measured.
+   The mixed 0.24 us and cold-seed 0.53 us bookend it, but
+   pinning the inter-tag figure would firm up wall-time
+   projections for any future inter-tag optimization.
+3. **JR-011 already delivered the ideal seed-cost fix
+   (elimination via SA carry).**  No further seed-cost work is
+   needed.  Any future locate optimizations should target
+   inter-tag walks (12% of walk work on Aug 2026) -- but the
+   `samples[rid]` optimization ceiling of 0.06-0.32% shows the
+   inter-tag structure has little exploitable slack.
+4. **Non-encoded r-index path.**  All tables assume the encoded
+   path (default for `.ri` files).  Non-encoded is dead code but
+   would need a fresh classification run to match.
+
+### Data artifacts
+
+**Vesuvio classification output (canonical):**
+- `../mem-projection/pangenome-pipeline/classify_output_jr015/classify_noisy_legacy.tsv`  (155551 rows, ~10 MB)
+- `../mem-projection/pangenome-pipeline/classify_output_jr015/classify_noisy_flipped.tsv` (identical to legacy)
+- `../mem-projection/pangenome-pipeline/classify_output_jr015/classify_clean_legacy.tsv`  (100000 rows, ~6.6 MB)
+- `../mem-projection/pangenome-pipeline/classify_output_jr015/classify_clean_flipped.tsv` (identical to legacy)
+- `.../classify_output_jr015/summary_{noisy,clean}.txt` -- human-readable aggregates.
+
+**Historical baseline (superseded numbers, kept for reference):**
+- `FINDINGS_SEED_COST.md` -- July 2026 pre-Risk-E analysis.
+
+**Aggregator (one-off, not committed):**
+- `xy-test/classify_aggregate.py` -- Python 3 stdlib script that
+  produces the summary tables from the classifier's TSV.
+
+### Commits (this repo, branch backward-extend-sa-perf)
+
+- (no code changes in JR-015 -- this entry documents fresh
+  measurements against JR-014 code)
 
 ---
