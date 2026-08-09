@@ -136,6 +136,7 @@ won't have the same context you do.
 | [JR-014](#jr-014--serialize-run_head_c-into-ri-load-time-collapse) | 2026-08-06 | Serialize run_head_c[] into .ri: load time collapse | resolved | jr-011, jr-013, r-index, serialization, load-time, vesuvio |
 | [JR-015](#jr-015--post-risk-e-mem-classification-fresh-seed-cost--tag-partition-tables) | 2026-08-07 | Post-Risk-E MEM classification: fresh seed-cost + tag-partition tables | resolved | classification, seed-cost, tag-partition, hprc, vesuvio, historical-comparison |
 | [JR-016](#jr-016--tag-head-sa-samples-sr-index-style-storage-cost-on-hprc-chr6) | 2026-08-09 | Tag-head SA samples (sr-index-style): storage cost on HPRC chr6 | open | tag-head-samples, sr-index, sa-sampling, storage, hprc, vesuvio |
+| [JR-017](#jr-017--lf-operation-latency-on-hprc-chr6-baseline-vs-fused-lf_scan) | 2026-08-09 | LF-operation latency on HPRC chr6: baseline vs fused LF_scan | open | lf, r-index, microbenchmark, hprc, vesuvio, jr-016 |
 
 ---
 
@@ -2794,6 +2795,194 @@ storage.  Assumes projection holds; needs end-to-end validation.
   (fixes SA bit-width truncation; adds spot-check passes; changes
   deletion rule to text-order per Cobas/Gagie/Navarro 2021)
 - `890d413` run_hprc_chr6.sh: delete stale v1 outputs before rerun
+- (this entry, pending as of writing)
+
+---
+
+## JR-017 — LF-operation latency on HPRC chr6: baseline vs fused LF_scan
+
+```yaml
+id: JR-017
+date: 2026-08-09
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: open
+tags: [lf, r-index, microbenchmark, hprc, vesuvio, jr-016]
+refs:
+  follows: [JR-016]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+JR-016 established that tag-head SA samples fit trivially in storage
+(13-61 MB for s in {32, 64, 128, 256}), so the design's viability
+hinges on **query-time LF-walk cost**.  Per-emit cost in the slow
+path is bounded by s LF steps.  Earlier back-of-envelope projections
+used ~0.4 us/LF from JR-013's aggregate locateNext measurement, but
+LF is a different operation than locateNext and its true cost was
+unknown.  Also open: whether fusing the two internal block walks in
+LF (bwt_char_at_encoded + rankAt_encoded -> one scan_at) would
+provide meaningful speedup.
+
+### Method
+
+Two implementations compared:
+
+- **LF()** -- today's baseline (r-index.hpp:807): two independent block
+  walks via psi_encoded, one for the char and one for the rank.
+- **LF_scan()** -- new header-inline (r-index.hpp:988) wrapping one
+  scan_at() call.  Reuses the block scan machinery JR-011 added.
+  Bonus: populates run_id, run_start_bwt, and ranks[] as byproducts
+  useful for downstream callers (e.g., the "is pos a BWT-run head"
+  check in the sr-index sampled-SA slow path -- free from the same
+  scan).
+
+Two access patterns per variant:
+
+- **Random**: 1,000,000 fresh random BWT positions, one LF per call.
+  Models per-fresh-walk cost in the sr-index query (first LF step of
+  each deleted tag-head's walk starts at an unrelated position).
+- **Chain**: 10,000 random starts x 100 sequential LF steps
+  (cur = LF(cur)).  Models the per-step cost of steps 2..s within an
+  ongoing walk from a deleted tag-head to a nearby sample.
+
+Protocol: `bin/bench_lf` (src/bench_lf.cpp).  Correctness pass first
+(10,000 random positions cross-checked LF vs LF_scan).  Warmup pass
+(one untimed round of both variants + both patterns).  Then 5 timed
+trials per (variant, pattern), median + stddev reported.  Same
+seeded position pools reused across variants so measurements are on
+identical inputs.  XOR sink accumulator prevents dead-code elimination.
+
+HPRC chr6 r-index used: `runs/hprc-chr6-2026-06-02/hprcv1_chr6.ri`
+(post-JR-014 format, ~3.6 GB on disk).
+
+### Findings
+
+**Correctness.**  LF() == LF_scan() on 10,000 / 10,000 random positions.
+Zero mismatches.
+
+**Latency (Vesuvio, median-of-5 ns/op, stddev < 1% of median on every
+row).**
+
+| variant             | pattern | ns/op    | stddev | speedup vs baseline |
+|:--------------------|:--------|---------:|-------:|--------------------:|
+| LF (baseline)       | random  | 677.01   | 3.54   | 1.00x               |
+| LF_scan (fused)     | random  | **646.53** | 4.65 | **1.05x (4.5% faster)** |
+| LF (baseline)       | chain   | 664.31   | 2.35   | 1.00x               |
+| LF_scan (fused)     | chain   | **634.29** | 2.54 | **1.05x (4.5% faster)** |
+
+**Yeast comparison** (Mac, small n=337M .ri, ~168 MB on disk):
+
+| variant             | pattern | ns/op   | speedup |
+|:--------------------|:--------|--------:|--------:|
+| LF (baseline)       | random  | 434.54  | 1.00x   |
+| LF_scan (fused)     | random  | 330.92  | **1.31x (24% faster)** |
+
+### Interpretation
+
+**Fusing gives 24% on yeast but only 4.5% on HPRC.**  Root cause:
+DRAM latency.  On yeast the entire .ri fits in L3 cache, so both
+variants pay CPU-only work per LF call -- fusing eliminates one full
+block walk (~50% of CPU work per LF), giving the ~24% total speedup.
+On HPRC, block accesses are DRAM-bound (~150 ns per fetch); the
+baseline's second scan hits the just-warmed block from L1, so it's
+cheap.  Fusing only saves the CPU walk cost, not the memory fetch.
+Net: fused wins by the walk-cost fraction of total, which shrinks
+as DRAM cost grows.
+
+**Random and chain are essentially identical wall on HPRC** (both ~640 ns
+for LF_scan; 12 ns spread).  LF is a random-looking permutation, so
+successive LF steps jump to unrelated block regions.  No cache-locality
+benefit from being in a walk.  Confirms LF cost model is per-step
+independent, no per-walk amortization.
+
+**Real LF cost is ~634 ns/op** (LF_scan chain, HPRC).  Meaningfully
+higher than the ~400 ns estimate JR-016 used for query-cost
+projection.  Updated projections below.
+
+### Impact on JR-016 query-cost projections
+
+Using **634 ns/LF** (LF_scan chain, real number) and JR-016's HPRC
+workload (155.5K MEMs x 6.2 emits/MEM = 964K total emits per query,
+mean LF walk length ~ s/2 assuming uniform):
+
+| s   | ops/emit | ops/workload | LF wall (s) | vs legacy locate 30.5s |
+|----:|---------:|-------------:|------------:|-----------------------:|
+| 32  |       16 |       15.4M  |      **9.8** | **-20.7 s (-68%)**       |
+| 64  |       32 |       30.8M  |     **19.5** | **-11.0 s (-36%)**       |
+| 128 |       64 |       61.7M  |     **39.1** | **+8.6 s regression**    |
+| 256 |      128 |      123.4M  |     **78.3** | **+48 s regression**     |
+
+**Only s=32 and s=64 remain wins**; s=128 flips to regression.
+Previously JR-016 projected wins at all s <= 128 using the 0.4 us
+estimate; s=128 was borderline (25 s vs 30.5 s).  With the real
+634 ns/LF, s=128 is +8.6 s worse than legacy today.
+
+**Sweet spot narrows to s=32 or s=64.**  Storage cost:
+
+| s | storage | LF wall | savings vs legacy | savings vs flipped Step 0' (JR-012 noisy: 41.1s locate) |
+|--:|--------:|--------:|------------------:|--------------------------------------------------------:|
+| 32 | 61 MB  | 9.8 s  | -20.7 s (68%)   | -3 s vs flipped                                          |
+| 64 | 33 MB  | 19.5 s | -11.0 s (36%)   | +7 s worse than flipped                                  |
+
+**s=32 is the only projection where legacy + tag-head samples clearly
+beats flipped** (~3 s wall win, tiny margin).  s=64 loses to flipped.
+The design's competitive window has narrowed to a single s value with
+a small absolute win.
+
+### Discussion
+
+**The naive-LF-optimization ceiling is low in DRAM-bound regimes.**
+Fusing block walks (JR-011's scan_at machinery) helps CPU-bound
+workloads a lot but flattens to ~5% when DRAM is the bottleneck.
+Any further LF speedup would need to attack the DRAM cost itself:
+prefetching, block layout changes to reduce cache-line splits, or
+skipping LF entirely for certain query paths.
+
+**Chain and random being identical wall is a load-bearing finding.**
+It rules out cache-locality optimizations across LF steps within a
+single walk.  Any per-step optimization applies uniformly.  It also
+means our earlier intuition ("chain should be cheaper due to
+sequential access") was wrong.
+
+**The tag-head samples design remains marginally viable, not obviously
+worth shipping.**  At s=32: 61 MB storage, ~3 s wall win over the
+current flipped default.  End-to-end validation would take days of
+integration + benchmarking (build a find_mems --tag-head-samples
+variant, gate via --gaf, N=5 warm-cache Vesuvio bench).  Given the
+small projected margin, worth asking whether other JR-016 open
+questions (like the correctness gate itself) should complete before
+investing in that path.
+
+### Open questions
+
+1. **Should we invest in the end-to-end find_mems integration?**
+   Projected 3 s wall win at s=32 vs current flipped default is
+   marginal.  Cost: ~3-5 days of integration + benchmark work.
+   Deferred pending user direction.
+
+2. **Prefetching LF's block fetch?**  A `__builtin_prefetch` on
+   blocks_start_pos.predecessor(pos) + block_encoded_start_bits[..]
+   could hide part of the DRAM latency.  Speculative gains 10-30%
+   in similar r-index microbenchmarks in the literature; would need
+   to measure.  Not attempted.
+
+3. **Dedicated run-head bitvector to shortcut the run-head check?**
+   Adding an sd_vector marking BWT-run-start positions (~250 MB
+   storage for HPRC chr6) would let the query slow path skip the
+   scan_at when checking "is cur a BWT-run head" -- but per JR-017's
+   fusion result, that check is already ~free when combined with the
+   LF scan.  Marginal.  Not worth building unless the query path
+   ends up hot in a real find_mems integration.
+
+### Data artifacts
+
+- `~/mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/tag_head_samples/bench_lf.log`
+  (copied to Mac at `mem-projection/pangenome-pipeline/classify_output_jr015/bench_lf.log`)
+
+### Commits (this repo, branch tag-head-samples)
+
+- `063fbe7` r-index: add LF_scan (fused LF via scan_at) + bench_lf microbenchmark
 - (this entry, pending as of writing)
 
 ---
