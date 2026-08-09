@@ -131,6 +131,11 @@ won't have the same context you do.
 | [JR-007](#jr-007--risk-e-fix-fixed-legacy--flipped-produce-byte-identical-coverage) | 2026-07-29 | Risk E fix: fixed-legacy == flipped (byte-identical coverage) + honest Stage 3 delta | resolved | risk-e, fix, correctness, perf, stage3 |
 | [JR-008](#jr-008--stage-3-benchmark-n5-warm-cache-hprc-chr6-100k-reads) | 2026-07-29 | Stage 3 benchmark: N=5 warm-cache HPRC chr6 100K reads | resolved | stage3, perf, benchmark, hprc |
 | [JR-011](#jr-011--backward_extend_encoded_with_sa-rewrite-hprc-chr6-noisy-benchmark) | 2026-07-30 | backward_extend_encoded_with_sa rewrite: HPRC chr6 noisy benchmark | resolved | jr-010, sa-carry, primitive, perf, hprc, noisy |
+| [JR-012](#jr-012--step-0-min_len-pre-check-in-find_mems_flipped-hprc-chr6-noisy--clean) | 2026-08-01 | Step 0' min_len pre-check in find_mems_flipped: HPRC chr6 noisy + clean | resolved | flipped, algorithm, perf, hprc, noisy, clean, step0, vesuvio |
+| [JR-013](#jr-013--toehold-hoist-into-callers-perf-null-contract-cleanup) | 2026-08-06 | Toehold hoist into callers: perf null, contract cleanup | resolved | flipped, r-index, primitive, contract, refactor, vesuvio, perf-null |
+| [JR-014](#jr-014--serialize-run_head_c-into-ri-load-time-collapse) | 2026-08-06 | Serialize run_head_c[] into .ri: load time collapse | resolved | jr-011, jr-013, r-index, serialization, load-time, vesuvio |
+| [JR-015](#jr-015--post-risk-e-mem-classification-fresh-seed-cost--tag-partition-tables) | 2026-08-07 | Post-Risk-E MEM classification: fresh seed-cost + tag-partition tables | resolved | classification, seed-cost, tag-partition, hprc, vesuvio, historical-comparison |
+| [JR-016](#jr-016--tag-head-sa-samples-sr-index-style-storage-cost-on-hprc-chr6) | 2026-08-09 | Tag-head SA samples (sr-index-style): storage cost on HPRC chr6 | open | tag-head-samples, sr-index, sa-sampling, storage, hprc, vesuvio |
 
 ---
 
@@ -2521,5 +2526,274 @@ that was missing from July 2026's work.
 
 - (no code changes in JR-015 -- this entry documents fresh
   measurements against JR-014 code)
+
+---
+
+## JR-016 — Tag-head SA samples (sr-index-style): storage cost on HPRC chr6
+
+```yaml
+id: JR-016
+date: 2026-08-09
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: open
+tags: [tag-head-samples, sr-index, sa-sampling, storage, hprc, vesuvio]
+refs:
+  follows: [JR-015]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+JR-015 confirmed seed cost is a structural, workload-independent
+property of HPRC chr6: 30-33% of walk work, ~76% concentrated in
+tag heads inside long BWT runs.  The flipped path (JR-012)
+eliminates this cost by SA-carrying through backward-only MEM
+enumeration, at the price of a more expensive MEM-finding phase.
+An alternative attack: keep the legacy MEM finder (which is
+faster at MEM finding per JR-012 Vesuvio tables: 28.35s vs Step 0'
+flipped 38.63s on noisy chr6) and instead add a query-side data
+structure that answers `SA[tag_head]` cheaply.  This decouples
+"where the MEMs are" from "what the SA is at each tag emit."
+
+Design: sr-index-inspired sub-sampling over tag-run heads.  From
+Cobas, Gagie, Navarro 2021 (arXiv:2103.15329) §4.1, adapted to
+our two-tier structure (tag runs + BWT runs):
+
+- Candidates = tag-run heads (deletable) + BWT-run heads
+  (unremovable anchors; already sampled in `.ri` samples[]).
+- Sort candidates by SA value (text-position order).
+- Scan left-to-right; for each tag-run head `s_i`, delete iff
+  `SA[s_{i+1}] - SA[prev_kept_SA] < s`.
+
+Guarantee: from any deleted tag head `t`, walking LF backward
+reaches a kept sample (tag-head OR BWT-anchor) in < s LF steps,
+because LF decrements SA by 1 per step and the deletion rule
+ensures a kept sample exists at some SA in
+`[SA[t] - s + 1, SA[t]]`.  A find_mems query for `SA[t]` at any
+deleted tag head becomes: 1 hash-marker lookup (fast path if
+kept) OR up to s LF steps to a known-SA position (slow path).
+No `locate_sa_value` seed walk needed.
+
+### Method
+
+New binary `bin/build_tag_head_samples` (branch
+`tag-head-samples`, off `backward-extend-sa-perf` HEAD `c6858a1`):
+
+**Phase 1** -- enumerate all candidates with their SAs.  Walk BWT
+runs in order via existing block-decode; at each BWT-run head,
+emit anchor candidate with `SA = getSample(bwt_rid)`.  Walk
+locateNext through each run, emitting tag-head candidates at
+their BWT positions with the running SA cursor.  Total locateNext
+cost ~= n (single full BWT walk).
+
+**Phase 2** -- sort candidates by SA; apply deletion rule
+per-`s` value in a single linear scan.  All 4 s values processed
+against one shared Phase 1 output.
+
+**Phase 3** -- serialize per s: sd_vector `kept_marker` indexed
+by tag-run rid (1 bit per rid, 1 iff kept), int_vector
+`sa_values` of packed SAs for kept tag-run heads in rid order.
+Width from `r_index.samples.width()` (=39 bits on HPRC chr6);
+using naive `ceil(log2(n))` = 35 bits silently truncates SA
+values since packed SA range is `n_seq * max_length` >> `n` on
+multi-string BWTs.  Caught by verification pass (a) below on
+first yeast run; fixed before Vesuvio run.
+
+**Verification** -- two spot-check passes per s value on the
+built table:
+
+- (a) 1000 random kept tag heads: assert
+  `sa_values[rank_1(rid)] == locate_sa_value(run_start_bwt(rid))`.
+- (b) 100 random deleted tag heads: simulate the query-time LF
+  walk, assert we land on a known sample within s steps AND
+  reconstructed SA (sample + steps) equals ground truth.
+
+Both checks pass on all 4 s values on both yeast (n=337M) and
+HPRC chr6 (n=31e9).  See "Verification" section below for what's
+covered and what isn't.
+
+### Findings
+
+**HPRC chr6 storage table** (Vesuvio, single 1h 24m build for all
+4 s values via `xy-test/tag_samples/run_hprc_chr6.sh`):
+
+Index stats: n = 31.0 Gbp BWT, 249.4M BWT runs, 710.2M tag runs,
+of which 240.6M (34%) coincide with BWT-run heads (implicit-
+deleted for free -- SA available from r-index `samples[]`),
+leaving 469.6M genuine tag-head deletion candidates.
+
+| s | Kept | %candidates | %all_tag_runs | kept_marker | sa_values | **Total** |
+|--:|--:|--:|--:|--:|--:|--:|
+| 32  | 10.77M | 2.29% | 1.52% | 10.94 MB | 50.07 MB | **61.0 MB** |
+| 64  |  5.74M | 1.22% | 0.81% |  6.60 MB | 26.66 MB | **33.3 MB** |
+| 128 |  3.44M | 0.73% | 0.48% |  4.22 MB | 16.00 MB | **20.2 MB** |
+| 256 |  2.27M | 0.48% | 0.32% |  2.93 MB | 10.57 MB | **13.5 MB** |
+
+Bits per kept sample climb from 8.52 (s=32) to 10.82 (s=256) as
+kept density drops -- sd_vector overhead grows sublinearly with
+sparsity.  SA values consume 39 bits/entry uniformly.
+
+**Verification** (per s value):
+
+- (a) 1000/1000 kept-SA spot checks match `locate_sa_value_ref`
+- (b) 100/100 deleted tag heads reachable within s LF steps AND
+  reconstructed SA matches ground truth
+
+On all 4 s values, both passes.  Zero mismatches.  Failure modes
+covered include: SA computation bugs, bit-width truncation, wrong
+`kept_marker` rank alignment with `sa_values`, deletion-rule
+invariant violation, LF-walk arithmetic errors.  Not covered:
+end-to-end pipeline (no `find_mems` variant consumes these files
+yet), and rare corner cases below the 1100-sample-per-s
+statistical resolution.
+
+**Build cost breakdown** (HPRC chr6, Vesuvio, one invocation for
+all 4 s values):
+
+| Phase | Wall | Notes |
+|:------|-----:|:------|
+| R-index + ltag load | ~2 s | |
+| Phase 1: candidate + SA enumeration | 4952 s (82 min) | 12.47B locateNext calls at 0.40 us/call |
+| Sort by SA (719M candidates) | 82 s | std::sort on 24-byte tuples |
+| Per-s: deletion + build + verify + write | ~4 s each | 4 passes over sorted candidates |
+| **Total wall** | **1h 24m** | |
+| Peak RSS | 21.7 GB | dominated by sorted candidate array |
+
+Amortization: SA computation is O(n) regardless of s value, so
+running all 4 s values in one invocation is essentially free
+compared to running 1.
+
+### Interpretation
+
+**Storage overhead is far smaller than initially projected.**  The
+early mean-field estimates in this session's design phase
+predicted 300 MB - 3.5 GB storage per s -- too pessimistic by
+1-2 orders of magnitude because the exponential-gap-length
+assumption breaks: real BWT candidate gaps are fat-tailed, and
+the interleaving of 249M BWT-run-head anchors (mean text-order
+gap ~124) already covers most tag heads by proximity to a BWT
+anchor.  Genuine samples are only needed for tag heads inside
+long BWT runs, which are ~8-9% of all tag runs per JR-015 / the
+FINDINGS_SEED_COST tail characterization.
+
+**All s values fit the CLAUDE.md RSS budget by an order of
+magnitude.**  Baseline find_mems peak RSS on HPRC chr6 = 4.2 GB.
+CLAUDE.md 10% ceiling = 420 MB.  Every s value in {32, 64, 128,
+256} adds <70 MB (1.6% overhead).  Storage is no longer the
+constraint on this design.
+
+**Query-time cost projection (not yet measured)** based on the
+< s LF-step guarantee and the JR-013 locateNext cost of ~0.4 us:
+
+- Per emit: <= s LF steps, mean ~s/2 assuming uniform position
+  along the deletion interval.
+- Per HPRC chr6 workload (155.5K MEMs * 6.2 emits/MEM = 964K emits):
+
+| s | expected LF walk / query workload | vs today's legacy locate 30.5s |
+|--:|--:|--:|
+| 32  | 964K * 16 * 0.4us ~= 6s   | -24s savings |
+| 64  | 964K * 32 * 0.4us ~= 12s  | -18s savings |
+| 128 | 964K * 64 * 0.4us ~= 25s  | -5s savings  |
+| 256 | 964K * 128 * 0.4us ~= 50s | +20s regression |
+
+Sweet spot for query time: s=32 or s=64.  Both fit RSS budget
+trivially and project to substantial (18-24s) wall savings on
+the legacy path.  s=256 is a regression -- LF walk exceeds seed
+cost being eliminated.
+
+**Strategic implication.**  If this design ships, the legacy MEM
+finder becomes competitive with (or faster than) flipped:
+- Legacy today: 28.35s MEM-finding + 30.5s locate = 58.9s (Vesuvio noisy)
+- Legacy + s=32 samples (projected): 28.35s MEM-finding + 6s LF walk = 34.4s
+- Flipped Step 0' (JR-012 Vesuvio noisy): 38.63s MEM-finding + 2.48s locate = 41.1s
+
+Projection: legacy + samples beats flipped by ~7s at 61 MB extra
+storage.  Assumes projection holds; needs end-to-end validation.
+
+### Open questions
+
+1. **End-to-end validation not done.**  The samples files are
+   correct at the SA-lookup level (verified) but no `find_mems`
+   variant consumes them yet.  The `--gaf` gate on HPRC chr6
+   must pass 2000/2000 valid AND coverage MD5 must match the
+   JR-012 baseline `60f6b8e4a759aebb252b83a870b9ff8c` before
+   this can be trusted for production.  This is the next
+   correctness gate.
+2. **Query-time perf is projected, not measured.**  The 6-24s
+   wall savings estimates assume mean LF walk = s/2 with uniform
+   distribution.  Real walks may be shorter (BWT anchors dense
+   in text order intercept most walks well before s cap) or
+   longer (specific tag-head distributions).  Only a real
+   `find_mems` benchmark on Vesuvio can settle this.
+3. **Should this replace or coexist with the flipped default?**
+   JR-012 recommended flipping the default to `--use-flipped-mems`
+   based on ~11% wall wins on both workloads.  If JR-016
+   validates end-to-end with ~20% wall win over flipped, legacy
+   + samples becomes the new default candidate.  Deferred until
+   (1) and (2) complete.
+4. **Choice of s.**  s=32 minimizes query cost but pays 61 MB;
+   s=64 halves storage at ~2x query cost; s=128 further halves
+   at another ~2x.  Actual sweet spot depends on downstream
+   priorities: cohort-run batch (RSS matters more, prefer larger
+   s) vs single-query latency (LF walk matters more, prefer
+   smaller s).
+
+### Verification (what's covered / not)
+
+**Covered by build-time spot checks (a) + (b):**
+- Phase 1 SA computation correctness (walk from BWT-run-head sample via locateNext)
+- Bit-width sizing of sa_values (must match r-index samples width for packed SA)
+- Coincident tag-head-with-BWT-anchor handling (step-0 anchor check in query)
+- Deletion rule not too aggressive (deleted head reachable within s)
+- kept_marker rank/select alignment with sa_values ordering
+- LF() primitive behavior in the query walk
+- Off-by-one in step counter during LF walk
+
+**NOT covered (natural next-step gate):**
+- End-to-end pipeline via `./query.sh --gaf`: no `find_mems`
+  variant reads `.tag_samples.s<N>` yet.
+- Statistical: 1100 spot-check samples per s across ~700M
+  candidates rules out bug rates >~0.1% with high confidence,
+  but not rare-corner-case bugs (1-in-10-million rate).
+
+### Design decisions worth recording
+
+- **Distance metric: text-position (SA), not BWT-position.**  BWT
+  adjacency has no relation to LF-walk reachability.  Text
+  adjacency IS the correct metric because LF walks step through
+  SA-adjacent positions (SA decrements by 1 per LF step, modulo
+  sequence boundaries which BWT runs never cross).
+- **Coincident tag-head + BWT-anchor: implicit-deleted, no storage.**
+  Their SAs are available for free from r-index `samples[]`.  Query
+  slow-path step 0 catches these via the "is pos a BWT-run head"
+  check.  Saves storage for 240.6M / 710.2M = 34% of all tag runs
+  on HPRC chr6.
+- **Single Phase 1 shared across all s values.**  SA computation
+  cost is fixed at O(n).  Running all 4 s values in one
+  invocation costs the same as running 1.  Building s=32 alone
+  costs ~1h 24m; adding s=64/128/256 costs ~12 s more.
+
+### Data artifacts
+
+**Vesuvio build outputs (canonical / source of truth):**
+- `~/mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/tag_head_samples/hprcv1_chr6.tag_samples.s{32,64,128,256}`
+- `~/mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/tag_head_samples/build_tag_head_samples.log`
+  (copied to Mac at `mem-projection/pangenome-pipeline/classify_output_jr015/build_tag_head_samples_v2.log`)
+
+**Yeast smoke-test outputs (Mac):**
+- `xy-test/tag_samples/yeast.tag_samples.s{32,64,128,256}` (v2 files,
+  all pass verification 1000/1000 + 100/100)
+- `xy-test/tag_samples/yeast.ri` (rebuilt with post-JR-014 format)
+
+### Commits (this repo, branch tag-head-samples)
+
+- `cedea60` build_tag_head_samples: sampled SA table over tag-run heads
+  (initial v1 with BWT-order deletion; superseded)
+- `29c28f1` run_hprc_chr6.sh: drop unnecessary .ri rebuild step
+- `e5babd0` build_tag_head_samples: text-order deletion (v2) + verification
+  (fixes SA bit-width truncation; adds spot-check passes; changes
+  deletion rule to text-order per Cobas/Gagie/Navarro 2021)
+- `890d413` run_hprc_chr6.sh: delete stale v1 outputs before rerun
+- (this entry, pending as of writing)
 
 ---
