@@ -20,6 +20,14 @@ mkdir -p "$OUT"
 RI="$DATA/hprcv1_chr6.ri"
 LTAGS="$DATA/hprcv1_chr6.ltags"
 
+# Delete stale v1 (BWT-order) output files so they don't confuse anyone.
+# v2 files are the same name; overwrite is fine but explicit cleanup makes
+# it obvious in the log that we're starting fresh.
+if ls "$OUT"/hprcv1_chr6.tag_samples.s* >/dev/null 2>&1; then
+    echo "Removing stale output files (probably v1 BWT-order-rule)..."
+    rm -v "$OUT"/hprcv1_chr6.tag_samples.s*
+fi
+
 # Log output goes both to stdout and to a file for later reference.
 LOG="$OUT/build_tag_head_samples.log"
 echo "Running build_tag_head_samples..." | tee "$LOG"
