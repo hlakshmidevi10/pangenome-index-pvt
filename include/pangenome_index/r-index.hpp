@@ -812,6 +812,9 @@ namespace panindexer {
             }
         }
 
+        // LF_scan is defined below (after struct block_scan_result).  See
+        // that definition for the fused-LF rationale and cost model.
+
         // This function returns pairs (i, SA[i]) for the end of sequences
         std::vector <std::pair<uint64_t, uint64_t>> OCC() {
             std::vector <std::pair<uint64_t, uint64_t>> occ;
@@ -969,6 +972,27 @@ namespace panindexer {
         // See DESIGN_FLIPPED_MEM.md section 5 for how this feeds the
         // rewritten backward_extend_encoded_with_sa (sub-step 7).
         void scan_at(size_t pos, block_scan_result& out) const;
+
+        // Fused LF: computes LF(pos) via a single scan_at() call, which also
+        // populates the block-scan metadata (BWT char at pos, run_id and
+        // run_start_bwt of the containing run, per-symbol cumulative ranks).
+        //
+        // The naive LF() above does two independent block walks -- one for
+        // bwt_char_at_encoded and one for rankAt_encoded -- each of which
+        // does a predecessor + block-scan. LF_scan collapses these into one
+        // predecessor + one block-scan, cutting per-op cost roughly in half.
+        //
+        // Callers that also need to check "is pos a BWT-run head" (as in the
+        // sr-index-style tag-head SA recovery query) get that check for free:
+        //   scan_at populates out.run_start_bwt; the check becomes
+        //   out.run_start_bwt == pos with no additional scan.
+        //
+        // Header-inline for zero-call-overhead in tight query loops.
+        inline size_t LF_scan(size_t pos, block_scan_result& out) const {
+            this->scan_at(pos, out);
+            const size_t c_idx = static_cast<size_t>(this->sym_map[out.bwt_char_at_pos]);
+            return this->C[c_idx] + out.ranks[c_idx];
+        }
 
         // Public thin re-exposure of rank_at_cached_encoded for the
         // scan_at correctness test.  The private declaration below is
