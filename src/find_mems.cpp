@@ -1,6 +1,8 @@
 #include "pangenome_index/algorithm.hpp"
 #include "pangenome_index/tag_arrays.hpp"
 #include "pangenome_index/light_tag_index.hpp"
+#include "pangenome_index/tag_head_samples.hpp"
+#include "pangenome_index/tag_head_samples_query.hpp"
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -95,6 +97,12 @@ struct MEMProfilingStats {
     size_t first_locate_calls = 0;     // Number of locate_sa_value calls (1 per MEM)
     size_t locate_next_calls = 0;      // Number of locateNext calls
     size_t entries_written = 0;
+    // Tag-head samples emit path (--tag-head-samples). Zero elsewhere.
+    // Reported both per-MEM and aggregated so we can see fast/slow-path
+    // distribution and average LF walk length on the slow path.
+    size_t samples_fast_hits = 0;      // rids resolved by kept-tag-head lookup (0 LF steps)
+    size_t samples_slow_hits = 0;      // rids resolved by LF-walk (1..s LF steps)
+    size_t samples_lf_steps = 0;       // total LF steps taken across slow-path resolutions
 };
 
 // Global profiling structure
@@ -130,6 +138,12 @@ struct ProfilingData {
     size_t total_first_locate_calls = 0;    // Total number of locate_sa_value calls
     size_t total_locate_next_calls = 0;     // Total number of locateNext calls
     size_t total_entries_written = 0;
+
+    // Tag-head samples aggregated counters (only populated when
+    // --tag-head-samples is active; zero otherwise).
+    size_t total_samples_fast_hits = 0;
+    size_t total_samples_slow_hits = 0;
+    size_t total_samples_lf_steps = 0;
     
     // Sorting
     double total_sort_time = 0.0;
@@ -1081,6 +1095,117 @@ void dump_mem_info_lightweight_flipped(const MEM_with_sa& mem_sa, const int read
                                    debug_stats);
 }
 
+// Flipped + tag-head-samples emit path. Same output contract as
+// dump_mem_info_lightweight_flipped, but replaces the locateNext-forward
+// walk with per-rid samples lookup:
+//
+//   * first_rid emit uses mem_sa.sa_sp directly (the flipped SA-carry gives
+//     us SA[mem.bwt_start] for free -- and mem.bwt_start is by construction
+//     inside first_rid AND inside the MEM interval, so it's a valid
+//     representative of that tag run).
+//   * For each rid in [first_rid + 1, last_rid], seed the SA at that rid's
+//     tag-run-head BWT position via seed_sa_via_samples() (fast-path lookup
+//     or bounded LF-walk of up to sample_period() steps).
+//
+// This eliminates all locateNext calls in the emit loop, at the cost of
+// per-rid samples lookup work. Correctness relies on: each interior /
+// last rid is fully contained inside the MEM interval, so its head is a
+// valid representative (in the MEM x rid intersection).
+//
+// Instrumentation: mem_stats.samples_{fast_hits, slow_hits, lf_steps} are
+// populated; locate_next_calls stays zero.
+void dump_mem_info_lightweight_flipped_samples(const MEM_with_sa& mem_sa, const int read_id,
+                                               const LightTagIndex& ltag, FastLocate& r_index,
+                                               const TagHeadSamples& samples,
+                                               vector<size_t>& seq_id_counter,
+                                               std::vector<PackedEntry>& entries,
+                                               MEMProfilingStats& mem_stats,
+                                               bool debug_stats = false) {
+    const size_t bwt_start  = mem_sa.bwt_start;
+    const size_t bwt_end    = mem_sa.bwt_start + mem_sa.size - 1;
+    const size_t mem_length = mem_sa.end - mem_sa.start;
+
+#if TIME
+    auto tag_query_start = chrono::high_resolution_clock::now();
+#endif
+
+    // Map [bwt_start, bwt_end] -> run id range via rank on bwt_intervals.
+    const size_t first_rid = ltag.run_id_at(bwt_start);
+    const size_t last_rid  = ltag.run_id_at(bwt_end);
+    const size_t n_runs    = last_rid - first_rid + 1;
+    mem_stats.tag_runs = n_runs;
+
+#if TIME
+    auto tag_query_end = chrono::high_resolution_clock::now();
+    std::chrono::duration<double> tag_query_duration = tag_query_end - tag_query_start;
+    mem_stats.tag_query_time = tag_query_duration.count();
+#endif
+
+    if (n_runs == 0) return;
+
+    // Emit helper: given an SA value, push one PackedEntry with the derived
+    // seq_id / path_bp. Shared by both the first-rid and interior-rid branches
+    // so the packing / stats logic stays in one place.
+    size_t total_entries_in_mem = 0;
+    std::unordered_map<size_type, size_t> seq_id_count;
+    auto emit_from_sa = [&](size_type sa_value) {
+        const size_type seq_id  = r_index.seqId(sa_value);
+        const size_type path_bp = r_index.seqOffset(sa_value);
+        seq_id_counter[seq_id]++;
+        mem_stats.entries_written++;
+        ++total_entries_in_mem;
+        if (debug_stats) seq_id_count[seq_id]++;
+        entries.push_back(PackedEntry{
+            static_cast<uint32_t>(seq_id),
+            static_cast<uint32_t>(path_bp),
+            static_cast<uint32_t>(mem_length),
+            static_cast<uint32_t>(mem_sa.start),
+            static_cast<uint32_t>(read_id)
+        });
+    };
+
+    // first_rid: use the flipped-provided SA[mem.bwt_start] directly.
+    emit_from_sa(mem_sa.sa_sp);
+
+    // Interior + last rids: seed each from samples. Each such rid has its
+    // head at run_start_bwt(rid) >= bwt_start + 1 (strictly after the
+    // first run's span), which is inside [bwt_start, bwt_end] -- and thus
+    // a valid representative for the (rid x MEM) intersection.
+    for (size_t rid = first_rid + 1; rid <= last_rid; ++rid) {
+        SamplesResolution res = seed_sa_via_samples(r_index, ltag, samples, rid);
+        if (res.hit_fast_path) {
+            mem_stats.samples_fast_hits++;
+        } else {
+            mem_stats.samples_slow_hits++;
+            mem_stats.samples_lf_steps += res.lf_steps;
+        }
+        emit_from_sa(res.sa_value);
+    }
+
+    mem_stats.locate_time = mem_stats.first_locate_time + mem_stats.locate_next_time;
+    mem_stats.locate_operations = mem_stats.first_locate_calls + mem_stats.locate_next_calls;
+
+    if (debug_stats) {
+        std::cerr << "=== MEM STATISTICS (Lightweight + Tag-Head Samples) ===" << std::endl;
+        std::cerr << "Read ID: " << read_id << std::endl;
+        std::cerr << "MEM: start=" << mem_sa.start << ", end=" << mem_sa.end
+                  << ", size(no. of matches)=" << mem_sa.size
+                  << ", length(len of mem)=" << mem_length << std::endl;
+        std::cerr << "BWT interval: [" << bwt_start << ", " << bwt_end
+                  << "], size=" << mem_sa.size << std::endl;
+        std::cerr << "Tag runs intersecting interval: " << n_runs << std::endl;
+        std::cerr << "Entries emitted (no dedup): " << total_entries_in_mem << std::endl;
+        std::cerr << "Samples fast/slow: " << mem_stats.samples_fast_hits
+                  << " / " << mem_stats.samples_slow_hits
+                  << " (LF steps: " << mem_stats.samples_lf_steps << ")" << std::endl;
+        std::cerr << "Distinct seq_ids in MEM: " << seq_id_count.size() << std::endl;
+        size_t dup_seq = 0;
+        for (const auto& p : seq_id_count) if (p.second > 1) ++dup_seq;
+        std::cerr << "Seq_ids appearing in >1 entry: " << dup_seq << std::endl;
+        std::cerr << "=================================" << std::endl;
+    }
+}
+
 // Helper function to dump MEM information (All-Positions Algorithm).
 // Verification / POC path: bypasses the tag array entirely and emits ONE
 // PackedEntry per BWT position in [bwt_start, bwt_end] using only the
@@ -1250,7 +1375,7 @@ void write_sorted_entries(std::vector<PackedEntry>& entries, const std::string& 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags|--all-positions] [--use-flipped-mems] [--debug-classify=<path.tsv>]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <r_index_file> <tag_array_index> <reads_file> <mem_length> <min_occ> [output_prefix] [--tsv] [--debug-stats] [--verbose] [--lightweight-tags|--all-positions] [--use-flipped-mems] [--debug-classify=<path.tsv>] [--tag-head-samples=<path>]" << std::endl;
         std::cerr << "  --lightweight-tags: treat <tag_array_index> as a .ltags file (LightTagIndex)" << std::endl;
         std::cerr << "                      instead of a full compact tags file. Emits one entry per" << std::endl;
         std::cerr << "                      tag run intersecting each MEM, with no graph-position dedup." << std::endl;
@@ -1273,6 +1398,12 @@ int main(int argc, char **argv) {
         std::cerr << "                      starts, and estimating current-vs-optimized locateNext" << std::endl;
         std::cerr << "                      walking cost. Does not alter any output; adds per-MEM" << std::endl;
         std::cerr << "                      overhead so DO NOT use for wall-time measurement." << std::endl;
+        std::cerr << "  --tag-head-samples=<path>: enable sr-index-style sampled SA over tag-run heads" << std::endl;
+        std::cerr << "                      (see RESEARCH_JOURNAL.md JR-016/JR-017). Loads a" << std::endl;
+        std::cerr << "                      .tag_samples.s<N> file built by build_tag_head_samples." << std::endl;
+        std::cerr << "                      Interior tag-run emits are resolved via samples lookup +" << std::endl;
+        std::cerr << "                      bounded LF-walk instead of the locateNext walk." << std::endl;
+        std::cerr << "                      Requires --lightweight-tags AND --use-flipped-mems." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -1283,6 +1414,7 @@ int main(int argc, char **argv) {
     size_t min_occ = std::stoi(argv[5]);
     string output_file_name;
     string classify_tsv_path;
+    string tag_head_samples_path;
     bool debug_stats = false;
     bool verbose = false;
     bool emit_tsv = false;
@@ -1306,6 +1438,8 @@ int main(int argc, char **argv) {
             use_flipped_mems = true;
         } else if (arg.rfind("--debug-classify=", 0) == 0) {
             classify_tsv_path = arg.substr(std::string("--debug-classify=").size());
+        } else if (arg.rfind("--tag-head-samples=", 0) == 0) {
+            tag_head_samples_path = arg.substr(std::string("--tag-head-samples=").size());
         } else if (output_file_name.empty()) {
             output_file_name = arg;
         }
@@ -1331,6 +1465,14 @@ int main(int argc, char **argv) {
         std::cerr << "ERROR: --use-flipped-mems and --all-positions are mutually exclusive" << std::endl;
         return EXIT_FAILURE;
     }
+    // Tag-head samples require the flipped-lightweight combo (the samples path
+    // only substitutes into dump_mem_info_lightweight_flipped's emit loop; the
+    // legacy locate-first path and full-tag / all-positions paths are not wired).
+    if (!tag_head_samples_path.empty() && !(use_flipped_mems && lightweight_tags)) {
+        std::cerr << "ERROR: --tag-head-samples requires --use-flipped-mems AND --lightweight-tags "
+                     "(only the flipped-lightweight emit path is wired to consume samples)" << std::endl;
+        return EXIT_FAILURE;
+    }
 
     // Print run parameters for logging
     std::cerr << "========================================" << std::endl;
@@ -1353,6 +1495,9 @@ int main(int argc, char **argv) {
                                    : "legacy 3-phase") << std::endl;
     std::cerr << "Debug classify:    "
               << (classify_tsv_path.empty() ? "disabled" : classify_tsv_path)
+              << std::endl;
+    std::cerr << "Tag-head samples:  "
+              << (tag_head_samples_path.empty() ? "disabled" : tag_head_samples_path)
               << std::endl;
     std::cerr << "========================================" << std::endl;
 
@@ -1445,6 +1590,50 @@ int main(int argc, char **argv) {
     std::cerr << "Tag index memory usage: " << profiling.tag_index_load_memory_mb << " MB" << std::endl;
 #endif
 
+    // Optionally load the sr-index-style sampled SA over tag-run heads. Only
+    // wired for the flipped-lightweight emit path (validated above). Held via
+    // unique_ptr so the emit code can accept a nullable pointer without
+    // having to construct an empty TagHeadSamples (which is move-only and
+    // has no meaningful "empty" state beyond default-constructed).
+    std::unique_ptr<TagHeadSamples> tag_head_samples;
+    if (!tag_head_samples_path.empty()) {
+        cerr << "Reading the tag-head samples file (.tag_samples.s<N>)" << endl;
+        std::ifstream ths_in(tag_head_samples_path, std::ios::binary);
+        if (!ths_in) {
+            std::cerr << "Cannot open the tag-head samples file " << tag_head_samples_path << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        tag_head_samples = std::make_unique<TagHeadSamples>();
+        try {
+            tag_head_samples->load(ths_in);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load tag-head samples file " << tag_head_samples_path
+                      << ": " << e.what() << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        // Cross-check against the LightTagIndex we just loaded (only
+        // lightweight_tags is supported here per validation).
+        if (tag_head_samples->num_tag_runs() != light_tag_index.num_runs()) {
+            std::cerr << "ERROR: tag-head samples num_tag_runs ("
+                      << tag_head_samples->num_tag_runs()
+                      << ") != .ltags num_runs (" << light_tag_index.num_runs()
+                      << "). File was built against a different tag index." << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        if (tag_head_samples->bwt_size() != r_index.bwt_size()
+            && tag_head_samples->bwt_size() != r_index.bwt_size() + 1) {
+            std::cerr << "ERROR: tag-head samples bwt_size ("
+                      << tag_head_samples->bwt_size()
+                      << ") does not match r-index bwt_size (" << r_index.bwt_size()
+                      << "). File was built against a different r-index." << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        std::cerr << "  s (sample period):    " << tag_head_samples->sample_period() << std::endl;
+        std::cerr << "  kept tag heads:       " << tag_head_samples->kept_count()
+                  << " / " << tag_head_samples->num_tag_runs() << std::endl;
+        std::cerr << "  in-memory footprint:  " << tag_head_samples->memory_bytes() << " bytes" << std::endl;
+    }
+
     // Open reads file
     std::ifstream reads(reads_file);
     if (!reads) {
@@ -1527,6 +1716,9 @@ int main(int argc, char **argv) {
             profiling.total_file_write_time += mem_stats.file_write_time;
             profiling.total_tag_runs += mem_stats.tag_runs;
             profiling.total_entries_written += mem_stats.entries_written;
+            profiling.total_samples_fast_hits += mem_stats.samples_fast_hits;
+            profiling.total_samples_slow_hits += mem_stats.samples_slow_hits;
+            profiling.total_samples_lf_steps += mem_stats.samples_lf_steps;
             if (mem_stats.tag_runs > 0) {
                 double n_over_r = (double)mem_size / mem_stats.tag_runs;
                 profiling.total_n_over_r_ratio += n_over_r;
@@ -1545,9 +1737,17 @@ int main(int argc, char **argv) {
                 }
 #endif
                 MEMProfilingStats mem_stats;
-                dump_mem_info_lightweight_flipped(mem_sa, i, light_tag_index, r_index,
-                                                  seq_id_counter, entries, mem_stats,
-                                                  debug_stats);
+                if (tag_head_samples) {
+                    // Samples-based emit: replaces the locateNext walk with
+                    // per-rid fast-path lookup / bounded LF-walk.
+                    dump_mem_info_lightweight_flipped_samples(
+                        mem_sa, i, light_tag_index, r_index, *tag_head_samples,
+                        seq_id_counter, entries, mem_stats, debug_stats);
+                } else {
+                    dump_mem_info_lightweight_flipped(mem_sa, i, light_tag_index, r_index,
+                                                      seq_id_counter, entries, mem_stats,
+                                                      debug_stats);
+                }
                 if (classify_tsv.is_open()) {
                     MEMRunClassification cls =
                         classify_mem_runs(mem_sa.to_legacy(), i, light_tag_index, r_index);
@@ -1692,6 +1892,33 @@ int main(int argc, char **argv) {
     std::cout << "     - Locate next calls: " << format_number(profiling.total_locate_next_calls) << std::endl;
     if (profiling.total_mems_outputted > 0) {
         std::cout << "   Average locate operations per MEM: " << (double)profiling.total_locate_operations / profiling.total_mems_outputted << std::endl;
+    }
+    // Tag-head samples path (only meaningful when --tag-head-samples is on).
+    // Print only when we actually took the path; keeps stdout unchanged for
+    // all other runs.
+    const size_t total_samples_resolutions =
+        profiling.total_samples_fast_hits + profiling.total_samples_slow_hits;
+    if (total_samples_resolutions > 0) {
+        std::cout << "   Tag-head samples resolutions: "
+                  << format_number(total_samples_resolutions) << std::endl;
+        std::cout << "     - Fast-path hits (kept):   "
+                  << format_number(profiling.total_samples_fast_hits)
+                  << " (" << std::fixed << std::setprecision(2)
+                  << 100.0 * profiling.total_samples_fast_hits / total_samples_resolutions
+                  << "%)" << std::endl;
+        std::cout << "     - Slow-path (LF-walked):   "
+                  << format_number(profiling.total_samples_slow_hits)
+                  << " (" << std::fixed << std::setprecision(2)
+                  << 100.0 * profiling.total_samples_slow_hits / total_samples_resolutions
+                  << "%)" << std::endl;
+        std::cout << "     - Total LF steps taken:    "
+                  << format_number(profiling.total_samples_lf_steps) << std::endl;
+        if (profiling.total_samples_slow_hits > 0) {
+            std::cout << "     - Avg LF steps per slow:   "
+                      << std::fixed << std::setprecision(2)
+                      << (double)profiling.total_samples_lf_steps / profiling.total_samples_slow_hits
+                      << std::endl;
+        }
     }
     std::cout << "   Total time for file writes: " << profiling.total_file_write_time << " seconds" << std::endl;
     std::cout << "   Total number of entries written: " << format_number(profiling.total_entries_written) << std::endl;
