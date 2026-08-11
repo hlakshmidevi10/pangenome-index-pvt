@@ -1206,6 +1206,134 @@ void dump_mem_info_lightweight_flipped_samples(const MEM_with_sa& mem_sa, const 
     }
 }
 
+// Legacy + tag-head-samples emit path. Analog of
+// dump_mem_info_lightweight_flipped_samples for the legacy MEM finder,
+// which does NOT provide SA[bwt_start] as a byproduct. Instead:
+//
+//   * first_rid: resolve SA at first_rid's head via seed_sa_via_samples,
+//     then walk locateNext forward (bwt_start - run_start_bwt(first_rid))
+//     times to reach SA[bwt_start]. Emit using that. Walk length is 0
+//     when the MEM starts exactly at the tag-run head, up to the tag-run
+//     length otherwise (mean ~4-5 BWT positions on HPRC; see JR-018).
+//   * Interior + last rids: identical to the flipped+samples path --
+//     seed_sa_via_samples(rid), emit.
+//
+// Instrumentation: samples_{fast_hits, slow_hits, lf_steps} include the
+// first_rid resolution. The locateNext walks for first_rid are counted
+// in mem_stats.locate_next_calls (semantically ARE locateNext work; do
+// not fragment the field). first_locate_calls stays zero -- we never
+// call locate_sa_value in this path.
+void dump_mem_info_lightweight_samples(const MEM& mem, const int read_id,
+                                       const LightTagIndex& ltag, FastLocate& r_index,
+                                       const TagHeadSamples& samples,
+                                       vector<size_t>& seq_id_counter,
+                                       std::vector<PackedEntry>& entries,
+                                       MEMProfilingStats& mem_stats,
+                                       bool debug_stats = false) {
+    const size_t bwt_start  = mem.bwt_start;
+    const size_t bwt_end    = mem.bwt_start + mem.size - 1;
+    const size_t mem_length = mem.end - mem.start;
+
+#if TIME
+    auto tag_query_start = chrono::high_resolution_clock::now();
+#endif
+
+    const size_t first_rid = ltag.run_id_at(bwt_start);
+    const size_t last_rid  = ltag.run_id_at(bwt_end);
+    const size_t n_runs    = last_rid - first_rid + 1;
+    mem_stats.tag_runs = n_runs;
+
+#if TIME
+    auto tag_query_end = chrono::high_resolution_clock::now();
+    std::chrono::duration<double> tag_query_duration = tag_query_end - tag_query_start;
+    mem_stats.tag_query_time = tag_query_duration.count();
+#endif
+
+    if (n_runs == 0) return;
+
+    size_t total_entries_in_mem = 0;
+    std::unordered_map<size_type, size_t> seq_id_count;
+    auto emit_from_sa = [&](size_type sa_value) {
+        const size_type seq_id  = r_index.seqId(sa_value);
+        const size_type path_bp = r_index.seqOffset(sa_value);
+        seq_id_counter[seq_id]++;
+        mem_stats.entries_written++;
+        ++total_entries_in_mem;
+        if (debug_stats) seq_id_count[seq_id]++;
+        entries.push_back(PackedEntry{
+            static_cast<uint32_t>(seq_id),
+            static_cast<uint32_t>(path_bp),
+            static_cast<uint32_t>(mem_length),
+            static_cast<uint32_t>(mem.start),
+            static_cast<uint32_t>(read_id)
+        });
+    };
+
+    // === first_rid: samples resolve at head + locateNext walk to bwt_start ===
+    SamplesResolution head_res = seed_sa_via_samples(r_index, ltag, samples, first_rid);
+    if (head_res.hit_fast_path) {
+        mem_stats.samples_fast_hits++;
+    } else {
+        mem_stats.samples_slow_hits++;
+        mem_stats.samples_lf_steps += head_res.lf_steps;
+    }
+
+    size_type sa_at_bwt_start = head_res.sa_value;
+    const size_t head_bwt = ltag.run_start_bwt(first_rid);
+    // Walk locateNext forward from head_bwt up to bwt_start. Zero iterations
+    // when the MEM starts exactly at the tag-run head (mean tag run length
+    // is small -- ~4 BWT positions on HPRC noisy per JR-018).
+    for (size_t p = head_bwt; p < bwt_start; ++p) {
+#if TIME
+        auto locate_next_start = chrono::high_resolution_clock::now();
+#endif
+        sa_at_bwt_start = r_index.locateNext(sa_at_bwt_start);
+        mem_stats.locate_next_calls++;
+#if TIME
+        auto locate_next_end = chrono::high_resolution_clock::now();
+        std::chrono::duration<double> locate_next_duration = locate_next_end - locate_next_start;
+        mem_stats.locate_next_time += locate_next_duration.count();
+#endif
+    }
+    emit_from_sa(sa_at_bwt_start);
+
+    // === Interior + last rids: pure samples lookup (same as flipped variant) ===
+    for (size_t rid = first_rid + 1; rid <= last_rid; ++rid) {
+        SamplesResolution res = seed_sa_via_samples(r_index, ltag, samples, rid);
+        if (res.hit_fast_path) {
+            mem_stats.samples_fast_hits++;
+        } else {
+            mem_stats.samples_slow_hits++;
+            mem_stats.samples_lf_steps += res.lf_steps;
+        }
+        emit_from_sa(res.sa_value);
+    }
+
+    mem_stats.locate_time = mem_stats.first_locate_time + mem_stats.locate_next_time;
+    mem_stats.locate_operations = mem_stats.first_locate_calls + mem_stats.locate_next_calls;
+
+    if (debug_stats) {
+        std::cerr << "=== MEM STATISTICS (Legacy + Tag-Head Samples) ===" << std::endl;
+        std::cerr << "Read ID: " << read_id << std::endl;
+        std::cerr << "MEM: start=" << mem.start << ", end=" << mem.end
+                  << ", size(no. of matches)=" << mem.size
+                  << ", length(len of mem)=" << mem_length << std::endl;
+        std::cerr << "BWT interval: [" << bwt_start << ", " << bwt_end
+                  << "], size=" << mem.size << std::endl;
+        std::cerr << "Tag runs intersecting interval: " << n_runs << std::endl;
+        std::cerr << "Entries emitted (no dedup): " << total_entries_in_mem << std::endl;
+        std::cerr << "First-rid walk locateNext calls: " << mem_stats.locate_next_calls << std::endl;
+        std::cerr << "Samples fast/slow: " << mem_stats.samples_fast_hits
+                  << " / " << mem_stats.samples_slow_hits
+                  << " (LF steps: " << mem_stats.samples_lf_steps << ")" << std::endl;
+        std::cerr << "Distinct seq_ids in MEM: " << seq_id_count.size() << std::endl;
+        size_t dup_seq = 0;
+        for (const auto& p : seq_id_count) if (p.second > 1) ++dup_seq;
+        std::cerr << "Seq_ids appearing in >1 entry: " << dup_seq << std::endl;
+        std::cerr << "=================================" << std::endl;
+    }
+}
+
 // Helper function to dump MEM information (All-Positions Algorithm).
 // Verification / POC path: bypasses the tag array entirely and emits ONE
 // PackedEntry per BWT position in [bwt_start, bwt_end] using only the
@@ -1399,11 +1527,14 @@ int main(int argc, char **argv) {
         std::cerr << "                      walking cost. Does not alter any output; adds per-MEM" << std::endl;
         std::cerr << "                      overhead so DO NOT use for wall-time measurement." << std::endl;
         std::cerr << "  --tag-head-samples=<path>: enable sr-index-style sampled SA over tag-run heads" << std::endl;
-        std::cerr << "                      (see RESEARCH_JOURNAL.md JR-016/JR-017). Loads a" << std::endl;
+        std::cerr << "                      (see RESEARCH_JOURNAL.md JR-016/JR-017/JR-018). Loads a" << std::endl;
         std::cerr << "                      .tag_samples.s<N> file built by build_tag_head_samples." << std::endl;
         std::cerr << "                      Interior tag-run emits are resolved via samples lookup +" << std::endl;
         std::cerr << "                      bounded LF-walk instead of the locateNext walk." << std::endl;
-        std::cerr << "                      Requires --lightweight-tags AND --use-flipped-mems." << std::endl;
+        std::cerr << "                      Requires --lightweight-tags. Optional --use-flipped-mems:" << std::endl;
+        std::cerr << "                        with:    first_rid SA comes free from flipped's sa_sp." << std::endl;
+        std::cerr << "                        without: first_rid SA computed via samples-at-head +" << std::endl;
+        std::cerr << "                                 locateNext walk to bwt_start (legacy path)." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -1465,12 +1596,16 @@ int main(int argc, char **argv) {
         std::cerr << "ERROR: --use-flipped-mems and --all-positions are mutually exclusive" << std::endl;
         return EXIT_FAILURE;
     }
-    // Tag-head samples require the flipped-lightweight combo (the samples path
-    // only substitutes into dump_mem_info_lightweight_flipped's emit loop; the
-    // legacy locate-first path and full-tag / all-positions paths are not wired).
-    if (!tag_head_samples_path.empty() && !(use_flipped_mems && lightweight_tags)) {
-        std::cerr << "ERROR: --tag-head-samples requires --use-flipped-mems AND --lightweight-tags "
-                     "(only the flipped-lightweight emit path is wired to consume samples)" << std::endl;
+    // Tag-head samples require --lightweight-tags (the samples path is wired
+    // into both the legacy and flipped lightweight emit paths; full-tag and
+    // all-positions paths are not wired). --use-flipped-mems is optional:
+    //   * with --use-flipped-mems: samples emit uses mem_sa.sa_sp for first_rid.
+    //   * without:                 samples emit walks locateNext from first_rid's
+    //                              head to bwt_start (legacy MEM finder has no
+    //                              SA-carry to lean on).
+    if (!tag_head_samples_path.empty() && !lightweight_tags) {
+        std::cerr << "ERROR: --tag-head-samples requires --lightweight-tags "
+                     "(only the lightweight emit paths are wired to consume samples)" << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -1775,6 +1910,14 @@ int main(int argc, char **argv) {
                     dump_mem_info_all_positions(mem, i, r_index,
                                                 seq_id_counter, entries, mem_stats,
                                                 debug_stats);
+                } else if (lightweight_tags && tag_head_samples) {
+                    // Legacy + samples: first_rid via samples-at-head + short
+                    // locateNext walk to bwt_start; interior/last rids via
+                    // samples lookup only. No locate_sa_value seed cost.
+                    dump_mem_info_lightweight_samples(mem, i, light_tag_index,
+                                                      r_index, *tag_head_samples,
+                                                      seq_id_counter, entries,
+                                                      mem_stats, debug_stats);
                 } else if (lightweight_tags) {
                     dump_mem_info_lightweight(mem, i, light_tag_index, r_index,
                                               seq_id_counter, entries, mem_stats,
