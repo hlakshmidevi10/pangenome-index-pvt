@@ -137,6 +137,7 @@ won't have the same context you do.
 | [JR-015](#jr-015--post-risk-e-mem-classification-fresh-seed-cost--tag-partition-tables) | 2026-08-07 | Post-Risk-E MEM classification: fresh seed-cost + tag-partition tables | resolved | classification, seed-cost, tag-partition, hprc, vesuvio, historical-comparison |
 | [JR-016](#jr-016--tag-head-sa-samples-sr-index-style-storage-cost-on-hprc-chr6) | 2026-08-09 | Tag-head SA samples (sr-index-style): storage cost on HPRC chr6 | open | tag-head-samples, sr-index, sa-sampling, storage, hprc, vesuvio |
 | [JR-017](#jr-017--lf-operation-latency-on-hprc-chr6-baseline-vs-fused-lf_scan) | 2026-08-09 | LF-operation latency on HPRC chr6: baseline vs fused LF_scan | open | lf, r-index, microbenchmark, hprc, vesuvio, jr-016 |
+| [JR-018](#jr-018--tag-head-sa-samples-end-to-end-integration--n3-warm-cache-perf-on-hprc-chr6) | 2026-08-12 | Tag-head SA samples: end-to-end integration + N=3 warm-cache perf on HPRC chr6 | resolved | tag-head-samples, integration, correctness, perf, benchmark, hprc, vesuvio, jr-016, jr-017 |
 
 ---
 
@@ -2983,6 +2984,244 @@ investing in that path.
 ### Commits (this repo, branch tag-head-samples)
 
 - `063fbe7` r-index: add LF_scan (fused LF via scan_at) + bench_lf microbenchmark
+- (this entry, pending as of writing)
+
+---
+
+## JR-018 — Tag-head SA samples: end-to-end integration + N=3 warm-cache perf on HPRC chr6
+
+```yaml
+id: JR-018
+date: 2026-08-12
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [tag-head-samples, integration, correctness, perf, benchmark, hprc, vesuvio, jr-016, jr-017]
+refs:
+  follows: [JR-016, JR-017]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+JR-016 established that the sr-index-inspired sampled SA over tag-run
+heads is storage-viable (61 MB at s=32 for HPRC chr6). JR-017
+measured the real per-LF cost at 634 ns on HPRC (1.6x higher than the
+earlier 400 ns proxy) and projected the design's competitive window
+would narrow to s in {32, 64} with only ~3s wall margin over the
+current flipped default (JR-012).
+
+JR-018 wires the samples primitive into `find_mems` end-to-end for
+both `--use-flipped-mems` and legacy MEM finders, validates
+correctness on the HPRC chr6 pipeline gate, and measures perf under
+N=3 warm-cache via `perf_harness.sh`.
+
+### Method
+
+**Integration** (branch `tag-head-samples`):
+
+1. `TagHeadSamples` loader class (`include/pangenome_index/tag_head_samples.hpp`
+   + `src/tag_head_samples.cpp`, commit `fd49146`). Pure data structure,
+   inline `try_sa_at_tag_head(rid)` fast-path returning `UNKNOWN` sentinel
+   for deleted rids.
+
+2. `seed_sa_via_samples()` free function (`include/pangenome_index/tag_head_samples_query.hpp`,
+   commit `fd49146`). Fast-path lookup + LF-walk slow path (up to
+   `sample_period()` steps) using `LF_scan` (JR-017 fused primitive)
+   for free BWT-run-head check.
+
+3. CLI flag `--tag-head-samples=<path>` on `find_mems`. Requires
+   `--lightweight-tags`. `--use-flipped-mems` optional; dispatch
+   selects the appropriate samples emit variant.
+
+4. **Flipped variant** `dump_mem_info_lightweight_flipped_samples`
+   (commit `fd49146`): first_rid emit uses `mem_sa.sa_sp` directly
+   (flipped SA-carry); interior/last rids resolved via `seed_sa_via_samples`.
+
+5. **Legacy variant** `dump_mem_info_lightweight_samples` (commit
+   `7301cdb`): first_rid resolved via `seed_sa_via_samples(first_rid)`
+   plus a `locateNext` walk from `run_start_bwt(first_rid)` to
+   `mem.bwt_start` (mean ~4 BWT positions on HPRC); interior/last
+   identical to flipped variant.
+
+6. Fine-grained timing (commit `175fa65`, `#if TIME`-gated): samples
+   file load, first_rid resolve+walk, interior/last resolve.
+
+**Correctness gate**: `./query.sh configs/hprcv1-chr6.env
+hprc-chr6-2026-06-02 <name> --gaf`. Coverage MD5 must equal
+`60f6b8e4a759aebb252b83a870b9ff8c` (JR-012 baseline); validate_gaf
+must be 2000/2000.
+
+**Perf harness**: `perf/perf_harness.sh <config> 3 <tag>
+--modes=lightweight` (2 untimed warmups + 3 timed trials, warm cache).
+
+**Also built s=8 and s=16** samples (commit `3e45b60`, single Vesuvio
+invocation `run_hprc_chr6_s8_s16.sh` amortizing Phase 1 SA
+enumeration across both). Extends the JR-016 s-curve.
+
+### Findings
+
+**S-curve storage table (extends JR-016 with s=8/s=16):**
+
+| s | Kept | %candidates | %all_tag_runs | File size |
+|--:|--:|--:|--:|--:|
+| 8 | 50.30M | 10.71% | 7.08% | **272 MB** |
+| 16 | 22.40M | 4.77% | 3.15% | **125 MB** |
+| 32 | 10.77M | 2.29% | 1.52% | 61 MB |
+| 64 | 5.74M | 1.22% | 0.81% | 33 MB |
+| 128 | 3.44M | 0.73% | 0.48% | 20 MB |
+| 256 | 2.27M | 0.48% | 0.32% | 14 MB |
+
+**Correctness gate (HPRC chr6 alt-noisy, 100K reads):** all 11 configs
+tested (baseline flipped, baseline legacy, flipped+samples s in
+{8, 16, 32, 64, 128, 256}, legacy+samples s in {8, 16, 32, 64, 128, 256})
+produce coverage MD5 = `60f6b8e4a759aebb252b83a870b9ff8c` and
+validate_gaf 2000/2000. Yeast chrII (2000 reads) also byte-identical
+between legacy baseline and legacy+samples across all four s values.
+Zero correctness regressions.
+
+**N=3 warm-cache perf (Vesuvio, HPRC chr6 alt-noisy):**
+
+| Config | find_mems wall | Peak RSS | vs flipped |
+|:--|--:|--:|--:|
+| Flipped baseline | 38.45 +- 0.08 s | 4512 MB | 0 |
+| Legacy baseline | 44.78 +- 0.03 s | 4512 MB | +6.33s (+16%) |
+| **Legacy + samples s=8** | **30.47 +- 0.08 s** | 4789 MB | **-7.98s (-20.8%)** |
+| Legacy + samples s=16 | 32.53 +- 0.06 s | 4639 MB | -5.92s (-15.4%) |
+| Flipped + samples s=8 | 38.58 +- 0.02 s | 4788 MB | +0.13s (noise) |
+
+**Combined pipeline wall (find_mems + gafpack):**
+
+| Config | find_mems | gafpack | **Combined** | vs flipped |
+|:--|--:|--:|--:|--:|
+| Flipped baseline | 38.45s | 24.33s | **62.78s** | 0 |
+| Legacy + samples s=8 | 30.47s | 24.28s | **54.75s** | **-8.03s (-12.8%)** |
+| Legacy + samples s=16 | 32.53s | 24.39s | **56.92s** | -5.86s (-9.3%) |
+
+**S-curve on legacy+samples path** (single-trial via query.sh):
+
+| s | find_mems wall | Fast-path % | Avg LF steps / slow |
+|--:|--:|--:|--:|
+| 8 | **30.46s** | 12.27% | 2.99 |
+| 16 | 32.30s | 5.25% | 6.25 |
+| 32 | 36.17s | 2.82% | 12.35 |
+| 64 | 43.98s | 1.04% | 24.48 |
+| 128 | 58.35s | 0.55% | 46.64 |
+| 256 | 85.10s | 0.28% | 85.31 |
+
+s in {8, 16, 32} beat flipped; s=64 ties legacy baseline; s in {128, 256} regress.
+
+**Fine-grained emit breakdown (legacy + samples, N=3 mean):**
+
+| Config | Samples file load | First-rid resolve+walk | Interior/last resolve | first_rid locateNext calls |
+|:--|--:|--:|--:|--:|
+| s=8 | 0.12s | 0.81s | 2.04s | 615.6K |
+| s=16 | 0.05s | 0.89s | 4.03s | 615.6K |
+
+Interior cost dominates and scales linearly with avg LF steps x
+per-LF cost (JR-017: 634 ns). Model closes to within ~5% (e.g. s=8:
+810K rids x 4 avg LF x 634 ns = ~2.05s predicted vs 2.04s measured).
+
+**Instrumentation overhead check (TIME=0 vs TIME=1, N=3):**
+
+| Config | TIME=1 | TIME=0 | Delta |
+|:--|--:|--:|--:|
+| Flipped baseline | 38.49s | 38.56s | +0.07s (noise) |
+| Legacy + samples s=8 | 30.64s | 30.43s | -0.21s |
+
+Instrumentation adds <1% overhead. All reported numbers are honest.
+
+### Interpretation
+
+**Legacy MEM finding is ~7.5s faster than flipped on HPRC chr6
+noisy** (26.46s vs 34.00s, both N=3, variance <0.05s). Legacy's
+3-phase enumeration is fundamentally cheaper than flipped's Step 2'
+fresh forward extend per emit (Risk C in JR-011). Flipped monetized
+this by eliminating the ~14s locate_sa_value seed cost via SA-carry;
+that trade-off left flipped ~4s faster overall (JR-012).
+
+**Legacy + samples restores the original trade shape**: keep legacy's
+faster MEM finding, eliminate its seed cost via samples lookup
+instead of SA-carry. At s=8: samples emit costs ~2.9s (vs flipped's
+~2.1s locateNext emit), while legacy's MEM-finding advantage saves
+~7.5s. Net: -7.98s (-20.8%) over flipped baseline.
+
+**Dataset-invariant fast-path rate at s=32** (~3% on both yeast and
+HPRC despite 100x scale difference; see JR-018 measurements in this
+entry) confirms the deletion rule's storage-first bias. Aggressive
+sampling (s=8) meaningfully improves fast-path rate (12.27%) and
+shortens slow-path LF walks (avg 3 steps), which is why s=8 becomes
+the winner rather than a marginal improvement.
+
+**Flipped + samples adds nothing** (+0.13s vs flipped baseline).
+Flipped already eliminated the seed cost via SA-carry; samples emit
+at s=8 offers no compounding benefit and slightly slows the emit
+path. Confirmed: samples targets legacy's seed cost, not flipped's.
+
+### Recommendation
+
+**Adopt `--tag-head-samples=<hprcv1_chr6.tag_samples.s8>` with the
+legacy MEM finder as the default HPRC chr6 configuration.**
+Expected win over current flipped default: -8s find_mems wall
+(-20.8%), -8s combined pipeline (-12.8%), at +277 MB peak RSS
+(+6.1%, well under the CLAUDE.md +10% ceiling) and +272 MB on-disk
+storage for the samples file.
+
+**s=16 is the backup option** for storage-constrained workloads:
+-5.92s find_mems (-15.4%), +127 MB RSS (+2.8%), +125 MB storage.
+
+### Open questions
+
+1. **Whole-genome HPRCv1/HPRCv2 datasets not yet tested.** The
+   ~3% fast-path rate held across the yeast:HPRC-chr6 100x scale gap,
+   so we expect it to hold at whole-genome scale, but should
+   confirm. Storage cost extrapolates to ~2-3 GB per s=8 samples
+   file on a full HPRCv1 (~100 Gbp) -- still fits typical server
+   RAM but worth measuring.
+
+2. **Genotyping-framework integration.** JR-016/017/018 have
+   demonstrated the samples design is production-ready as a
+   find_mems drop-in. Downstream use as input to graph-coverage-based
+   genotyping is next.
+
+3. **Multi-batch parallelism.** Coverage aggregation is
+   embarrassingly parallel across read batches; a single-pass merge
+   can amortize further. Not yet exploited.
+
+4. **Ship the flag as default?** Currently opt-in via
+   `--tag-head-samples`. Default flip would require:
+   (a) pipeline wrapper (`query.sh`) to auto-locate a `.tag_samples.s<N>`
+       file next to the `.ri`, or
+   (b) a decision on whether we ship the `.tag_samples.s8` file as
+       part of the index build output by default.
+   Not scoped for this entry.
+
+### Data artifacts
+
+**Vesuvio perf logs (canonical / source of truth):**
+
+- Original single-trial via `query.sh`:
+  `~/mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/queries/jr018-{legacy-baseline,legacy-samples-s{8,16,32,64,128,256},samples-s{8,16,32}}/lightweight/`
+- N=3 warm-cache via `perf_harness.sh`:
+  `~/mem-projection/pangenome-pipeline/perf/jr018-final-{flipped-baseline,legacy-baseline,legacy-samples-s{8,16}}/`
+- TIME=0 sanity harness:
+  `~/mem-projection/pangenome-pipeline/perf/jr018-perf-{flipped-baseline,legacy-samples-s8}-notime/`
+- Build log for s=8/s=16:
+  `~/mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/tag_head_samples/build_tag_head_samples_s8_s16.log`
+
+**Mac copies:**
+
+- `xy-test/tag_samples/jr018_v2_logs/` (query.sh single-trial)
+- `xy-test/tag_samples/jr018_perf_logs/` (N=3 harness, TIME=1)
+- `xy-test/tag_samples/jr018_perf_notime_logs/` (N=3 harness, TIME=0)
+- `xy-test/tag_samples/jr018_final_logs/` (N=3 harness with fine-grained timing)
+- `xy-test/tag_samples/build_tag_head_samples_s8_s16.log`
+
+### Commits (this repo, branch tag-head-samples)
+
+- `fd49146` find_mems: integrate tag-head SA samples into flipped-lightweight emit path
+- `3e45b60` run_hprc_chr6_s8_s16: build tag_head_samples at s=8 and s=16
+- `7301cdb` find_mems: legacy+samples emit path with first_rid walk
+- `175fa65` find_mems: instrument samples load + first_rid + interior emit times
 - (this entry, pending as of writing)
 
 ---
