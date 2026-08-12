@@ -103,6 +103,14 @@ struct MEMProfilingStats {
     size_t samples_fast_hits = 0;      // rids resolved by kept-tag-head lookup (0 LF steps)
     size_t samples_slow_hits = 0;      // rids resolved by LF-walk (1..s LF steps)
     size_t samples_lf_steps = 0;       // total LF steps taken across slow-path resolutions
+
+    // Per-MEM samples-emit timing breakdown (populated only when
+    // --tag-head-samples is active; zero elsewhere). Wraps the
+    // seed_sa_via_samples calls plus, for the legacy variant, the first_rid
+    // locateNext walk to bwt_start (which is ALSO counted in locate_next_time
+    // -- do not sum first_rid_time + locate_next_time, they overlap).
+    double samples_first_rid_time = 0.0;   // full first_rid resolution incl. walk
+    double samples_interior_time  = 0.0;   // sum of seed_sa_via_samples for rid > first_rid
 };
 
 // Global profiling structure
@@ -144,6 +152,10 @@ struct ProfilingData {
     size_t total_samples_fast_hits = 0;
     size_t total_samples_slow_hits = 0;
     size_t total_samples_lf_steps = 0;
+    // Tag-head samples aggregated timings.
+    double tag_head_samples_load_time = 0.0;   // one-off startup load of .tag_samples file
+    double total_samples_first_rid_time = 0.0; // sum over MEMs; legacy path only
+    double total_samples_interior_time = 0.0;  // sum over MEMs; both flipped+samples & legacy+samples
     
     // Sorting
     double total_sort_time = 0.0;
@@ -1172,7 +1184,14 @@ void dump_mem_info_lightweight_flipped_samples(const MEM_with_sa& mem_sa, const 
     // first run's span), which is inside [bwt_start, bwt_end] -- and thus
     // a valid representative for the (rid x MEM) intersection.
     for (size_t rid = first_rid + 1; rid <= last_rid; ++rid) {
+#if TIME
+        auto _samp_t0 = chrono::high_resolution_clock::now();
+#endif
         SamplesResolution res = seed_sa_via_samples(r_index, ltag, samples, rid);
+#if TIME
+        auto _samp_t1 = chrono::high_resolution_clock::now();
+        mem_stats.samples_interior_time += std::chrono::duration<double>(_samp_t1 - _samp_t0).count();
+#endif
         if (res.hit_fast_path) {
             mem_stats.samples_fast_hits++;
         } else {
@@ -1270,6 +1289,9 @@ void dump_mem_info_lightweight_samples(const MEM& mem, const int read_id,
     };
 
     // === first_rid: samples resolve at head + locateNext walk to bwt_start ===
+#if TIME
+    auto _first_t0 = chrono::high_resolution_clock::now();
+#endif
     SamplesResolution head_res = seed_sa_via_samples(r_index, ltag, samples, first_rid);
     if (head_res.hit_fast_path) {
         mem_stats.samples_fast_hits++;
@@ -1295,11 +1317,22 @@ void dump_mem_info_lightweight_samples(const MEM& mem, const int read_id,
         mem_stats.locate_next_time += locate_next_duration.count();
 #endif
     }
+#if TIME
+    auto _first_t1 = chrono::high_resolution_clock::now();
+    mem_stats.samples_first_rid_time += std::chrono::duration<double>(_first_t1 - _first_t0).count();
+#endif
     emit_from_sa(sa_at_bwt_start);
 
     // === Interior + last rids: pure samples lookup (same as flipped variant) ===
     for (size_t rid = first_rid + 1; rid <= last_rid; ++rid) {
+#if TIME
+        auto _samp_t0 = chrono::high_resolution_clock::now();
+#endif
         SamplesResolution res = seed_sa_via_samples(r_index, ltag, samples, rid);
+#if TIME
+        auto _samp_t1 = chrono::high_resolution_clock::now();
+        mem_stats.samples_interior_time += std::chrono::duration<double>(_samp_t1 - _samp_t0).count();
+#endif
         if (res.hit_fast_path) {
             mem_stats.samples_fast_hits++;
         } else {
@@ -1732,6 +1765,9 @@ int main(int argc, char **argv) {
     // has no meaningful "empty" state beyond default-constructed).
     std::unique_ptr<TagHeadSamples> tag_head_samples;
     if (!tag_head_samples_path.empty()) {
+#if TIME
+        auto ths_load_start = chrono::high_resolution_clock::now();
+#endif
         cerr << "Reading the tag-head samples file (.tag_samples.s<N>)" << endl;
         std::ifstream ths_in(tag_head_samples_path, std::ios::binary);
         if (!ths_in) {
@@ -1746,6 +1782,12 @@ int main(int argc, char **argv) {
                       << ": " << e.what() << std::endl;
             std::exit(EXIT_FAILURE);
         }
+#if TIME
+        auto ths_load_end = chrono::high_resolution_clock::now();
+        std::chrono::duration<double> ths_load_duration = ths_load_end - ths_load_start;
+        profiling.tag_head_samples_load_time = ths_load_duration.count();
+        std::cerr << "Loading tag-head samples took " << profiling.tag_head_samples_load_time << " seconds" << std::endl;
+#endif
         // Cross-check against the LightTagIndex we just loaded (only
         // lightweight_tags is supported here per validation).
         if (tag_head_samples->num_tag_runs() != light_tag_index.num_runs()) {
@@ -1854,6 +1896,8 @@ int main(int argc, char **argv) {
             profiling.total_samples_fast_hits += mem_stats.samples_fast_hits;
             profiling.total_samples_slow_hits += mem_stats.samples_slow_hits;
             profiling.total_samples_lf_steps += mem_stats.samples_lf_steps;
+            profiling.total_samples_first_rid_time += mem_stats.samples_first_rid_time;
+            profiling.total_samples_interior_time += mem_stats.samples_interior_time;
             if (mem_stats.tag_runs > 0) {
                 double n_over_r = (double)mem_size / mem_stats.tag_runs;
                 profiling.total_n_over_r_ratio += n_over_r;
@@ -2062,6 +2106,10 @@ int main(int argc, char **argv) {
                       << (double)profiling.total_samples_lf_steps / profiling.total_samples_slow_hits
                       << std::endl;
         }
+        std::cout << "     - First-rid resolve+walk:  "
+                  << profiling.total_samples_first_rid_time << " s" << std::endl;
+        std::cout << "     - Interior/last resolve:   "
+                  << profiling.total_samples_interior_time << " s" << std::endl;
     }
     std::cout << "   Total time for file writes: " << profiling.total_file_write_time << " seconds" << std::endl;
     std::cout << "   Total number of entries written: " << format_number(profiling.total_entries_written) << std::endl;
@@ -2078,11 +2126,15 @@ int main(int argc, char **argv) {
     std::cout << "\n================================================" << std::endl;
     std::cout << "=== TIMING BREAKDOWN ===" << std::endl;
     std::cout << "================================================" << std::endl;
-    double total_time = profiling.rindex_load_time + profiling.tag_index_load_time + 
+    double total_time = profiling.rindex_load_time + profiling.tag_index_load_time +
+                        profiling.tag_head_samples_load_time +
                         profiling.total_reads_processing_time + profiling.total_sort_time;
     std::cout << "Total execution time: " << total_time << " seconds" << std::endl;
     std::cout << "  - R-index loading: " << profiling.rindex_load_time << " s" << std::endl;
     std::cout << "  - Tag index loading: " << profiling.tag_index_load_time << " s" << std::endl;
+    if (profiling.tag_head_samples_load_time > 0.0) {
+        std::cout << "  - Tag-head samples loading: " << profiling.tag_head_samples_load_time << " s" << std::endl;
+    }
     std::cout << "  - Read processing: " << profiling.total_reads_processing_time << " s" << std::endl;
     std::cout << "  - Sorting: " << profiling.total_sort_time << " s" << std::endl;
     
