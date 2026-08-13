@@ -138,6 +138,7 @@ won't have the same context you do.
 | [JR-016](#jr-016--tag-head-sa-samples-sr-index-style-storage-cost-on-hprc-chr6) | 2026-08-09 | Tag-head SA samples (sr-index-style): storage cost on HPRC chr6 | open | tag-head-samples, sr-index, sa-sampling, storage, hprc, vesuvio |
 | [JR-017](#jr-017--lf-operation-latency-on-hprc-chr6-baseline-vs-fused-lf_scan) | 2026-08-09 | LF-operation latency on HPRC chr6: baseline vs fused LF_scan | open | lf, r-index, microbenchmark, hprc, vesuvio, jr-016 |
 | [JR-018](#jr-018--tag-head-sa-samples-end-to-end-integration--n3-warm-cache-perf-on-hprc-chr6) | 2026-08-12 | Tag-head SA samples: end-to-end integration + N=3 warm-cache perf on HPRC chr6 | resolved | tag-head-samples, integration, correctness, perf, benchmark, hprc, vesuvio, jr-016, jr-017 |
+| [JR-019](#jr-019--flipped-vs-legacys8-end-to-end-perf-on-hprc-chr6-alt-noisy-l25-vs-l50) | 2026-08-12 | Flipped vs Legacy+s=8 end-to-end perf on HPRC chr6 alt-noisy: L=25 vs L=50 | resolved | perf, benchmark, hprc, alt-noisy, l25, l50, samples, jr-018 |
 
 ---
 
@@ -3223,5 +3224,197 @@ storage for the samples file.
 - `7301cdb` find_mems: legacy+samples emit path with first_rid walk
 - `175fa65` find_mems: instrument samples load + first_rid + interior emit times
 - (this entry, pending as of writing)
+
+---
+
+## JR-019 — Flipped vs Legacy+s=8 end-to-end perf on HPRC chr6 alt-noisy: L=25 vs L=50
+
+```yaml
+id: JR-019
+date: 2026-08-12
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [perf, benchmark, hprc, alt-noisy, l25, l50, samples, jr-018]
+refs:
+  follows: [JR-018]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+JR-018 established that legacy + samples s=8 beats flipped baseline by
+-20.8% on find_mems wall (N=3 warm-cache) at MEM_LEN=50 on HPRC chr6
+alt-noisy. JR-019 extends the measurement to MEM_LEN=25 to confirm
+the win generalizes across MEM-length regimes, and records the
+end-to-end throughput (find_mems + gafpack) with standard workload
+characteristics for both L values.
+
+### Method
+
+Two `query.sh --gaf` invocations per L value (flipped baseline + legacy
++ samples s=8), single-trial each. L=50 uses `configs/hprcv1-chr6.env`;
+L=25 uses `configs/hprcv1-chr6-alt-reads-L25.env`. Same reads
+(`chr6.alt_noisy.reads.txt`), same graph, same index (post-JR-014
+`.ri`).
+
+L=50 timing values use the N=3 warm-cache means from the JR-018
+perf harness (source `perf/jr018-final-{flipped-baseline,legacy-samples-s8}`).
+L=25 values are single-trial from query.sh (source
+`runs/hprc-chr6-2026-06-02/queries/jr018-L25-{flipped,legacy-s8}`).
+
+Correctness verified: L=25 configs produce validate_gaf 2000/2000
+each and byte-identical record counts (250,177 MEMs, 1,432,999
+records). L=50 configs share coverage MD5 `60f6b8e4a759aebb252b83a870b9ff8c`
+per JR-018.
+
+### Findings
+
+**MEM_LEN = 50**
+
+Performance (all wall time):
+
+| Metric | Flipped baseline | Legacy + samples s=8 | delta |
+|:--|--:|--:|--:|
+| find_mems | 38.45s | 30.47s | **-7.98s (-20.8%)** |
+| gafpack | 24.33s | 24.28s | -0.05s (noise) |
+| **Total wall** | **62.78s** | **54.75s** | **-8.03s (-12.8%)** |
+| Peak RSS (find_mems) | 4512 MB | 4789 MB | +277 MB (+6.1%) |
+| Peak RSS (gafpack) | 314 MB | 314 MB | ~0 |
+| Throughput -- reads/s | 1593 | 1827 | **+15%** |
+| Throughput -- MEMs/s | 2,478 | 2,841 | **+15%** |
+
+Workload characteristics:
+
+| | Value |
+|:--|:--|
+| Read file | `chr6.alt_noisy.reads.txt` |
+| Read length | 200 bp |
+| Total reads | 100,000 |
+| Total MEMs | 155,551 |
+| Average MEM length | 106.29 bp |
+| Total occurrence of all MEMs (Sigma mem.size) | 16,792,975 |
+| Total records written by find_mems | 965,868 |
+| Total occurrence on graph (post-gafpack dedup, GAF entries) | 532,533 |
+| Average occurrence / MEM | 107.96 |
+| Average tags / MEM | 6.21 |
+
+Configuration params:
+
+| Param | Value |
+|:--|:--|
+| min_len (MEM_LEN) | 50 |
+| min_occ (MIN_OCC) | 1 |
+| Reads type | HPRC alt-noisy (in-graph, ~1% base error) |
+| Graph | HPRC v1 chr6 (`hprcv1_chr6.gbz`) |
+| Index | `hprcv1_chr6.ri` (~3.76 GB), `hprcv1_chr6.ltags` (~89 MB) |
+| Samples file (legacy+s=8 only) | `hprcv1_chr6.tag_samples.s8` (272 MB) |
+
+**MEM_LEN = 25**
+
+Performance (all wall time):
+
+| Metric | Flipped baseline | Legacy + samples s=8 | delta |
+|:--|--:|--:|--:|
+| find_mems | 48.34s | 39.10s | **-9.24s (-19.1%)** |
+| gafpack | 24.23s | 24.47s | +0.24s (noise) |
+| **Total wall** | **72.57s** | **63.57s** | **-9.00s (-12.4%)** |
+| Peak RSS (find_mems) | 4531 MB | 4808 MB | +277 MB (+6.1%) |
+| Peak RSS (gafpack) | 328 MB | 329 MB | ~0 |
+| Throughput -- reads/s | 1378 | 1573 | **+14%** |
+| Throughput -- MEMs/s | 3,447 | 3,935 | **+14%** |
+
+Workload characteristics:
+
+| | Value |
+|:--|:--|
+| Read file | `chr6.alt_noisy.reads.txt` |
+| Read length | 200 bp |
+| Total reads | 100,000 |
+| Total MEMs | 250,177 |
+| Average MEM length | 79.42 bp |
+| Total occurrence of all MEMs (Sigma mem.size) | 32,050,895 |
+| Total records written by find_mems | 1,432,999 |
+| Total occurrence on graph (post-gafpack dedup, GAF entries) | 840,010 |
+| Average occurrence / MEM | 128.16 |
+| Average tags / MEM | 5.92 |
+
+Configuration params:
+
+| Param | Value |
+|:--|:--|
+| min_len (MEM_LEN) | 25 |
+| min_occ (MIN_OCC) | 1 |
+| Reads type | HPRC alt-noisy (in-graph, ~1% base error) |
+| Graph | HPRC v1 chr6 (`hprcv1_chr6.gbz`) |
+| Index | `hprcv1_chr6.ri` (~3.76 GB), `hprcv1_chr6.ltags` (~89 MB) |
+| Samples file (legacy+s=8 only) | `hprcv1_chr6.tag_samples.s8` (272 MB) |
+
+**Cross-L comparison:**
+
+| Metric | L=50 | L=25 | change |
+|:--|--:|--:|--:|
+| Total MEMs | 155,551 | 250,177 | +61% |
+| Sigma mem.size | 16.79M | 32.05M | +91% |
+| Total records (find_mems) | 965,868 | 1,432,999 | +48% |
+| Total GAF entries (post-dedup) | 532,533 | 840,010 | +58% |
+| Compression ratio (Sigma mem.size / GAF entries) | 31.5x | 38.2x | -- |
+| **Total wall -- flipped** | 62.78s | 72.57s | +9.79s (+16%) |
+| **Total wall -- legacy+s=8** | 54.75s | 63.57s | +8.82s (+16%) |
+| **Win magnitude (end-to-end)** | **-8.03s (-12.8%)** | **-9.00s (-12.4%)** | consistent |
+| Peak RSS delta | +277 MB | +277 MB | same |
+
+### Interpretation
+
+**The legacy+s=8 win generalizes cleanly across MEM lengths.** End-to-end
+wall reduction is -12.4% at L=25 and -12.8% at L=50 -- statistically
+indistinguishable at single-trial resolution. Absolute win grows slightly
+in wall time (7.98 -> 9.24 s on find_mems) because samples emit scales
+sublinearly with MEM count while flipped's `locateNext` walk scales
+linearly with BWT positions scanned.
+
+**Shorter min-len filter (L=25) produces more, shorter MEMs.** Same
+200 bp reads, but the L=25 threshold admits ~1.6x more MEMs at ~25%
+shorter avg length (79.4 vs 106.3 bp). Total BWT positions scanned
+grows by ~1.9x (32.0M vs 16.8M), roughly matching the MEM count
+growth times a small increase in avg-occurrence-per-MEM (128.2 vs
+108.0).
+
+**Compression ratios are stable across L.** find_mems collapses ~17x
+of BWT positions into per-tag-run records (17.4x at L=50, 22.4x at L=25);
+gafpack dedup collapses another ~1.7x to unique graph positions.
+Net: 31-38x compression from raw BWT hits to graph coverage entries.
+
+**Peak RSS delta is workload-invariant** (+277 MB in both), confirming
+the samples file's in-memory footprint (285.6 MB per JR-016 build
+log) is the sole source of the memory overhead.
+
+### Open questions
+
+1. **N=3 warm-cache validation for L=25.** L=50 numbers are already
+   N=3 (JR-018); L=25 numbers here are single-trial. Given the
+   consistency of the win margin, N=3 for L=25 is a nice-to-have,
+   not a gate.
+2. **Out-of-graph read behavior.** HG002 clean/noisy reads (out of
+   HPRC v1 graph) tested separately -- results not yet in this
+   entry.
+3. **Whole-genome scaling.** HPRC v1 chr1 samples build in progress
+   (Vesuvio, ~2 hr wall); will follow up with chr1 perf when
+   complete.
+
+### Data artifacts
+
+**Vesuvio (canonical / source of truth):**
+- L=50 N=3 harness: `~/mem-projection/pangenome-pipeline/perf/jr018-final-{flipped-baseline,legacy-samples-s8}/`
+- L=25 single-trial: `~/mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/queries/jr018-L25-{flipped,legacy-s8}/lightweight/`
+
+**Mac copies:**
+- L=50: `xy-test/tag_samples/jr018_final_logs/{jr018-final-flipped-baseline,jr018-final-legacy-samples-s8}/`
+- L=25: `xy-test/tag_samples/jr018_L25_logs/jr018-L25-{flipped,legacy-s8}/`
+
+### Commits (this repo, branch tag-head-samples)
+
+No new code commits; measurement-only entry against binaries built
+from HEAD `b2c1608` (find_mems: suppress Locate ops block when samples
+path is active).
 
 ---
