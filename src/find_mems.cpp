@@ -2152,6 +2152,15 @@ int main(int argc, char **argv) {
                   << (profiling.total_first_locate_time / profiling.total_locate_time * 100) << "%)" << std::endl;
         std::cout << "      - Locate next: " << profiling.total_locate_next_time << " s (" 
                   << (profiling.total_locate_next_time / profiling.total_locate_time * 100) << "%)" << std::endl;
+        // Samples emit sub-breakdown (only meaningful when --tag-head-samples is
+        // active). Printed as % of MEM processing so it composes with the
+        // other MEM-processing lines above.
+        if (profiling.total_samples_first_rid_time > 0.0 || profiling.total_samples_interior_time > 0.0) {
+            std::cout << "    - First-rid resolve+walk: " << profiling.total_samples_first_rid_time << " s ("
+                      << (profiling.total_samples_first_rid_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
+            std::cout << "    - Interior/last resolve: " << profiling.total_samples_interior_time << " s ("
+                      << (profiling.total_samples_interior_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
+        }
         std::cout << "    - File writes: " << profiling.total_file_write_time << " s (" 
                   << (profiling.total_file_write_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
         
