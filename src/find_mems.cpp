@@ -2146,16 +2146,21 @@ int main(int argc, char **argv) {
                   << (profiling.total_mem_processing_time / profiling.total_reads_processing_time * 100) << "%)" << std::endl;
         std::cout << "    - Tag queries: " << profiling.total_tag_query_time << " s (" 
                   << (profiling.total_tag_query_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
-        std::cout << "    - Locate operations: " << profiling.total_locate_time << " s (" 
-                  << (profiling.total_locate_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
-        std::cout << "      - First locate: " << profiling.total_first_locate_time << " s (" 
-                  << (profiling.total_first_locate_time / profiling.total_locate_time * 100) << "%)" << std::endl;
-        std::cout << "      - Locate next: " << profiling.total_locate_next_time << " s (" 
-                  << (profiling.total_locate_next_time / profiling.total_locate_time * 100) << "%)" << std::endl;
-        // Samples emit sub-breakdown (only meaningful when --tag-head-samples is
-        // active). Printed as % of MEM processing so it composes with the
-        // other MEM-processing lines above.
-        if (profiling.total_samples_first_rid_time > 0.0 || profiling.total_samples_interior_time > 0.0) {
+        // Samples path: the only locateNext work is the first_rid walk, whose
+        // cost is already fully accounted for in "First-rid resolve+walk"
+        // below. Suppress the Locate operations block to avoid double-
+        // counting when a reader sums the sub-breakdown.
+        const bool samples_active =
+            (profiling.total_samples_first_rid_time > 0.0 ||
+             profiling.total_samples_interior_time > 0.0);
+        if (!samples_active) {
+            std::cout << "    - Locate operations: " << profiling.total_locate_time << " s ("
+                      << (profiling.total_locate_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
+            std::cout << "      - First locate: " << profiling.total_first_locate_time << " s ("
+                      << (profiling.total_first_locate_time / profiling.total_locate_time * 100) << "%)" << std::endl;
+            std::cout << "      - Locate next: " << profiling.total_locate_next_time << " s ("
+                      << (profiling.total_locate_next_time / profiling.total_locate_time * 100) << "%)" << std::endl;
+        } else {
             std::cout << "    - First-rid resolve+walk: " << profiling.total_samples_first_rid_time << " s ("
                       << (profiling.total_samples_first_rid_time / profiling.total_mem_processing_time * 100) << "%)" << std::endl;
             std::cout << "    - Interior/last resolve: " << profiling.total_samples_interior_time << " s ("
