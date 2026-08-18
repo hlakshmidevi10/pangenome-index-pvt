@@ -263,6 +263,8 @@ int main(int argc, char** argv) {
         std::cerr << "  BWT size:      " << r_index.bwt_size() << "\n"
                   << "  BWT runs:      " << r_index.tot_runs() << "\n"
                   << "  num_blocks:    " << r_index.num_blocks() << "\n"
+                  << "  samples.size():" << r_index.samples.size() << "\n"
+                  << "  samples.width:" << r_index.samples.width() << " bits\n"
                   << "  load time:     " << dt.count() << " s\n";
     }
 
@@ -326,12 +328,46 @@ int main(int argc, char** argv) {
 
     BwtRunHeadIter bwt_iter(r_index);
     size_t total_locate_next_phase1 = 0;
+    const size_t samples_size = r_index.samples.size();
+    const size_t bwt_n        = r_index.bwt_size();
+    const size_t ltag_num_runs = ltag.num_runs();
+    size_t bwt_runs_walked = 0;
+    // Progress cadence: log ~40 lines end-to-end so a multi-hour walk still
+    // gives a heartbeat. Round to a power-of-two-ish for cheap modulo.
+    const size_t progress_every = std::max<size_t>(1'000'000, samples_size / 40);
 
     while (!bwt_iter.done()) {
         size_t run_start = bwt_iter.pos();
         size_t run_len   = bwt_iter.run_length();
         size_t run_end   = run_start + run_len;   // exclusive
         size_t bwt_rid   = bwt_iter.run_id();
+
+        // Defensive: BwtRunHeadIter numbers global_run_id densely 0..N-1 by
+        // walking blocks sequentially. samples[] is sized to r_index.tot_runs().
+        // If chr1 has any partially-filled encoded blocks (or any drift
+        // between block-walk and samples-array sizing) this fires with a
+        // diagnostic instead of a bare sdsl assert.
+        if (bwt_rid >= samples_size) {
+            std::cerr << "\nERROR: BwtRunHeadIter overshot samples[]:\n"
+                      << "  bwt_rid (from iterator) = " << bwt_rid << "\n"
+                      << "  samples.size()          = " << samples_size << "\n"
+                      << "  bwt_runs_walked so far  = " << bwt_runs_walked << "\n"
+                      << "  block_idx               = " << bwt_iter.block_idx << "\n"
+                      << "  num_blocks              = " << r_index.num_blocks() << "\n"
+                      << "  local_run_idx_in_block  = " << bwt_iter.local_run_idx_in_block << "\n"
+                      << "  block_runs.size()       = " << bwt_iter.block_runs.size() << "\n"
+                      << "  run_start (BWT pos)     = " << run_start << "\n"
+                      << "  run_len                 = " << run_len << "\n";
+            return 5;
+        }
+        if (run_end > bwt_n + 1) {
+            // ltag.bwt_size() can be r_index.bwt_size() OR r_index.bwt_size()+1
+            // (see line-283 check); anything beyond is a sign of block-walk drift.
+            std::cerr << "\nERROR: run_end (" << run_end << ") exceeds bwt_size+1 ("
+                      << (bwt_n + 1) << ") at bwt_rid=" << bwt_rid
+                      << " run_start=" << run_start << " run_len=" << run_len << "\n";
+            return 5;
+        }
 
         // Emit anchor at run_start.
         FastLocate::size_type sa_cursor = r_index.getSample(bwt_rid);
@@ -343,6 +379,12 @@ int main(int argc, char** argv) {
         {
             size_t tp = next_tag_pos();
             if (tp == run_start) {
+                if (next_tag_rid >= ltag_num_runs) {
+                    std::cerr << "\nERROR: tag rid overflow at coincident-collapse: "
+                              << "next_tag_rid=" << next_tag_rid
+                              << " ltag.num_runs()=" << ltag_num_runs << "\n";
+                    return 5;
+                }
                 next_tag_rid++;
             }
         }
@@ -353,6 +395,13 @@ int main(int argc, char** argv) {
         while (true) {
             size_t tp = next_tag_pos();
             if (tp == SIZE_MAX || tp >= run_end) break;
+            // Defensive: tp must lie inside the current BWT run (strict lower
+            // bound already enforced by run_start emit above).
+            if (tp < run_start) {
+                std::cerr << "\nERROR: tag pos " << tp << " precedes current run_start "
+                          << run_start << " (rid=" << next_tag_rid << ")\n";
+                return 5;
+            }
             // Advance the cursor to tp.
             while (cur_pos < tp) {
                 sa_cursor = r_index.locateNext(sa_cursor);
@@ -360,9 +409,29 @@ int main(int argc, char** argv) {
                 cur_pos++;
             }
             // Emit tag candidate at cur_pos = tp.
+            if (next_tag_rid >= ltag_num_runs) {
+                std::cerr << "\nERROR: tag rid overflow in interior emit: "
+                          << "next_tag_rid=" << next_tag_rid
+                          << " ltag.num_runs()=" << ltag_num_runs
+                          << " tp=" << tp << " run=[" << run_start << "," << run_end << ")\n";
+                return 5;
+            }
             candidates.push_back({static_cast<uint64_t>(sa_cursor),
                                   static_cast<uint64_t>(next_tag_rid), 1, {}});
             next_tag_rid++;
+        }
+
+        bwt_runs_walked++;
+        if (bwt_runs_walked % progress_every == 0) {
+            auto t_now = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> dt = t_now - t_phase1_start;
+            double pct = 100.0 * static_cast<double>(bwt_runs_walked) / static_cast<double>(samples_size);
+            std::cerr << "  [phase1] walked " << bwt_runs_walked << " / " << samples_size
+                      << " BWT runs (" << std::fixed << std::setprecision(2) << pct
+                      << "%), pos=" << run_start
+                      << ", candidates=" << candidates.size()
+                      << ", locateNext=" << total_locate_next_phase1
+                      << ", t=" << std::fixed << std::setprecision(1) << dt.count() << "s\n";
         }
 
         bwt_iter.advance();
