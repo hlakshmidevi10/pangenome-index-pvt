@@ -139,6 +139,7 @@ won't have the same context you do.
 | [JR-017](#jr-017--lf-operation-latency-on-hprc-chr6-baseline-vs-fused-lf_scan) | 2026-08-09 | LF-operation latency on HPRC chr6: baseline vs fused LF_scan | open | lf, r-index, microbenchmark, hprc, vesuvio, jr-016 |
 | [JR-018](#jr-018--tag-head-sa-samples-end-to-end-integration--n3-warm-cache-perf-on-hprc-chr6) | 2026-08-12 | Tag-head SA samples: end-to-end integration + N=3 warm-cache perf on HPRC chr6 | resolved | tag-head-samples, integration, correctness, perf, benchmark, hprc, vesuvio, jr-016, jr-017 |
 | [JR-019](#jr-019--flipped-vs-legacys8-end-to-end-perf-on-hprc-chr6-alt-noisy-l25-vs-l50) | 2026-08-12 | Flipped vs Legacy+s=8 end-to-end perf on HPRC chr6 alt-noisy: L=25 vs L=50 | resolved | perf, benchmark, hprc, alt-noisy, l25, l50, samples, jr-018 |
+| [JR-020](#jr-020--convert_tags-decoded-sdsl-header-as-bytecode-latent-bug-hit-by-hprcv1-chr1-build) | 2026-08-13 | convert_tags decoded SDSL header as ByteCode: latent bug hit by HPRCv1 chr1 build | resolved | convert_tags, build_tags, sdsl, int_vector_buffer, tag-arrays, correctness, hprc, chr1, bug-fix |
 
 ---
 
@@ -3416,5 +3417,519 @@ log) is the sole source of the memory overhead.
 No new code commits; measurement-only entry against binaries built
 from HEAD `b2c1608` (find_mems: suppress Locate ops block when samples
 path is active).
+
+---
+
+## JR-020 — convert_tags decoded SDSL header as ByteCode: latent bug hit by HPRCv1 chr1 build
+
+```yaml
+id: JR-020
+date: 2026-08-13
+author: claude-opus-4-7 (session with hlakshmidevi)
+status: resolved
+tags: [convert_tags, build_tags, sdsl, int_vector_buffer, tag-arrays, correctness, hprc, chr1, bug-fix]
+refs:
+  follows: [JR-019]
+```
+
+### Context
+
+Building the HPRCv1 chr1 tag index produced a `.ltags` whose
+`bwt_intervals.size()` violated the CLAUDE.md line-112 invariant
+`bwt_intervals size == BWT_size + 1`:
+
+| Dataset            | BWT size (n)    | bwt_intervals size (built) | Expected (n+1) | Delta |
+|:-------------------|----------------:|---------------------------:|---------------:|------:|
+| HPRCv1 chr6 alt    |  31,016,755,770 |             31,016,755,771 | 31,016,755,771 |     **0** ✓ |
+| **HPRCv1 chr1**    |  45,105,246,014 |         **45,105,246,211** | 45,105,246,015 | **+196** ✗ |
+
+Chr1's `_compressed.tags` and the downstream `.ltags` were unusable
+for MEM projection (every BWT-position query would be shifted by up
+to 196 positions). The chr6 build was correct so the failure was
+initially assumed to be a chr1-specific pipeline issue. It was not
+-- it was a latent bug in `src/convert_tags.cpp` that had gone
+undetected on every prior graph because the header bytes happened
+to decode into varints with `node_id == 0` and were silently skipped.
+
+Empirical shortcut discovered while investigating: passing
+`--num-seq 4328` (instead of the correct 4524 = `2 * 2262 paths`)
+produced `bwt_intervals size = 45,105,246,015`. `4524 - 4328 = 196`
+= the exact overshoot. Any linear shift of `num_seq` linearly
+shifts `bwt_intervals`, so this "fix" masked the real bug -- it did
+not remove any real coverage; it just under-prepended 196 endmarker
+positions so the accounting cancelled out. If used in production
+this would corrupt every seq_id assignment in gafpack output. See
+"Do not deploy the workaround" below.
+
+### Hypothesis
+
+1. The `.tags` file produced by `traverse_sequences_parallel`
+   (`include/pangenome_index/algorithm.hpp:496`) is opened as
+   `sdsl::int_vector_buffer<8> out(filename, std::ios::out | std::ios::trunc)`.
+   Per SDSL (`sdsl-lite/include/sdsl/int_vector_buffer.hpp:153`), a
+   nonzero `t_width` implies `m_offset = 8`, meaning the file has
+   an 8-byte header (LE uint64_t `size_in_bits`) prefixed to the
+   payload, plus 0-7 trailing zero bytes of alignment padding
+   written by `close()`.
+2. `convert_tags.cpp` (`src/convert_tags.cpp:66`, pre-fix) slurps
+   the entire file and starts decoding at byte 0 with
+   `gbwt::ByteCode::read`, treating the SDSL header as raw
+   ByteCode payload.
+3. On chr1 the first 4 header bytes `b8 cb d8 78` form a single
+   4-byte varint whose top bit is finally clear on `0x78`.
+   Decoding: `raw = 0x0f1625b8 = 253,247,928`. Field slicing per
+   `TagArray::encode_run_length`/`decode_run` (10 bits offset, 1
+   bit is_rev, 9 bits length, rest node_id): `node=241`,
+   `off=440`, `is_rev=1`, `length=196`.
+4. `node > 0` means `convert_tags.cpp:154` does NOT hit the
+   `nid == 0` skip. The varint is emitted as a real run of length
+   196 into the compact output. Hence `+196` overshoot.
+5. On chr6 the same code path fires but *every* header varint
+   happens to have `node_id == 0` (the arithmetic accident that
+   the first 8 bytes of a particular `size_in_bits` value all
+   have their high bits arranged such that `raw >> 20 == 0`), so
+   every phantom decode is skipped and the bug is silent.
+
+### Method
+
+**Direct evidence (vesuvio hex-dumps of the algorithm-format .tags
+files):**
+
+```sh
+# On vesuvio
+cd ~/mem-projection/pangenome-pipeline/runs/hprcv1-chr1-2026-08-12/
+xxd -c 16 -l 32 hprcv1_chr1.tags       # first 32 bytes -> SDSL header + payload start
+xxd -c 16 -s -32 hprcv1_chr1.tags      # last 32 bytes  -> trailing pad
+```
+
+Same for chr6, yeast, and hprcv2-mc-chr6. Then simulate
+`gbwt::ByteCode::read` + `TagArray::decode_run` on the 8 header
+bytes in Python and enumerate every varint that would be decoded
+and whether its `node_id == 0`.
+
+**Correctness verification (three tiers, per CLAUDE.md line 109):**
+
+Tier 1 -- local `convert_tags` round-trip against the checked-in
+yeast reference:
+
+```sh
+cd ~/personal/pangenome-index-latest
+make bin/convert_tags        # patched
+bin/convert_tags \
+    ../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.tags \
+    /tmp/yeast.patched.tags \
+    --num-seq 634
+md5 /tmp/yeast.patched.tags \
+    ../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized_compressed.tags
+```
+
+Tier 2 -- HPRCv1 chr6 E2E on vesuvio, comparing coverage MD5 to
+the JR-012/JR-013/JR-018/JR-019 gold-standard
+`60f6b8e4a759aebb252b83a870b9ff8c`:
+
+```sh
+# On vesuvio
+scp Mac:~/personal/pangenome-index-latest/src/convert_tags.cpp \
+    ~/pangenome-index-latest/src/convert_tags.cpp
+cd ~/pangenome-index-latest && make bin/convert_tags
+
+cd ~/mem-projection/pangenome-pipeline
+./query.sh configs/hprcv1-chr6-alt-reads.env hprc-chr6-2026-06-02 \
+    convert-tags-header-fix --gaf
+md5sum runs/hprc-chr6-2026-06-02/queries/convert-tags-header-fix/lightweight/alignment_coverage.csv
+```
+
+Tier 3 -- HPRCv1 chr1 rebuild with the patched binary, confirm the
+CLAUDE.md invariant:
+
+```sh
+cd ~/mem-projection/pangenome-pipeline/runs/hprcv1-chr1-2026-08-12/
+gtime -v ~/pangenome-index-latest/bin/convert_tags \
+    hprcv1_chr1.tags \
+    hprcv1_chr1_compressed.tags.header-fix \
+    --num-seq 4524 \
+    2>&1 | tee logs/06_convert_tags_header_fix.log
+grep "Building the bwt_intervals" logs/06_convert_tags_header_fix.log
+```
+
+### Findings
+
+**Header hex-dumps + simulated ByteCode decode (buggy convert_tags
+path). Each row is one varint the buggy code would decode from the
+8 header bytes.**
+
+Chr1 (`b8 cb d8 78 29 00 00 00`):
+
+| Varint bytes | raw       | decoded fields                       | action        |
+|:-------------|:----------|:-------------------------------------|:--------------|
+| `b8 cb d8 78`| `0xf1625b8` | node=241 off=440 rev=1 len=**196**   | **EMIT (bug)** |
+| `29`         | `0x29`    | node=0   off=41  rev=0 len=0         | skip           |
+| `00`         | `0x0`     | node=0   off=0   rev=0 len=0         | skip           |
+| `00`         | `0x0`     | node=0   off=0   rev=0 len=0         | skip           |
+| `00`         | `0x0`     | node=0   off=0   rev=0 len=0         | skip           |
+
+Chr6 alt (`58 94 44 07 08 00 00 00`):
+
+| Varint bytes | raw       | decoded fields                | action |
+|:-------------|:----------|:------------------------------|:-------|
+| `58`         | `0x58`    | node=0 off=88  rev=0 len=0    | skip   |
+| `94 44`      | `0x2214`  | node=0 off=532 rev=0 len=4    | skip   |
+| `07`         | `0x7`     | node=0 off=7   rev=0 len=0    | skip   |
+| `08`         | `0x8`     | node=0 off=8   rev=0 len=0    | skip   |
+| `00`         | `0x0`     | (as above)                    | skip   |
+| ...          |           |                               |        |
+
+Yeast (`50 73 b7 84 02 00 00 00`):
+
+| Varint bytes | raw       | decoded fields                | action |
+|:-------------|:----------|:------------------------------|:-------|
+| `50`         | `0x50`    | node=0 off=80  rev=0 len=0    | skip   |
+| `73`         | `0x73`    | node=0 off=115 rev=0 len=0    | skip   |
+| `b7 84 02`   | `0x8237`  | node=0 off=567 rev=0 len=16   | skip   |
+| `00`         | `0x0`     | (as above)                    | skip   |
+| ...          |           |                               |        |
+
+Hprcv2-mc-chr6 (`18 15 e4 0c 0a 00 00 00`):
+
+| Varint bytes | raw       | decoded fields                | action |
+|:-------------|:----------|:------------------------------|:-------|
+| `18`         | `0x18`    | node=0 off=24  rev=0 len=0    | skip   |
+| `15`         | `0x15`    | node=0 off=21  rev=0 len=0    | skip   |
+| `e4 0c`      | `0x664`   | node=0 off=612 rev=1 len=0    | skip   |
+| `0a`         | `0xa`     | node=0 off=10  rev=0 len=0    | skip   |
+| `00`         | `0x0`     | (as above)                    | skip   |
+| ...          |           |                               |        |
+
+Prediction from these tables: only chr1 emits a phantom run;
+that run has `len=196`, matching the observed `+196` overshoot.
+Chr6, yeast, and hprcv2-mc-chr6 emit 0 phantom bytes and are
+byte-safe.
+
+**Direct match against observed convert_tags "Skipping" log lines:**
+
+The buggy convert_tags logs each `nid == 0` skip. My simulated
+decode of the header bytes matches the leading log lines exactly
+in every dataset (`pos_t` prints as `id[+/-]offset` per
+`gbwtgraph::utils.h:330`; `-` means `is_rev=1`, `+` means `is_rev=0`;
+the second column is `length`):
+
+| Dataset | Simulated decode  | Observed log line   |
+|:--------|:------------------|:--------------------|
+| chr1    | node=241 off=440 rev=1 len=196 | (not logged; skip fires only if node==0)  |
+| chr1    | node=0 off=41 rev=0 len=0      | `Skipping pure endmarker run: 0+41 0`     |
+| chr6    | node=0 off=88 rev=0 len=0      | `Skipping pure endmarker run: 0+88 0`     |
+| chr6    | node=0 off=532 rev=0 len=4     | `Skipping pure endmarker run: 0+532 4`    |
+| chr6    | node=0 off=7 rev=0 len=0       | `Skipping pure endmarker run: 0+7 0`      |
+| chr6    | node=0 off=8 rev=0 len=0       | `Skipping pure endmarker run: 0+8 0`      |
+| yeast   | node=0 off=80 rev=0 len=0      | `Skipping pure endmarker run: 0+80 0`     |
+| yeast   | node=0 off=115 rev=0 len=0     | `Skipping pure endmarker run: 0+115 0`    |
+| yeast   | node=0 off=567 rev=0 len=16    | `Skipping pure endmarker run: 0+567 16`   |
+| mc-chr6 | node=0 off=24 rev=0 len=0      | `Skipping pure endmarker run: 0+24 0`     |
+| mc-chr6 | node=0 off=612 rev=1 len=0     | `Skipping pure endmarker run: 0-612 0`    |
+
+Every non-zero-offset skip line comes from header bytes.
+`0+0 0` lines come from either header bytes with all-zero bits or
+from trailing SDSL zero-padding (up to 7 bytes).
+
+**Verification (three tiers):**
+
+Tier 1 -- yeast round-trip. Reference produced by pre-fix
+convert_tags; my Mac-side baseline (rebuilt HEAD binary) and
+patched binary both regenerated it. All three MD5s match:
+
+```
+0672d1e901cfedffd110a1f743dccc55   yeast.baseline.tags     (rebuilt HEAD)
+0672d1e901cfedffd110a1f743dccc55   yeast.patched.tags      (patched)
+0672d1e901cfedffd110a1f743dccc55   ../runs/v2-yeast235/yeast235_chrII_100kb_normalized_compressed.tags (checked-in reference)
+```
+
+Stats logged by convert_tags in all three runs identical:
+`bwt_intervals size 337,356,603` (= BWT_size + 1 = 337,356,602 + 1),
+`Number of runs 226,291,960`. Log differs only in skip-line count
+(baseline: 12 lines from 8 header bytes + up to 4 trailing pad;
+patched: 6 lines from trailing pad only) -- confirms 8 bytes are
+being stripped correctly and no payload byte is being consumed
+in the process.
+
+Tier 2 -- HPRCv1 chr6 alt-noisy E2E on vesuvio. Patched
+convert_tags -> build_lightweight_tags -> find_mems -> gafpack
+-> validate_gaf:
+
+| variant | coverage MD5 | validate_gaf |
+|:--------|:-------------|-------------:|
+| `convert-tags-header-fix` | `60f6b8e4a759aebb252b83a870b9ff8c` | 2000/2000 ✓ |
+| JR-012/JR-013/JR-018/JR-019 gold baseline | `60f6b8e4a759aebb252b83a870b9ff8c` | -- (prior) |
+| `alt-noisy` older pre-JR-012 run | `f96f5030aa70a70b038a6ad1cf517a8b` | -- (superseded) |
+
+**Byte-identical downstream coverage** to every prior fix that
+targeted this dataset. This is JR-007's strongest correctness
+signal (see JR-007 line 933).
+
+Tier 3 -- HPRCv1 chr1 rebuild on vesuvio:
+
+| dataset    | pre-fix bwt_intervals | post-fix bwt_intervals | expected (BWT+1) | pre-fix runs | post-fix runs |
+|:-----------|----------------------:|-----------------------:|-----------------:|-------------:|--------------:|
+| **chr1**   |        45,105,246,211 |         **45,105,246,015** |   45,105,246,015 | 3,336,172,720 | **3,336,172,719** |
+
+Both invariant checks pass:
+- `bwt_intervals size == BWT + 1` ✓
+- `num_runs` dropped by exactly 1 (the single phantom run from the
+  4-byte header varint disappeared)
+- `.ltags` built downstream from the corrected `_compressed.tags`:
+  2.5 GB, 10 s, ~19 GB peak RSS, `num_runs = 3,336,172,719`
+  (consistent with `_compressed.tags`)
+
+Post-fix chr1 skip lines: `Skipping pure endmarker run: 0+0 0`
+(exactly 1; from the single trailing pad byte -- your `xxd -c 16 -s -32`
+showed the file ending in `...f2 ba d9 01 00`, one trailing zero).
+
+**Audit of other existing indexes** (using the invariant check
+below, no rebuild required):
+
+| Dataset | BWT size (n) | bwt_intervals size | delta (bwt_int - n - 1) | status |
+|:--------|-------------:|-------------------:|------------------------:|:------|
+| yeast235 chrII 100 kb normalized  |       337,356,602 |        337,356,603 |  **0** | ✓ safe |
+| HPRCv1 chr6 alt                   |    31,016,755,770 |     31,016,755,771 |  **0** | ✓ safe |
+| **HPRCv2 MC chm13 chr6**          |   157,116,624,594 |    157,116,624,595 |  **0** | ✓ safe |
+| **HPRCv1 chr1 (pre-fix build)**   |    45,105,246,014 |     45,105,246,211 | **+196** | ✗ affected -- rebuild required |
+| HPRCv1 chr1 (post-fix)            |    45,105,246,014 |     45,105,246,015 |  **0** | ✓ fixed |
+
+### Interpretation
+
+The bug is **latent and data-dependent**. Whether a given `.tags`
+file exposes it depends on the exact SDSL header byte pattern,
+which is derived from `size_in_bits` = 8 * payload_bytes. For a
+random large file, roughly half the possible headers have their
+first varint decode to `node_id > 0`. It is coincidence, not
+design, that all pre-chr1 builds landed on "safe" headers.
+
+The fix (`src/convert_tags.cpp`) is 10 lines: skip the 8-byte
+SDSL header before reading the payload. We deliberately do NOT
+trust the header's `size_in_bits` field to bound the read --
+on all four audited files the file has more bytes past the
+header than `size_in_bits/8` claims (chr1 ~5 MB extra, chr6
+~10 KB extra, yeast 6 bytes extra, mc-chr6 similar). Root cause
+of that discrepancy is not investigated further: likely
+`write_block()` flushing after the header is stamped. It does
+not matter for correctness because any real payload bytes past
+the claimed length are valid ByteCode varints that would decode
+to real runs; trailing SDSL zero-padding decodes to
+`node=0` and is skipped downstream by the existing endmarker-run
+guard (`convert_tags.cpp:154`).
+
+**Downstream impact of using an affected `.ltags`**: every
+`LightTagIndex::run_id_at(p)` for `p` past the phantom run start
+would return a run-id shifted by 1, and `find_mems`'s emitted
+`(seq_id, path_bp)` records would map to wrong graph positions
+proportional to the phantom-run count. On chr1 with one 196-long
+phantom, this is one bad boundary; on any future build that
+happens to have a header pattern with multiple phantom varints,
+it could be many.
+
+**Why the empirical `--num-seq 4524 - 196 = 4328` workaround
+worked at all and why it MUST NOT be used**: convert_tags
+prepends `num_seq` endmarker positions at BWT index 0. Reducing
+`num_seq` by 196 makes `bwt_intervals size` equal `BWT + 1` by
+cancelling out the phantom-run overshoot in the accounting
+total. But this poisons every seq_id lookup: gafpack maps BWT
+run 0..num_seq-1 to seq_ids 0..num_seq-1, so under-prepending
+by 196 shifts every real read's seq_id by 196 and produces
+wrong (but same-cardinality) coverage. The empirical fix
+"looks right" only in the aggregate check; it silently
+corrupts every per-record output. **Do not deploy the
+workaround. Deploy the patch.**
+
+### Pointers for future readers
+
+Where the bug lived:
+- `src/convert_tags.cpp:52-79` -- the file-read block (pre-fix).
+  The line `encoded_bytes.resize(static_cast<size_t>(sz))` +
+  full-file read + `while (loc < encoded_bytes.size())` loop was
+  the direct source of the misinterpretation.
+- `include/pangenome_index/algorithm.hpp:496` --
+  `sdsl::int_vector_buffer<8> out(filename, ...)` is where the
+  SDSL header prefix originates. Any tool that reads
+  `.tags` produced here must strip 8 bytes before decoding.
+
+Where the SDSL layout is documented:
+- `sdsl-lite/include/sdsl/int_vector_buffer.hpp:143-175`
+  (constructor) sets `m_offset = t_width ? 8 : 9` for non-plain
+  streams.
+- `sdsl-lite/include/sdsl/int_vector_buffer.hpp:333-360`
+  (`close()`) writes the header at offset 0 and pads with up
+  to 7 zero bytes to 8-byte alignment.
+- Header format for `int_vector<8>` (via
+  `int_vector.hpp:633`): a single 8-byte LE `uint64_t
+  size_in_bits`. Width is compile-time (no extra byte).
+
+Where the tag-run bit layout is defined:
+- `src/tag_arrays.cpp:28`
+  (`TagArray::encode_run_length`): `offset` in bits 0-9, `is_rev`
+  in bit 10, `length` in bits 11..(10+length_bits), `node_id` in
+  bits (11+length_bits).. . `length_bits = 9` per
+  `include/pangenome_index/tag_arrays.hpp:141`. So `node_id =
+  raw >> 20`, `length = (raw >> 11) & 0x1FF`, etc.
+- `src/tag_arrays.cpp:59` (`decode_run`) is the inverse.
+- The 511-cap is documented in the RLE splitting loops
+  (`length` field is 9 bits -> max value 511) at
+  `tag_arrays.cpp:113,141` and elsewhere.
+
+Where the `bwt_intervals` invariant is asserted informationally:
+- CLAUDE.md line 112: "check `bwt_intervals size == .seq size + 1`
+  in logs" -- this is the primary correctness gate for any
+  change touching TagArray serialization.
+- The `.seq` size is the total text length (all haplotypes
+  concatenated with endmarker separators), reported by grlbwt
+  as `Number of symbols in the file`, and equal to
+  `FastLocate::bwt_size()`.
+
+**Fast diagnostic (no rebuild, ~10 sec per index):**
+
+```sh
+cd /path/to/runs/<run-name>/
+BWT_SIZE=$(awk '/^Number of symbols in the file/ {print $NF}' logs/03_grlbwt.log)
+BWT_INT=$(awk '/Building the bwt_intervals vector/ {print $8}' logs/06_convert_tags.log)
+DELTA=$(( BWT_INT - BWT_SIZE - 1 ))
+if [ "$DELTA" -eq 0 ]; then
+    echo "SAFE (delta 0)"
+elif [ "$DELTA" -gt 0 ]; then
+    echo "AFFECTED (delta +$DELTA -- rebuild _compressed.tags and .ltags with patched convert_tags)"
+else
+    echo "UNDERSHOOT delta $DELTA -- investigate (unusual)"
+fi
+```
+
+If `AFFECTED`, the algorithm-format `.tags` file is fine (bug is
+in the reader). Rebuild only `_compressed.tags` (via
+`bin/convert_tags`) and its downstream `.ltags` (via
+`bin/build_lightweight_tags`). Do not rerun `build_tags` (~hours
+on chr1). Do not rerun `build_rindex`.
+
+**Mechanism check (5 sec per index):** if you want to know
+*why* a given file was or wasn't hit, hex-dump the first 8
+bytes and simulate the ByteCode decode:
+
+```sh
+xxd -c 16 -l 8 <base>.tags
+```
+
+Feed those 8 bytes into the Python snippet at the end of this
+entry to enumerate every varint the buggy code would decode
+from them and whether it has `node_id > 0`.
+
+### Open questions
+
+1. **Where do the "extra bytes past claimed payload" come from?**
+   All four audited files have `file_size - 8 - size_in_bits/8 > 0`
+   (chr1 ~5 MB, chr6 ~10 KB, yeast 6 bytes, mc-chr6 unknown).
+   Best guess: SDSL `write_block()` flushed a partial buffer that
+   `close()` didn't back off before stamping the header. Not
+   pursued because the fix (keep all post-header bytes) is
+   robust to this: any real ByteCode past the claimed payload
+   decodes as valid runs; trailing pad decodes as `0+0 0` skips.
+   If someone ever wants zero-padding-free output, investigate
+   here.
+2. **Other consumers of `.tags` files?** `build_lightweight_tags`
+   reads `_compressed.tags` (a different format written by
+   `TagArray::merge_compressed_files_sdsl` -- three
+   `sdsl::serialize` calls, not `int_vector_buffer<8>`). No SDSL
+   header issue there. `query_tags` reads the same
+   `_compressed.tags`. `merge_tags` doesn't call convert_tags. So
+   the fix scope is exactly `convert_tags`.
+3. **The `parsaeskandar/pangenome-index@bidirectional`
+   fork has not identified this bug.** Their most recent
+   convert_tags-touching commits are:
+   - `7853a2c` "fixed Silent truncation of endmarker count causes data corruption" (the uint16_t truncation on num_seq)
+   - `23cd454` "Fixed the convert_tags bug" (skip node_id=0 in max_node_id computation)
+   - `ade878f` "Fixed bug in the merge_tags"
+
+   None address the SDSL header. Upstream will hit this the
+   first time they build an index whose header happens to
+   decode with `node_id > 0`. Worth a heads-up PR when we get
+   there.
+
+### Commits (this repo)
+
+- Working-tree change on branch `tag-head-samples`:
+  `src/convert_tags.cpp` -- strip 8-byte SDSL header before
+  ByteCode-decoding the payload. Approximately +23 / -8 lines.
+  Not yet committed at time of writing (pending sign-off).
+
+### Files (this repo, kept for reproducibility)
+
+- `scratch/convert_tags.cpp.head-baseline` -- pre-fix HEAD source
+- `scratch/convert_tags.cpp.new-patched` -- post-fix source
+- `scratch/convert_tags.baseline` -- pre-fix binary
+- `scratch/convert_tags.patched` -- post-fix binary
+- `scratch/yeast_test/*.log` -- both convert_tags stderr from
+  round-trip test
+- `scratch/yeast_test/yeast.baseline.tags`, `yeast.patched.tags`
+  -- ~1 GB each, byte-identical MD5 `0672d1e901cfedffd110a1f743dccc55`
+
+### Artifacts (vesuvio)
+
+- `~/mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/queries/convert-tags-header-fix/`
+  -- Tier-2 chr6 E2E validation run, coverage MD5
+  `60f6b8e4a759aebb252b83a870b9ff8c`
+- `~/mem-projection/pangenome-pipeline/runs/hprcv1-chr1-2026-08-12/hprcv1_chr1_compressed.tags.header-fix`
+  -- Tier-3 chr1 corrected `_compressed.tags`
+- `~/mem-projection/pangenome-pipeline/runs/hprcv1-chr1-2026-08-12/hprcv1_chr1.ltags.header-fix`
+  -- downstream `.ltags` built from the corrected
+  `_compressed.tags`, 2.5 GB, `num_runs = 3,336,172,719`
+- `~/mem-projection/pangenome-pipeline/runs/hprcv1-chr1-2026-08-12/logs/06_convert_tags_header_fix.log`
+  -- log confirming `bwt_intervals size = 45,105,246,015` and
+  1 skip line (`0+0 0`, trailing pad only)
+
+### Appendix: Python simulator for header decode
+
+Save the 8 header bytes to `HEX_BYTES` and run:
+
+```python
+# Decode the SDSL header of a .tags file as if it were raw ByteCode
+# payload, showing exactly which varints the buggy convert_tags would
+# emit as real runs (node_id > 0) vs skip (node_id == 0).
+HEX_BYTES = "b8 cb d8 78 29 00 00 00"   # chr1 example
+hdr = bytes(int(x, 16) for x in HEX_BYTES.split())
+
+def decode(bs):
+    i = 0
+    while i < len(bs):
+        start = i
+        off = 0
+        val = bs[i] & 0x7F
+        while (bs[i] & 0x80) and (i + 1 < len(bs)):
+            i += 1; off += 7
+            val += (bs[i] & 0x7F) << off
+        incomplete = bool(bs[i] & 0x80)
+        i += 1
+        yield val, i - start, incomplete
+        if incomplete: return
+
+# Field layout: bits 0..9 offset, bit 10 is_rev, bits 11..19 length,
+# bits 20.. node_id.  See src/tag_arrays.cpp:28,59 and length_bits=9.
+def decode_run(v):
+    return {
+        "node": v >> 20,
+        "off":  v & 0x3FF,
+        "rev":  (v >> 10) & 1,
+        "len":  (v >> 11) & 0x1FF,
+    }
+
+emit_total = 0
+for raw, nb, inc in decode(hdr):
+    r = decode_run(raw)
+    is_emit = r["node"] > 0
+    print(f"  bytes={nb}  raw=0x{raw:x}  node={r['node']}  "
+          f"off={r['off']}  rev={r['rev']}  len={r['len']}  "
+          f"[{'EMIT (BUG)' if is_emit else 'skip'}]")
+    if is_emit:
+        emit_total += r["len"]
+print(f"Total phantom-emit length from header: {emit_total}")
+```
+
+Interpretation: if `Total phantom-emit length from header` is 0,
+the file is safe under the pre-fix convert_tags. Any nonzero value
+is the exact overshoot you'd see in `bwt_intervals size` for that
+file.
 
 ---

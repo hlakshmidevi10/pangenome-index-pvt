@@ -49,7 +49,27 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Read the entire input file (algorithm.hpp format: raw gbwt::ByteCode runs) into memory
+    // Read the input .tags file into memory, skipping the 8-byte SDSL
+    // header. build_tags writes .tags via `sdsl::int_vector_buffer<8>`
+    // (traverse_sequences_parallel in algorithm.hpp), which prefixes
+    // an 8-byte header (LE uint64_t size_in_bits) before the ByteCode
+    // payload and appends up to 7 trailing zero bytes of alignment.
+    //
+    // Without this skip, the first varint from decoding starts inside
+    // the header. On chr1 the header bytes `b8 cb d8 78 29 00 00 00`
+    // decode as a first varint 0xf1625b8 = {node=241, off=440, rev=1,
+    // len=196}, which was silently emitted as a real run and inflated
+    // bwt_intervals by exactly +196 positions. On chr6 the header
+    // happened to decode to varints all with node_id==0 (skipped as
+    // pure endmarker runs), which is why chr6 was symptom-free despite
+    // hitting the same latent bug.
+    //
+    // We deliberately do NOT use size_in_bits to bound the payload:
+    // on both chr1 (~5MB) and chr6 (~10KB) the on-disk byte count past
+    // the header exceeds the header's claimed size, likely from
+    // additional data flushed by write_block() after the header was
+    // stamped. Reading all post-header bytes is safe -- trailing
+    // padding decodes to node=0 and is skipped downstream.
     vector<gbwt::byte_type> encoded_bytes;
     try {
         ifstream in(input_file, ios::binary);
@@ -63,12 +83,21 @@ int main(int argc, char** argv) {
             cerr << "Error: failed to stat input file size\n";
             return 1;
         }
-        encoded_bytes.resize(static_cast<size_t>(sz));
-        in.seekg(0, ios::beg);
-        if (!encoded_bytes.empty()) {
-            in.read(reinterpret_cast<char*>(encoded_bytes.data()), encoded_bytes.size());
+        size_t file_bytes = static_cast<size_t>(sz);
+
+        constexpr size_t SDSL_HEADER_BYTES = 8;
+        if (file_bytes < SDSL_HEADER_BYTES) {
+            cerr << "Error: input file smaller than SDSL header ("
+                 << file_bytes << " < " << SDSL_HEADER_BYTES << " bytes)\n";
+            return 1;
+        }
+        size_t payload_bytes = file_bytes - SDSL_HEADER_BYTES;
+        encoded_bytes.resize(payload_bytes);
+        in.seekg(SDSL_HEADER_BYTES, ios::beg);
+        if (payload_bytes > 0) {
+            in.read(reinterpret_cast<char*>(encoded_bytes.data()), payload_bytes);
             if (!in) {
-                cerr << "Error: failed to read input file: " << input_file << "\n";
+                cerr << "Error: failed to read payload from: " << input_file << "\n";
                 return 1;
             }
         }
