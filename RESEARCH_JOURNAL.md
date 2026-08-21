@@ -140,6 +140,7 @@ won't have the same context you do.
 | [JR-018](#jr-018--tag-head-sa-samples-end-to-end-integration--n3-warm-cache-perf-on-hprc-chr6) | 2026-08-12 | Tag-head SA samples: end-to-end integration + N=3 warm-cache perf on HPRC chr6 | resolved | tag-head-samples, integration, correctness, perf, benchmark, hprc, vesuvio, jr-016, jr-017 |
 | [JR-019](#jr-019--flipped-vs-legacys8-end-to-end-perf-on-hprc-chr6-alt-noisy-l25-vs-l50) | 2026-08-12 | Flipped vs Legacy+s=8 end-to-end perf on HPRC chr6 alt-noisy: L=25 vs L=50 | resolved | perf, benchmark, hprc, alt-noisy, l25, l50, samples, jr-018 |
 | [JR-020](#jr-020--convert_tags-decoded-sdsl-header-as-bytecode-latent-bug-hit-by-hprcv1-chr1-build) | 2026-08-13 | convert_tags decoded SDSL header as ByteCode: latent bug hit by HPRCv1 chr1 build | resolved | convert_tags, build_tags, sdsl, int_vector_buffer, tag-arrays, correctness, hprc, chr1, bug-fix |
+| [JR-021](#jr-021--standardized-performance-report-format-perf_report_templatemd--hprc-chr6-l25-worked-example) | 2026-08-21 | Standardized performance-report format (PERF_REPORT_TEMPLATE.md) + HPRC chr6 L=25 worked example | resolved | reporting, template, perf, benchmark, hprc, l25, noisy, vesuvio, jr-018, jr-019, tag-head-samples |
 
 ---
 
@@ -291,7 +292,7 @@ Commands:
 ```
 bin/test_flipped_mems \
   ../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri \
-  ../mem-projection/yeast-235/yeast-235-chrI/S288C_chrII_N100K_R1_200_reads.txt \
+  ../mem-projection/yeast-235/yeast-235-chrII/S288C_chrII_N100K_R1_200_reads.txt \
   30 1 <N>
 ```
 for N in {500, 10000, 100000}.
@@ -3931,5 +3932,176 @@ Interpretation: if `Total phantom-emit length from header` is 0,
 the file is safe under the pre-fix convert_tags. Any nonzero value
 is the exact overshoot you'd see in `bwt_intervals size` for that
 file.
+
+---
+
+## JR-021 — Standardized performance-report format (PERF_REPORT_TEMPLATE.md) + HPRC chr6 L=25 worked example
+
+```yaml
+id: JR-021
+date: 2026-08-21
+author: claude-sonnet-5 (session with hlakshmidevi)
+status: resolved
+tags: [reporting, template, perf, benchmark, hprc, l25, noisy, vesuvio, jr-018, jr-019, tag-head-samples]
+refs:
+  follows: [JR-019]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+Prior perf write-ups (JR-008, JR-012, JR-014, JR-018, JR-019) each built
+their own ad-hoc table layout inside a full journal narrative
+(Context/Hypothesis/Method/Findings/Interpretation). User asked for a
+different, reusable shape instead: a dataset-centric report -- Reference
+characteristics, Read characteristics, MEM Coverage Statistics, Performance,
+Disk storage -- that can be produced the same way for any (graph, reads,
+config) combination without re-deriving the format each time. This entry
+establishes that format as `PERF_REPORT_TEMPLATE.md` (this repo) and records
+the worked example that produced it: HPRC v1 chr6 (PGGB), MEM_LEN=25,
+alt-noisy reads, flipped vs legacy+`--tag-head-samples=s8`.
+
+The underlying benchmark data is not new -- it is the N=3 warm-cache harness
+run at `perf/jr019-perf-L25-{flipped,legacy-s8}/` on Vesuvio, executed
+2026-08-14 (two days after JR-019 was written) but never folded back into
+the journal. This entry is also, incidentally, the write-up JR-019's open
+question #1 ("N=3 warm-cache validation for L=25") was waiting on.
+
+### Method
+
+Data pulled directly from `perf/jr019-perf-L25-{flipped,legacy-s8}/SUMMARY.tsv`,
+`PROVENANCE.txt`, and each trial's `find_mems.log` (Vesuvio). Graph
+characteristics pulled fresh via `gbz_stats -p` and `gbz_stats -g` against
+`hprcv1/chr6.gbz` (the `-i` flag's "Total length" line was initially
+mis-read as a bp count -- see the Gotcha in `PERF_REPORT_TEMPLATE.md`'s
+Reference characteristics section, caught before it made it into this
+report). Two corrections were made mid-session while assembling the MEM
+Coverage Statistics section, both now encoded as gotchas in the template:
+
+1. "Total Entries Written" was initially copied from JR-019's journal prose
+   (1,432,999) without cross-checking against this run's own `SUMMARY.tsv`.
+   The actual ground truth for this run is `bin_bytes / 16 = 23,715,712 / 16
+   = 1,482,232`, exact and identical across all 6 trials. The discrepancy is
+   consistent with `find_mems.log`'s "K/M" abbreviated text using truncation
+   rather than rounding (1,482,232 prints as "1.4M", which a naive reader
+   would round back to ~1.4M rather than the true 1.48M).
+2. "Average Tag Run Length" was resolved to `find_mems.log`'s "Global n/r
+   ratio (Σmem.size / Σtag_runs)" = 21.6344, not the "Mean per-MEM n/r
+   ratio" = 77.98 -- the latter is explicitly flagged as outlier-skewed in
+   `mem-projection/pangenome-pipeline/CLAUDE.md`'s footgun list and is not
+   meant for this kind of summary reporting.
+
+### Findings
+
+**Reference characteristics**
+
+| | |
+|:--|--:|
+| Graph | HPRC v1 chr6 (PGGB) |
+| Nodes | 4,743,141 |
+| Edges | 6,586,286 |
+| Graph sequence (deduplicated) | 228.63 Mbp |
+| Total haplotype path length (all haplotypes, single orientation) | 15.51 Gbp |
+| Haplotypes / samples / paths | 90 haplotypes, 46 samples, 1,410 paths (1,409 contigs) |
+
+**Read characteristics**
+
+| | |
+|:--|--:|
+| Reads | 100,000 x 200 bp, single-end |
+| Source | `HG00438#2#JAHBCA010000010.1#0` (alt haplotype, in-graph) |
+| Error profile | Noisy -- ~1% per-base substitution error, wgsim-simulated, Illumina-like uniform-error model |
+| Read file | `chr6.alt_noisy.reads.txt` (20.1 MB) |
+
+**MEM Coverage Statistics** (identical between both configs -- verified via
+the correctness gate below)
+
+| Metric | Value |
+|:--|--:|
+| Total Reads | 100,000 |
+| Total MEMs | 250,177 |
+| Average MEM length | 79.42 bp |
+| Total Occurrence (Σ mem.size) | 32,050,895 (32.0M) |
+| Avg Occurrence / MEM | 128.16 |
+| Avg Tag Runs / MEM (SA interval) | 5.92 |
+| Average Tag Run Length (Global n/r ratio) | 21.63 |
+| Total Entries Written (find_mems, pre-dedup) | 1,482,232 |
+| Total Occurrence on graph after MEM projection (post gafpack dedup) | 840,010 |
+
+**Performance** (N=3 warm-cache, mean +- stdev)
+
+| Metric | Flipped | Legacy + samples (s=8) | delta |
+|:--|--:|--:|--:|
+| find_mems time | 48.30 +- 0.17 s | 38.94 +- 0.14 s | -9.36s (-19.4%) |
+| find_mems memory (peak RSS) | 4,516.4 +- 0.7 MB | 4,792.4 +- 0.7 MB | +276.0 MB (+6.1%) |
+| gafpack time | 24.04 +- 0.05 s | 24.16 +- 0.08 s | +0.12s (noise) |
+| gafpack memory (peak RSS) | ~335 MB | ~336 MB | ~0 |
+| **Total wall (find_mems + gafpack)** | **72.33 +- 0.21 s** | **63.10 +- 0.11 s** | **-9.23s (-12.8%)** |
+| **MEM throughput (MEMs/s, total wall)** | **3,459** | **3,964** | **+14.6%** |
+
+**Disk storage**
+
+| Index component | Size |
+|:--|--:|
+| r-index (`.ri`) | 3.63 GiB (3,900,355,874 bytes) |
+| tag-index, lightweight (`.ltags`) | 670.31 MiB (702,868,237 bytes) |
+| tag-samples (s=8, legacy+s8 config only) | 272.35 MiB (285,578,626 bytes) |
+
+**Correctness gate:** coverage MD5 `5b1b770ca5f8d4719c5ea0ea2cd8e655`,
+`.bin` records 1,482,232, gafpack entries 840,010, and MEM count 250,177 --
+all identical across all 6 trials (3 flipped + 3 legacy+s8), stderr warnings
+0 throughout.
+
+### Interpretation
+
+**The template holds up on first real use** -- every field in
+`PERF_REPORT_TEMPLATE.md` had a concrete, unambiguous source once the two
+corrections above were made. Both corrections are now load-bearing gotchas
+in the template itself, which is the point: they should not have to be
+rediscovered by whoever runs the next report.
+
+**The underlying numbers reconfirm JR-019 at N=3.** Find_mems wall -19.4%,
+combined wall -12.8%, both within ~1pp of JR-019's single-trial numbers
+(-19.1% / -12.4%) and inside the N=3 stdev bars (<=0.17s on every total).
+Combined with JR-018's L=50 result (-20.8%/-12.8%), the legacy+samples-s8
+win now has harness-grade (not single-trial) confirmation at two MEM
+lengths. This resolves JR-019 open question #1.
+
+**New at L=25:** the samples-resolution cost (4.18s: 1.12s first-rid walk +
+3.06s interior/last resolve) is 23.9% cheaper than flipped's SA-carry
+locateNext walk (5.49s) -- a cleaner isolation of this effect than L=50
+gave, because L=25 has more, shorter MEMs (250K vs 155K) and therefore more
+tag-run boundaries per MEM, so the fixed per-resolution cost of a samples
+lookup (avg 2.93 LF steps, well under the s=8 cap) pays off more.
+
+### Open questions
+
+1. JR-019's remaining open questions (#2 out-of-graph HG002 reads, #3
+   whole-genome scaling) are untouched by this entry.
+2. Two un-journaled Vesuvio runs postdate this data and are candidates for
+   a future report using this template: `perf/hprcv2-mc-chr6-flipped/`
+   (2026-08-14, flipped on the larger HPRCv2 MC chr6 graph, no
+   legacy/samples comparison yet) and
+   `runs/hprcv1-chr1-2026-08-12/queries/flipped-hg00097-L25/` (2026-08-15).
+3. `PERF_REPORT_TEMPLATE.md` has one worked example (this entry). Whether
+   its section shape holds for a fundamentally different scenario --
+   e.g. an out-of-graph read set, where "Total Occurrence on graph after
+   MEM projection" is expected to be sparse rather than near-total, or a
+   whole-genome (multi-chromosome) index -- is untested.
+
+### Data artifacts
+
+Same as JR-019's L=25 data:
+- `~/mem-projection/pangenome-pipeline/perf/jr019-perf-L25-flipped/`
+- `~/mem-projection/pangenome-pipeline/perf/jr019-perf-L25-legacy-s8/`
+
+Plus fresh for this entry:
+- `gbz_stats -p` / `-g` output against `~/mem-projection/hprcv1/chr6.gbz`
+  (not persisted to a log file on Vesuvio; re-run if needed, ~seconds)
+
+### Commits
+
+No code changes. `PERF_REPORT_TEMPLATE.md` added to this repo (this commit);
+no changes to `find_mems`/`gafpack`/harness code.
 
 ---

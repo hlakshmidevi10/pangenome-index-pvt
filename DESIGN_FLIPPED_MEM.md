@@ -12,7 +12,7 @@
 - `src/test_r_index_sa.cpp` — Tier-1 unit test pattern (validated `leftmost_c_in_interval` on yeast, 105K+ tests, 0 failures)
 
 **Do not** validate against `xy-test/xy.ri` — it is a known-bad fixture. Use the canonical validation datasets from `VALIDATION_GUIDE.md`:
-- Yeast (fast iteration): `../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri` with reads at `../mem-projection/yeast-235/yeast-235-chrI/S288C_chrII_N100K_R1_200_reads.txt` (config `configs/yeast235-chrII-normalized.env`).
+- Yeast (fast iteration): `../mem-projection/pangenome-pipeline/runs/v2-yeast235/yeast235_chrII_100kb_normalized.ri` with reads at `../mem-projection/yeast-235/yeast-235-chrII/S288C_chrII_N100K_R1_200_reads.txt` (config `configs/yeast235-chrII-normalized.env`).
 - HPRC chr6 (production scale): `../mem-projection/pangenome-pipeline/runs/hprc-chr6-2026-06-02/hprcv1_chr6.ri` with reads at `../mem-projection/hprcv1/chr6.alt.reads.txt` (config `configs/hprcv1-chr6-alt-reads.env`).
 
 Any subsetting (e.g., a "500 reads" quick loop) must be a deterministic prefix of the canonical reads file — pass `[max_reads=N]` to the test binaries rather than committing a separate on-disk subset.
@@ -261,7 +261,7 @@ Verification bars per CLAUDE.md + VALIDATION_GUIDE.md — every stage that touch
 
 **Stage 2: Flipped MEM finder.**
 - Implement `find_all_mems_flipped` in `include/pangenome_index/algorithm.hpp` using `backward_extend_encoded_with_sa` for Step 1' and existing `forward_extend_encoded` for Step 2'. Step 2' doesn't need SA carry (its purpose is only to identify next-x, not to emit MEMs).
-- Write a test that runs both `find_all_mems` and `find_all_mems_flipped` on the canonical yeast reads (`../mem-projection/yeast-235/yeast-235-chrI/S288C_chrII_N100K_R1_200_reads.txt`, subsetted via `max_reads` for iteration speed), diffs MEM sets.
+- Write a test that runs both `find_all_mems` and `find_all_mems_flipped` on the canonical yeast reads (`../mem-projection/yeast-235/yeast-235-chrII/S288C_chrII_N100K_R1_200_reads.txt`, subsetted via `max_reads` for iteration speed), diffs MEM sets.
 - Bar: bitwise-identical `(start, end, bwt_start, size)` tuples across every yeast read. Also verify `sa_sp` returned by flipped equals `locate_sa_value(bwt_start)` computed via the legacy path — this is the correctness check that ties the algorithm-level result back to the primitive-level guarantee.
 - E2E: not applicable yet (find_mems still uses the legacy path).
 

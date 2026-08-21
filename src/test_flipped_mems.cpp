@@ -25,7 +25,7 @@
 // canonical file with max_reads instead). Recommended:
 //   .ri:    ../mem-projection/pangenome-pipeline/runs/v2-yeast235/
 //           yeast235_chrII_100kb_normalized.ri
-//   reads:  ../mem-projection/yeast-235/yeast-235-chrI/
+//   reads:  ../mem-projection/yeast-235/yeast-235-chrII/
 //           S288C_chrII_N100K_R1_200_reads.txt
 //
 // For quick iteration, pass max_reads=500 (or any N) instead of splitting the
