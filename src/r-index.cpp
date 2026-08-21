@@ -370,8 +370,17 @@ namespace panindexer {
             bit_offsets.push_back(bitpos);
             // Write cumulative ranks in sym_map index order [0..C.size())
             // TODO: check this when we don't have N
-            for (size_t idx = 0; idx < this->blocks[bi].get_cum_ranks().size(); ++idx) {
-                size_t val = this->blocks[bi].get_cum_ranks()[idx];
+            //
+            // The count is driven by C.size(), not by the block's own vector
+            // length, because EncodedBlock::skip_header reads back exactly
+            // C.size() varints. Letting the block decide would desynchronize
+            // writer and reader for any block whose cum-ranks were never
+            // assigned, and the surplus bytes would then decode as phantom
+            // runs. Blocks filled by the constructor always hold exactly
+            // C.size() entries, so this is a no-op for them.
+            const auto& cum_ranks = this->blocks[bi].get_cum_ranks();
+            for (size_t idx = 0; idx < this->C.size(); ++idx) {
+                size_t val = (idx < cum_ranks.size()) ? cum_ranks[idx] : 0;
                 gbwt::ByteCode::write(stream, static_cast<gbwt::size_type>(val));
             }
             // Encode runs
@@ -1124,7 +1133,14 @@ namespace panindexer {
         auto n_seq = this->tot_strings();
 
         std::cerr << total_runs / this->block_size << std::endl;
-        this->blocks.resize((total_runs / this->block_size) + 1);
+        // Must be ceil(total_runs / block_size), matching block_sd_builder's
+        // capacity below. An unconditional "+ 1" over-allocates by one whenever
+        // block_size divides total_runs exactly, leaving a trailing block that
+        // is never filled but still gets serialized -- and which has no
+        // corresponding 1-bit in blocks_start_pos. Any sequential block walk
+        // then runs off the end of blocks_start_pos's select support.
+        this->blocks.resize((total_runs / this->block_size) +
+                            (total_runs % this->block_size != 0));
 
 
         size_t run_iterator = 0;

@@ -151,7 +151,12 @@ namespace panindexer {
             // and the second element is the run length
             std::vector <std::pair<size_t, size_t>> runs;
 
-            Run_blocks() : character_cum_ranks(8) {};
+            // Left empty rather than sized to a fixed guess: the real length is
+            // C.size(), which this struct cannot see. set_character_cum_ranks
+            // resizes to the true alphabet size, and serialize_encoded writes
+            // exactly C.size() entries regardless, so an unassigned block costs
+            // nothing and cannot desynchronize the encoded stream.
+            Run_blocks() = default;
 
 
             void set_runs(std::vector <std::pair<size_t, size_t>> &source) {
