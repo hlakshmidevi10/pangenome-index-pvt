@@ -142,6 +142,7 @@ won't have the same context you do.
 | [JR-020](#jr-020--convert_tags-decoded-sdsl-header-as-bytecode-latent-bug-hit-by-hprcv1-chr1-build) | 2026-08-13 | convert_tags decoded SDSL header as ByteCode: latent bug hit by HPRCv1 chr1 build | resolved | convert_tags, build_tags, sdsl, int_vector_buffer, tag-arrays, correctness, hprc, chr1, bug-fix |
 | [JR-021](#jr-021--standardized-performance-report-format-perf_report_templatemd--hprc-chr6-l25-worked-example) | 2026-08-21 | Standardized performance-report format (PERF_REPORT_TEMPLATE.md) + HPRC chr6 L=25 worked example | resolved | reporting, template, perf, benchmark, hprc, l25, noisy, vesuvio, jr-018, jr-019, tag-head-samples |
 | [JR-022](#jr-022--block-count-off-by-one-in-the-fastlocate-constructor-a-phantom-trailing-block) | 2026-08-21 | Block-count off-by-one in the FastLocate constructor: a phantom trailing block | resolved | r-index, blocks, off-by-one, sdsl, sd-vector, build_tag_head_samples, correctness, bug-fix, chr1, mc-chr6, vesuvio |
+| [JR-023](#jr-023--tag-head-sa-samples-do-not-scale-to-whole-genome-the-chr6-recommendation-inverts-on-chr1) | 2026-08-22 | Tag-head SA samples do not scale to whole-genome: the chr6 recommendation inverts on chr1 | resolved | tag-head-samples, scaling, whole-genome, perf, benchmark, chr1, hprc, flipped, vesuvio, jr-016, jr-018, jr-019 |
 
 ---
 
@@ -4318,5 +4319,206 @@ fails at scale.
   — the successful run; `.debug.log` alongside it is the 2026-08-15 crash
 - `runs/*/queries/blockfix-verify/lightweight/` — pipeline verification runs
 - `~/mcchr6_ab/` — mc-chr6 old-vs-new `find_mems` A/B outputs
+
+---
+
+## JR-023 — Tag-head SA samples do not scale to whole-genome: the chr6 recommendation inverts on chr1
+
+```yaml
+id: JR-023
+date: 2026-08-22
+author: claude-opus-5 (session with hlakshmidevi)
+status: resolved
+tags: [tag-head-samples, scaling, whole-genome, perf, benchmark, chr1, hprc, flipped, vesuvio, jr-016, jr-018, jr-019]
+refs:
+  follows: [JR-022]
+  resolves: [JR-018, JR-019]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+JR-018 recommended `--tag-head-samples=…s8` with the legacy MEM finder as the
+default HPRC chr6 configuration: **−20.8%** find_mems wall versus the flipped
+baseline, at +6.1% peak RSS. Its open question #1 flagged the obvious risk —
+*"Whole-genome HPRCv1/HPRCv2 datasets not yet tested… we expect it to hold, but
+should confirm"* — and JR-019's open question #3 promised chr1 numbers once the
+samples build finished.
+
+That build never finished. It aborted twice on the block-count bug fixed in
+JR-022. With chr1's samples now built (s=8/16/32, all probes passing), this
+entry finally runs the comparison.
+
+### Question
+
+Does JR-018's "legacy + samples beats flipped" result hold at whole-genome
+scale?
+
+### Method
+
+`find_mems` run directly (not via `perf_harness.sh`, which also runs gafpack on
+every trial and would have added hours while measuring nothing — the `.bin`
+outputs are proven identical). Per config: 2 untimed warmups + 3 timed trials,
+contiguous per-mode ordering. Five configs: flipped, legacy, legacy+s8/s16/s32.
+Index `hprcv1_chr1.ri` (post-JR-022), L=25, MIN_OCC=1.
+
+**Two readsets**, because the first choice was wrong:
+
+- **in-graph**: `chr1.alt_noisy.reads.txt` — HG00438 alt haplotype, **38 of the
+  2262 chr1 paths**. This is the direct analogue of chr6's benchmark readset
+  (also HG00438), and the only valid basis for comparing against JR-018/019.
+- **out-of-graph**: `chr1.hg00097_noisy.reads.txt` — HG00097, **0 of 2262
+  paths**. Initially benchmarked by mistake (it was the readset with a coverage
+  baseline, chosen for JR-022's correctness gate and then carried over without
+  thinking). Retained because it answers JR-019's open question #2, which listed
+  out-of-graph behaviour as untested.
+
+Both 100K × 200 bp.
+
+**Caveat:** run concurrently with mc-chr6's `build_tag_head_samples` (one
+single-threaded process on a 96-core host). Load was constant across all arms
+and ordering was contiguous, so relative deltas hold; absolute walls are
+inflated. Per-trial spread was ±0.3 s on most arms, so the inflation is
+systematic rather than noisy.
+
+### Findings
+
+**A. Storage: ~8× chr6 at every s, and the ratio is stable.**
+
+| s | chr6 (JR-016) | chr1 | ratio | chr1 kept | % of all tag runs |
+|--:|--:|--:|--:|--:|--:|
+| 8 | 272 MB | **2.19 GB** | 8.1× | 403.8 M | 12.11% |
+| 16 | 125 MB | **1.02 GB** | 8.2× | 184.7 M | 5.54% |
+| 32 | 61 MB | **507 MB** | 8.3× | 87.3 M | 2.62% |
+
+Build: 3h46m wall, **95.3 GB peak RSS** (chr6 was 1h24m / 21.7 GB).
+
+**B. Root cause — the free-SA subsidy collapses.**
+
+Tag heads that coincide with a BWT-run head get their SA free from the
+r-index's existing `samples[]`, needing no stored sample:
+
+| | chr6 | chr1 |
+|:--|--:|--:|
+| tag runs | 710.2 M | 3336.2 M |
+| BWT runs | 249.4 M | 338.4 M |
+| **tag runs per BWT run** | **2.85** | **9.86** |
+| **coincident (free) tag heads** | **33.9%** | **9.8%** |
+
+chr6 got a third of its tag heads subsidised; chr1 gets a tenth. chr1 packs
+4.7× more tag runs onto 1.36× more BWT runs, so coincidences are rare and far
+more genuine samples must be stored — and, at query time, far more emits fall
+to the slow path.
+
+**C. Perf, in-graph (HG00438 alt, L=25, N=3 medians).**
+
+| config | median | RSS | vs legacy | vs flipped | fast-path |
+|:--|--:|--:|--:|--:|--:|
+| **flipped** | **94.19 s** | 9403 MB | −34% | — | — |
+| legacy + s8 | 140.84 s | 11662 MB (+24.0%) | −1.8% | **+50%** | 14.02% |
+| legacy | 143.42 s | 9403 MB | — | +52% | — |
+| legacy + s16 | 219.06 s | 10462 MB (+11.3%) | +53% | +133% | 6.45% |
+| legacy + s32 | 379.91 s | 9914 MB (+5.4%) | +165% | **+303%** | 3.05% |
+
+**D. Perf, out-of-graph (HG00097, L=25, N=3 medians).**
+
+| config | median | RSS | vs legacy | vs flipped | fast-path |
+|:--|--:|--:|--:|--:|--:|
+| **flipped** | **76.97 s** | 8579 MB | −33% | — | — |
+| legacy + s8 | 92.55 s | 10839 MB (+26.4%) | −20% | +20% | 13.73% |
+| legacy | 115.41 s | 8578 MB | — | +50% | — |
+| legacy + s16 | 120.55 s | 9637 MB (+12.3%) | +4% | +57% | 6.43% |
+| legacy + s32 | 184.40 s | 9090 MB (+6.0%) | +60% | +140% | 3.07% |
+
+**E. The direct like-for-like comparison — the result inverts.**
+
+Same L=25, same HG00438 alt-noisy readset family, same metric:
+
+| | chr6 (JR-019) | chr1 in-graph | |
+|:--|--:|--:|:--|
+| flipped | 48.34 s | 94.19 s | |
+| legacy + s8 | 39.10 s | 140.84 s | |
+| **s8 vs flipped** | **−19.1%** ✅ | **+49.5%** ❌ | **reversed** |
+
+**F. Correctness preserved throughout.** All samples configs produce `.bin` and
+`seq_id_starts` byte-identical to the legacy baseline on both readsets. Flipped's
+`.bin` differs (`9e7e561b…` vs `8d73e085…`) but is the same 584,554,560 bytes
+with identical `seq_id_starts` — JR-007's documented sort tie-break, since legacy
+iterates left-to-right and flipped right-to-left. Confirmed benign: gafpack
+coverage from the two is **byte-identical over 160,353,056 bytes**.
+
+### Interpretation
+
+**JR-018's recommendation does not generalise, and should not be applied to
+whole-genome indexes.** On chr1 the flipped finder dominates every samples
+configuration on *both* axes simultaneously — fastest wall, lowest RSS, no
+2.19 GB side file, no 3h46m build step.
+
+The mechanism is not a bug in the samples design; it works exactly as specified,
+eliminating the entire ~51 s seed cost in every arm. What fails is the **trade**.
+Cost of the replacement is (emits × slow-path fraction × avg LF steps × ~634 ns
+per DRAM-bound LF, JR-017). On chr6 three factors were mild: high coincidence
+rate kept the slow-path fraction down, low tag density kept emits per MEM down,
+and the seed cost being replaced was proportionally large. On chr1 all three move
+against it at once. The seed saving is fixed; the replacement cost is not.
+
+**s=8 is the only setting that beats legacy at all (−1.8% in-graph), and it is
+the one that busts the +10% RSS ceiling — by 2.4×.** The only setting inside the
+ceiling (s=32) is 4× slower than flipped. There is no viable operating point.
+
+**In-graph is markedly harsher than out-of-graph** (s=8: −1.8% vs −20% relative
+to legacy). In-graph reads match the pangenome more, producing more MEMs and more
+tag-run emits per MEM — precisely the quantity the slow-path cost scales with,
+while the seed saving does not. Anyone extrapolating from out-of-graph numbers
+would materially overestimate the design.
+
+**Retrospective on JR-018.** Its s=8 recommendation was correct for chr6 but
+rested on a property nobody had identified as load-bearing: the 33.9% coincidence
+rate. JR-016 recorded that number as a storage optimisation ("saves storage for
+34% of all tag runs") without noting it was equally a *query-time* subsidy. The
+lesson is that `s` is not the only knob — the graph's tag-runs-per-BWT-run ratio
+determines whether any `s` works, and that ratio is a property of the dataset, not
+a tunable.
+
+### Recommendation
+
+Keep `--use-flipped-mems` as the whole-genome path. Do not build or ship
+`.tag_samples` files for chr1-scale indexes. JR-018's chr6 guidance stands **for
+chr6-scale single-chromosome indexes only** and should be read with that scope.
+
+Before applying samples to any new dataset, compute
+`tag_runs / bwt_runs` and the coincidence rate — both available in ~3 s from
+`print_stats` plus one `build_tag_head_samples` Phase-2 line. If the coincidence
+rate is well below ~30%, expect the design not to pay.
+
+### Open questions
+
+1. **Where is the crossover?** chr6 (2.85 tag runs/BWT run, 33.9% coincident)
+   wins; chr1 (9.86, 9.8%) loses badly. hprcv2 MC chr6 sits between and its
+   samples build is running — one more point would show whether the transition
+   is sharp or gradual, and whether coincidence rate alone predicts it.
+2. **Clean-machine re-run.** These numbers carry mc-chr6's concurrent load.
+   Relative deltas are sound but absolute walls are inflated; re-run before any
+   external reporting.
+3. **Is flipped's advantage growing with scale?** flipped beats legacy by 34%
+   here versus JR-012's ~11% on chr6. If the margin widens with graph size, that
+   strengthens the case for flipped as the default everywhere, which JR-014's
+   open question #2 left pending.
+4. **Does a much smaller s help?** s=4 or s=2 would raise the fast-path rate,
+   but storage already scales ~2× per halving — s=4 would be ~4.4 GB on chr1.
+   Almost certainly not viable, but it would confirm the curve has no minimum
+   hiding below s=8.
+
+### Data artifacts (vesuvio)
+
+- `~/chr1_bench_ingraph/` — in-graph N=3 logs, `.time` files, coverage identity check
+- `~/chr1_bench/` — out-of-graph N=3 logs and `.time` files
+- `~/chr1_gate/` — 4-way byte-identity gate (baseline vs s8/s16/s32)
+- `runs/hprcv1-chr1-2026-08-12/tag_head_samples/hprcv1_chr1.tag_samples.s{8,16,32}`
+- `runs/hprcv1-chr1-2026-08-12/tag_head_samples/build_tag_head_samples.blockfix.log`
+
+### Commits
+
+No code changes — measurement-only entry against `720843f`.
 
 ---
