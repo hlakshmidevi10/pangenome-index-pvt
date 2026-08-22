@@ -143,6 +143,7 @@ won't have the same context you do.
 | [JR-021](#jr-021--standardized-performance-report-format-perf_report_templatemd--hprc-chr6-l25-worked-example) | 2026-08-21 | Standardized performance-report format (PERF_REPORT_TEMPLATE.md) + HPRC chr6 L=25 worked example | resolved | reporting, template, perf, benchmark, hprc, l25, noisy, vesuvio, jr-018, jr-019, tag-head-samples |
 | [JR-022](#jr-022--block-count-off-by-one-in-the-fastlocate-constructor-a-phantom-trailing-block) | 2026-08-21 | Block-count off-by-one in the FastLocate constructor: a phantom trailing block | resolved | r-index, blocks, off-by-one, sdsl, sd-vector, build_tag_head_samples, correctness, bug-fix, chr1, mc-chr6, vesuvio |
 | [JR-023](#jr-023--tag-head-sa-samples-do-not-scale-to-whole-genome-the-chr6-recommendation-inverts-on-chr1) | 2026-08-22 | Tag-head SA samples do not scale to whole-genome: the chr6 recommendation inverts on chr1 | resolved | tag-head-samples, scaling, whole-genome, perf, benchmark, chr1, hprc, flipped, vesuvio, jr-016, jr-018, jr-019 |
+| [JR-024](#jr-024--tag-array-structural-characteristics-coincidence-rate-as-the-samples-design-predictor) | 2026-08-22 | Tag-array structural characteristics: coincidence rate as the samples-design predictor | resolved | tag-head-samples, characterization, tag-array, coincidence-rate, density, chr1, mc-chr6, hprc, vesuvio |
 
 ---
 
@@ -4520,5 +4521,117 @@ rate is well below ~30%, expect the design not to pay.
 ### Commits
 
 No code changes — measurement-only entry against `720843f`.
+
+---
+
+## JR-024 — Tag-array structural characteristics: coincidence rate as the samples-design predictor
+
+```yaml
+id: JR-024
+date: 2026-08-22
+author: claude-opus-5 (session with hlakshmidevi)
+status: resolved
+tags: [tag-head-samples, characterization, tag-array, coincidence-rate, density, chr1, mc-chr6, hprc, vesuvio]
+refs:
+  follows: [JR-023]
+  supports: [JR-016, JR-018, JR-023]
+```
+
+### Context
+
+JR-023 found the samples design wins on chr6/mc-chr6 and loses badly on chr1,
+and attributed it to "tag-array density". This entry pins down the underlying
+structural quantities, defines the terms `build_tag_head_samples` reports
+(which are easy to misread), and records the measured values.
+
+### The population hierarchy
+
+Every tag run has a head — its leftmost BWT position. Each falls in exactly
+one bucket:
+
+```
+All tag runs                                  (num_tag_runs)
+├── COINCIDENT with a BWT-run head            → SA free from r-index samples[]
+│                                               never stored in the samples file
+└── tag-head candidates ("deletable")         (num_tag_runs − coincident)
+      ├── KEPT     → SA stored in .tag_samples.sN
+      └── DELETED  → SA recovered by LF-walking ≤ s steps at query time
+```
+
+Phase 1 emits only the anchor at a coincident position, so a coincident tag
+head costs **zero storage and zero query work** — its SA is already in the
+r-index. This is a *subsidy*, and its size is a property of the dataset.
+
+### Reading the reported percentages
+
+`kept:` is reported against two different denominators:
+
+| label | denominator | measures |
+|---|---|---|
+| "% of candidates" | tag-head candidates (deletable only) | how aggressive the deletion rule was |
+| "% of all tag runs" | `num_tag_runs` (incl. coincident) | true storage burden |
+
+Their ratio is the non-coincidence rate, so the subsidy can be read straight
+off any `kept:` line: chr1 `12.11/13.42 = 0.902` → 9.8% coincident;
+mc-chr6 `7.14/10.91 = 0.654` → 34.6% coincident.
+
+### Measured values
+
+| | chr6 | mc-chr6 | chr1 |
+|:--|--:|--:|--:|
+| BWT size | 31.0 Gbp | 157.1 Gbp | 45.1 Gbp |
+| BWT runs | 249.4 M | 287.4 M | 338.4 M |
+| tag runs | 710.2 M | 770.8 M | **3336.2 M** |
+| **tag runs / BWT run** | **2.85** | **2.68** | **9.86** |
+| **coincident (free SA)** | **33.9%** | **34.5%** | **9.8%** |
+| avg BWT run length | 124 bp | 547 bp | 133 bp |
+| s=8 file | 272 MB | 304 MB | **2.19 GB** |
+| s=8 kept (% all tag runs) | 7.08% | 7.14% | **12.11%** |
+| s=8 vs flipped (JR-023) | −19% ✅ | −13% ✅ | **+50%** ❌ |
+
+chr6 figures for tag runs / BWT runs / coincidence are carried from JR-016,
+not re-measured here.
+
+### Interpretation
+
+**Coincidence rate is a direct function of tag-array density.** A tag head is
+coincident when it lands on a BWT-run head; the denser the tag array relative
+to the BWT run structure, the rarer that is. At ~2.7–2.9 tag runs per BWT run
+roughly a third of tag heads are subsidised; at 9.86 only a tenth are.
+
+**BWT size is not the predictor.** mc-chr6 has 3.5× chr1's BWT and 5× chr6's,
+yet sits with chr6 on every structural measure and behaves like it. Any
+extrapolation of the samples design from "chromosome size" or "graph size" is
+unfounded; `tag_runs / bwt_runs` is the quantity that matters.
+
+**The subsidy is doubly load-bearing.** JR-016 recorded the 34% coincidence
+rate as a *storage* optimisation only. It is equally a *query-time* one: a
+coincident head never takes the slow path. Losing it raises both the file size
+and the per-emit LF cost, which is why chr1 degrades on both axes at once.
+
+**Average BWT run length is a second, independent variable.** It governs how
+much seed cost there is to eliminate (`locate_sa_value` walks ~L/2 steps).
+mc-chr6's 547 bp runs make legacy's seed cost 60% of its wall (95 s of 157 s)
+versus chr1's 36% — which is why mc-chr6 shows the design's largest absolute
+saving despite a coincidence rate no better than chr6's.
+
+**Cheap pre-flight test.** Before committing to a multi-hour build, compute
+`tag_runs / bwt_runs` from `print_stats` (seconds, no build required). Below
+~3 the design is likely viable; near 10 it is not.
+
+### Open questions
+
+1. **Where is the crossover?** Three points at 2.68 / 2.85 (win) and 9.86
+   (lose). The transition is unlocated — anything between 3 and 9 would
+   narrow it.
+2. **What drives tag density?** chr1 packs 4.7× more tag runs onto 1.4× more
+   BWT runs than chr6. Whether that is graph complexity, node fragmentation
+   after `-m 1024` chopping, or a chr1-specific property is unexamined.
+3. **Log naming collision.** `candidates` denotes two different populations:
+   Phase 1's `candidates emitted:` (3,348,609,586 on chr1) is anchors + tag
+   heads, while the per-`s` `% of candidates` (3,010,177,026) is tag heads
+   only. Computing `kept / candidates_emitted` yields 12.06% instead of the
+   reported 13.42%. Renaming to `total candidates (anchors + tag-heads)` and
+   `% of deletable tag heads` would remove the trap.
 
 ---
