@@ -144,6 +144,7 @@ won't have the same context you do.
 | [JR-022](#jr-022--block-count-off-by-one-in-the-fastlocate-constructor-a-phantom-trailing-block) | 2026-08-21 | Block-count off-by-one in the FastLocate constructor: a phantom trailing block | resolved | r-index, blocks, off-by-one, sdsl, sd-vector, build_tag_head_samples, correctness, bug-fix, chr1, mc-chr6, vesuvio |
 | [JR-023](#jr-023--tag-head-sa-samples-do-not-scale-to-whole-genome-the-chr6-recommendation-inverts-on-chr1) | 2026-08-22 | Tag-head SA samples do not scale to whole-genome: the chr6 recommendation inverts on chr1 | resolved | tag-head-samples, scaling, whole-genome, perf, benchmark, chr1, hprc, flipped, vesuvio, jr-016, jr-018, jr-019 |
 | [JR-024](#jr-024--tag-array-structural-characteristics-coincidence-rate-as-the-samples-design-predictor) | 2026-08-22 | Tag-array structural characteristics: coincidence rate as the samples-design predictor | resolved | tag-head-samples, characterization, tag-array, coincidence-rate, density, chr1, mc-chr6, hprc, vesuvio |
+| [JR-025](#jr-025--correction-to-jr-023-emit-volume-not-coincidence-rate-drives-samples-query-cost) | 2026-08-22 | Correction to JR-023: emit volume, not coincidence rate, drives samples query cost | resolved | tag-head-samples, correction, model, emit-volume, perf, chr1, mc-chr6, vesuvio |
 
 ---
 
@@ -4522,6 +4523,10 @@ rate is well below ~30%, expect the design not to pay.
 
 No code changes — measurement-only entry against `720843f`.
 
+> Mechanism corrected by JR-025 (2026-08-22): query cost is driven by emit
+> volume, not by the coincidence rate. The findings and recommendation in this
+> entry stand; the explanation in "Interpretation" does not.
+
 ---
 
 ## JR-024 — Tag-array structural characteristics: coincidence rate as the samples-design predictor
@@ -4633,5 +4638,110 @@ saving despite a coincidence rate no better than chr6's.
    only. Computing `kept / candidates_emitted` yields 12.06% instead of the
    reported 13.42%. Renaming to `total candidates (anchors + tag-heads)` and
    `% of deletable tag heads` would remove the trap.
+
+---
+
+## JR-025 — Correction to JR-023: emit volume, not coincidence rate, drives samples query cost
+
+```yaml
+id: JR-025
+date: 2026-08-22
+author: claude-opus-5 (session with hlakshmidevi)
+status: resolved
+tags: [tag-head-samples, correction, model, emit-volume, perf, chr1, mc-chr6, vesuvio]
+refs:
+  follows: [JR-024]
+  corrects: [JR-023]
+```
+
+### Context
+
+JR-023 explained chr1's poor samples performance by its collapsed coincidence
+rate (9.8% vs chr6's 33.9%), reasoning that fewer free SAs means more slow-path
+LF walks. The mc-chr6 benchmark run afterwards produced fast-path measurements
+that contradict that explanation. JR-023's findings and recommendation stand;
+its stated mechanism does not.
+
+### The contradiction
+
+If coincidence rate drove query cost, chr1 should show the worst fast-path hit
+rate. It shows the **best**:
+
+| dataset / readset | fast-path @ s=8 | s=8 vs flipped |
+|:--|--:|--:|
+| **chr1 in-graph** | **14.02%** | **+50%** ❌ |
+| mc-chr6 hg002 | 13.51% | −13% ✅ |
+| chr1 out-of-graph | 13.73% | +20% ❌ |
+| chr6 (JR-018) | 12.27% | −19% ✅ |
+| mc-chr6 alt_noisy | 12.11% | −32% ✅ |
+
+The ordering is essentially uncorrelated with the outcome. Miss rate is not the
+discriminator.
+
+### What actually differs
+
+Per-query **emit volume** — the number of tag-run records needing SA
+resolution, measured directly as `.bin` bytes / 16:
+
+| | chr1 in-graph | mc-chr6 alt_noisy | mc-chr6 hg002 |
+|:--|--:|--:|--:|
+| emits (records) | **36.53 M** | 1.74 M | 5.03 M |
+| fast-path rate | 14.02% | 12.11% | 13.51% |
+| slow-path resolutions | 31.4 M | 1.53 M | 4.35 M |
+| avg LF steps / slow | 3.44 | 2.98 | 3.31 |
+| **slow-path LF ops** | **108.0 M** | **4.55 M** | 14.4 M |
+| ≈ cost @ 634 ns (JR-017) | **68.5 s** | 2.9 s | 9.1 s |
+
+chr1 performs **21× more emits** than mc-chr6/alt_noisy at a *higher* hit rate,
+so it pays ~24× the slow-path LF cost.
+
+**The model closes quantitatively.** chr1 in-graph: legacy 143.42 s → s=8
+140.84 s, a net −2.6 s. Predicted: ~71 s of eliminated seed cost minus ~68.5 s
+of slow-path cost = −2.5 s. The two nearly cancel, which is exactly the
+observed "s=8 barely beats legacy" result.
+
+### Corrected model
+
+```
+samples net gain = seed_cost_eliminated
+                 − (emits × (1 − fast_path_rate) × avg_LF_steps × ~634 ns)
+```
+
+- **Coincidence rate** governs **storage** (how many samples must be stored) —
+  JR-024's role for it is correct.
+- **Emit volume** governs **query cost**, and is set by tag-array density and
+  by how well the reads match the graph.
+- **Average BWT run length** governs the size of the term being eliminated
+  (`locate_sa_value` walks ~L/2), which is why mc-chr6's 547 bp runs produce
+  the largest absolute saving.
+
+The two are correlated — dense tag arrays yield both low coincidence and high
+emit volume — which is why JR-023's explanation fitted three datasets while
+being the wrong causal variable. mc-chr6's two readsets separate them: same
+graph, same coincidence rate, 2.9× the emits on `hg002`, and the margin falls
+from −32% to −13%. Coincidence rate cannot explain that; emit volume does.
+
+### Secondary caveat on JR-023's numbers
+
+Both chr1 benchmarks ran while mc-chr6's single-threaded build occupied one
+core; both mc-chr6 benchmarks ran on a quiet machine. Relative deltas within
+each run are sound (constant load, contiguous per-mode ordering), but the two
+halves of the cross-dataset comparison were **not measured under identical
+conditions**. The chr1 absolute walls are inflated by an unquantified amount.
+A clean-machine re-run of both chr1 benchmarks (~2 h) would remove this.
+
+### Open questions
+
+1. **Predict from emit volume before building.** Emit count is measurable from
+   a single `find_mems` run against an existing index (no samples file needed),
+   so the corrected model is testable in ~2 min per dataset rather than hours.
+   That is a better pre-flight test than JR-024's `tag_runs / bwt_runs` proxy.
+2. **hg002 s=32 was never run** (benchmark paused). s=16 had already crossed
+   into a loss, so it would not change the conclusion, but the curve is
+   incomplete.
+
+### Commits
+
+No code changes — measurement-only entry against `f3cedcf`.
 
 ---
