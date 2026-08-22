@@ -141,6 +141,7 @@ won't have the same context you do.
 | [JR-019](#jr-019--flipped-vs-legacys8-end-to-end-perf-on-hprc-chr6-alt-noisy-l25-vs-l50) | 2026-08-12 | Flipped vs Legacy+s=8 end-to-end perf on HPRC chr6 alt-noisy: L=25 vs L=50 | resolved | perf, benchmark, hprc, alt-noisy, l25, l50, samples, jr-018 |
 | [JR-020](#jr-020--convert_tags-decoded-sdsl-header-as-bytecode-latent-bug-hit-by-hprcv1-chr1-build) | 2026-08-13 | convert_tags decoded SDSL header as ByteCode: latent bug hit by HPRCv1 chr1 build | resolved | convert_tags, build_tags, sdsl, int_vector_buffer, tag-arrays, correctness, hprc, chr1, bug-fix |
 | [JR-021](#jr-021--standardized-performance-report-format-perf_report_templatemd--hprc-chr6-l25-worked-example) | 2026-08-21 | Standardized performance-report format (PERF_REPORT_TEMPLATE.md) + HPRC chr6 L=25 worked example | resolved | reporting, template, perf, benchmark, hprc, l25, noisy, vesuvio, jr-018, jr-019, tag-head-samples |
+| [JR-022](#jr-022--block-count-off-by-one-in-the-fastlocate-constructor-a-phantom-trailing-block) | 2026-08-21 | Block-count off-by-one in the FastLocate constructor: a phantom trailing block | resolved | r-index, blocks, off-by-one, sdsl, sd-vector, build_tag_head_samples, correctness, bug-fix, chr1, mc-chr6, vesuvio |
 
 ---
 
@@ -4103,5 +4104,219 @@ Plus fresh for this entry:
 
 No code changes. `PERF_REPORT_TEMPLATE.md` added to this repo (this commit);
 no changes to `find_mems`/`gafpack`/harness code.
+
+---
+
+## JR-022 — Block-count off-by-one in the FastLocate constructor: a phantom trailing block
+
+```yaml
+id: JR-022
+date: 2026-08-21
+author: claude-opus-5 (session with hlakshmidevi)
+status: resolved
+tags: [r-index, blocks, off-by-one, sdsl, sd-vector, build_tag_head_samples, correctness, bug-fix, chr1, mc-chr6, vesuvio]
+refs:
+  follows: [JR-020, JR-021]
+benchmark-platform: vesuvio (Linux 6.12.73 x86_64, Debian)
+```
+
+### Context
+
+`build_tag_head_samples` aborted on HPRCv1 chr1 with an SDSL assertion:
+
+```
+sdsl/int_vector.hpp:1443: ... operator[]: Assertion `idx < this->size()' failed.
+```
+
+It died **after** Phase 1's BWT walk logged 100% (all 338,432,560 runs) but
+**before** the `candidates emitted:` summary printed — burning 2h25m each
+time. Two attempts failed identically (2026-08-13 and, with added bounds
+checks, 2026-08-15). Those diagnostics never fired, which was itself a clue.
+
+While investigating, a second casualty turned up: **HPRCv2 MC chr6 had
+crashed the same way on 2026-08-14** (log stops at "Phase 1: enumerate
+candidates...", zero output files, ~32 min in). That failure was never
+recorded anywhere; JR-016/018 only ever reported chr6 success.
+
+### Hypothesis
+
+The constructor sizes `blocks` and `blocks_start_pos` with **different
+formulas** (`src/r-index.cpp`):
+
+```cpp
+blocks.resize((total_runs / block_size) + 1);                  // line 1127: floor + 1
+sd_vector_builder block_sd_builder(bwt_size(),
+    (total_runs / block_size) + (total_runs % block_size != 0)); // line 1143: ceil
+```
+
+These agree only when `block_size` (10) does **not** divide `total_runs`.
+When it does, `blocks` gains a trailing block that is never filled, yet is
+still serialized and counted by `num_blocks()` — with no corresponding
+1-bit in `blocks_start_pos`.
+
+Prediction: crash iff `total_runs % 10 == 0`.
+
+### Method
+
+Rather than reproduce (2.5h/attempt, no core dump — `ulimit -c` is 0), wrote
+`src/probe_blocks.cpp`: loads a `.ri` and reports `num_blocks()` vs the
+1-bits in `blocks_start_pos`, plus how the trailing blocks decode. **~3 s per
+index against files already on disk.**
+
+### Findings
+
+**Perfect correlation across the whole index fleet** (run counts from
+`08_print_stats.log`):
+
+| Dataset | BWT runs | `%10` | `num_blocks()` | `blocks_start_pos` ones | mismatch | outcome |
+|:--|--:|--:|--:|--:|--:|:--|
+| hprcv1 chr6 | 249,445,481 | 1 | 24,944,549 | 24,944,549 | **0** | ✅ worked (JR-016/018) |
+| **hprcv1 chr1** | 338,432,560 | **0** | 33,843,257 | 33,843,**256** | **1** | ❌ crashed |
+| **hprcv2 MC chr6** | 287,351,380 | **0** | 28,735,139 | 28,735,**138** | **1** | ❌ crashed |
+| hprcv1 MC chr6 | 246,861,799 | 9 | — | — | — | untested, predicted safe |
+| hprcv2 chr18 | 141,430,719 | 9 | — | — | — | untested, predicted safe |
+| hprcv2 chr6 | 291,744,113 | 3 | — | — | — | untested, predicted safe |
+| yeast235 chrII | 14,033,362 | 2 | — | — | — | ✅ worked |
+
+Exactly the two `%10 == 0` indexes are the two that crashed. Same code, same
+`block_size`, same `C.size()`=6 — only `runs % 10` differs.
+
+**The full mechanism** (each link observed, not inferred):
+
+1. `blocks.resize(floor+1)` creates a phantom block when `10 | total_runs`.
+2. `Run_blocks() : character_cum_ranks(8)` (r-index.hpp:154) hardcodes **8**
+   cum-rank slots; the real alphabet is `C.size()` = **6**.
+3. `serialize_encoded` loops over *all* blocks writing
+   `get_cum_ranks().size()` varints — so **8 zero-bytes** for the untouched
+   phantom block. Confirmed on disk: `start_bits[33843256] = 1523612419`,
+   stream size `1523612427` → **exactly 8 bytes**.
+4. On decode, `skip_header` consumes only `C.size()` = 6 varints. The
+   **2 leftover `0x00` bytes decode as valid run headers** (`prefix=0` →
+   `run_length=1`), so `get_block_runs()` returns the phantom block as
+   **non-empty**: `2 runs: (sym=10,len=1) (sym=10,len=1)` — `sym=10` is
+   `nuc[0]`, not real sequence.
+5. Non-empty ⇒ `BwtRunHeadIter::load_current_block()` takes the branch calling
+   `blocks_start_select_1(num_blocks)`.
+6. sdsl's `select_support_sd_trait<1>::select` (sd_vector.hpp:930) does
+   `v->low[i-1]` **with no bounds check**; `low` is an `int_vector<0>` of size
+   `ones`. Reading `low[ones]` fires the assertion.
+
+This happens inside `bwt_iter.advance()` — *after* the 100% progress print and
+*before* the loop re-tests — which is exactly why the JR-2026-08-15 bounds
+checks (in the loop body) never fired and `candidates emitted:` never printed.
+
+**Blast radius is narrow.** Query paths reach blocks via
+`blocks_start_pos.predecessor()`, which can never return the phantom block
+(no 1-bit). Only *sequential* block iteration trips it, and `BwtRunHeadIter`
+in `build_tag_head_samples` is its sole user. The affected `.ri` files were
+producing correct `find_mems`/genotyping output the whole time.
+
+### Fix
+
+Three changes (commit `10b83af`):
+
+1. `r-index.cpp:1127` — size `blocks` with the same ceiling expression as
+   `block_sd_builder`.
+2. `r-index.cpp:373` — serialize exactly `C.size()` cum-rank varints, so
+   writer and reader cannot desynchronize regardless of a block's own vector
+   length. No-op for real blocks (they always hold `C.size()` entries).
+3. `r-index.hpp:154` — drop the fabricated `8` from `Run_blocks`.
+
+Verified the constructor never indexes `blocks[ceil]`: when `10 | total_runs`
+the loop exits before touching it; otherwise the tail path at line 1282 uses
+`ceil-1`.
+
+### Verification
+
+**Byte-identity gate.** For any index with `runs % 10 != 0`, `floor+1 == ceil`,
+so the rebuilt `.ri` must be *byte-identical* — a free proof the fix is inert
+where it should be:
+
+| Dataset | `.ri` after rebuild | mismatch | build_rindex wall |
+|:--|:--|--:|--:|
+| yeast235 | **byte-identical** (`03f0b1ad…`) | 0 → 0 | 6.5 s |
+| chr6 | **byte-identical** (`75a9022c…`) | 0 → 0 | 7:45 |
+| **chr1** | −1 block, **−8 bytes** (5,465,354,069 → …061) | **1 → 0** | 12:57 |
+| **mc-chr6** | −1 block, **−8 bytes** (4,730,096,845 → …837) | **1 → 0** | 30:56 |
+
+Both affected indexes shrank by *exactly* 8 bytes and one block — the
+quantitative prediction from step 3 above. Trailing blocks now decode to real
+runs instead of `sym=10` garbage.
+
+**Full projection pipeline** (find_mems → gafpack → validate_gaf):
+
+| Dataset | Coverage MD5 | vs baseline | validate_gaf |
+|:--|:--|:--|:--|
+| yeast235 | `1baf368f3cdc59890f88410cc34cc051` | ✅ | 2000/2000 |
+| chr6 | `60f6b8e4a759aebb252b83a870b9ff8c` | ✅ gold (JR-012/13/18/19/20) | 2000/2000 |
+| chr1 | `9197ee230c283e816e6119f16feb2f8b` | ✅ exact | 2000/2000 |
+
+chr1 is the load-bearing row: its `.ri` genuinely changed content, and the
+pipeline still produced byte-identical coverage — confirming the phantom block
+was unreachable from the query path.
+
+mc-chr6 was verified by a stronger single-variable A/B instead (its stored
+baselines' `FIND_MEMS_EXTRA_FLAGS` were unrecorded, so a historical comparison
+could not distinguish "fix broke something" from "wrong flag"): `find_mems`
+output old-`.ri` vs new-`.ri`, same binary, minutes apart. Byte-identical in
+**both** finder modes — legacy (`189301f1…`) and flipped (`b385b1cf…`). Since
+gafpack never reads the `.ri`, identical `find_mems` output makes the whole
+downstream chain identical by construction.
+
+**Resolution.** `build_tag_head_samples` then completed on chr1 for the first
+time: wall 3:46:56, peak RSS 95.3 GB, exit 0, and `1000/1000` kept-SA +
+`100/100` deleted-head probes on each of s=8/16/32. Phase 1's candidate and
+`locateNext` counters matched the crashed run *exactly* at every 2.5%
+checkpoint through 100% (3,348,609,586 candidates), so the fix removed the
+phantom block and perturbed nothing else.
+
+### Interpretation
+
+Same shape as JR-020: **latent, data-dependent, and silent by arithmetic
+coincidence.** JR-020 turned on whether a file's SDSL header bytes happened to
+decode with `node_id == 0`; this one turns on whether `block_size` divides
+`total_runs`. Both went undetected for months because the datasets in use
+happened to land on the safe side, and both surfaced on chr1.
+
+Two compounding defects were required. The block-count off-by-one alone would
+have been harmless — an empty trailing block decodes to nothing and gets
+skipped. It only became fatal because `character_cum_ranks(8)` disagreed with
+`C.size()`, turning padding into phantom runs. Neither is dangerous alone;
+together they abort a 2.5-hour job.
+
+**Process note.** The probe was the whole difference: it converted a
+"reproduce for 2.5 h and hope for a backtrace" problem into a 3-second query
+against existing files, and turned a plausible story into a controlled
+experiment across three indexes. Worth reaching for earlier when a long job
+fails at scale.
+
+### Open questions
+
+1. **Other unchecked `select_1` call sites.** sdsl's `select_support_sd`
+   does an unguarded `low[i-1]`. Any caller passing a rank derived from a
+   *different* structure's size can fault the same way. A sweep of
+   `blocks_start_select_1` / `last_select_1` callers for that pattern would
+   say whether this class of bug has siblings.
+2. **Should `num_blocks()` be derived from `blocks_start_pos` instead of
+   `blocks_encoded_start_bits.size()`?** That would make the two structures
+   incapable of disagreeing, rather than relying on the constructor keeping
+   them in sync.
+3. **Untested indexes.** hprcv1-MC-chr6, hprcv2-chr18 and hprcv2-chr6 are
+   predicted safe from their run counts but were not rebuilt. `probe_blocks`
+   settles each in ~3 s if they are ever used with a sequential block walk.
+
+### Commits (branch `tag-head-samples`)
+
+- `10b83af` r-index: fix block-count off-by-one that corrupts sequential block walks
+- `1fe287a` probe_blocks: diagnostic for block-count / blocks_start_pos consistency
+
+### Data artifacts (vesuvio)
+
+- `runs/hprcv1-chr1-2026-08-12/hprcv1_chr1.ri.pre-blockfix` — pre-fix index
+- `runs/hprcv2-mc-chr6-2026-06-07/hprcv2-mc-chm13-chr6.ri.pre-blockfix`
+- `runs/hprcv1-chr1-2026-08-12/tag_head_samples/build_tag_head_samples.blockfix.log`
+  — the successful run; `.debug.log` alongside it is the 2026-08-15 crash
+- `runs/*/queries/blockfix-verify/lightweight/` — pipeline verification runs
+- `~/mcchr6_ab/` — mc-chr6 old-vs-new `find_mems` A/B outputs
 
 ---
