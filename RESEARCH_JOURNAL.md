@@ -4377,11 +4377,13 @@ Index `hprcv1_chr1.ri` (post-JR-022), L=25, MIN_OCC=1.
 
 Both 100K × 200 bp.
 
-**Caveat:** run concurrently with mc-chr6's `build_tag_head_samples` (one
-single-threaded process on a 96-core host). Load was constant across all arms
-and ordering was contiguous, so relative deltas hold; absolute walls are
-inflated. Per-trial spread was ±0.3 s on most arms, so the inflation is
-systematic rather than noisy.
+> **Revised 2026-08-22.** The flipped / legacy / s=8 rows below were originally
+> measured while mc-chr6's `build_tag_head_samples` occupied one core, and have
+> been replaced with clean-machine N=3 re-runs. The contamination proved
+> **non-uniform** (−0.3% to −10.2% depending on mode and readset), so the
+> original relative deltas were distorted, not merely scaled — one conclusion
+> changed sign (see C). s=16 and s=32 were not re-run and remain the original
+> loaded-run values, marked inline.
 
 ### Findings
 
@@ -4416,21 +4418,31 @@ to the slow path.
 
 | config | median | RSS | vs legacy | vs flipped | fast-path |
 |:--|--:|--:|--:|--:|--:|
-| **flipped** | **94.19 s** | 9403 MB | −34% | — | — |
-| legacy + s8 | 140.84 s | 11662 MB (+24.0%) | −1.8% | **+50%** | 14.02% |
-| legacy | 143.42 s | 9403 MB | — | +52% | — |
-| legacy + s16 | 219.06 s | 10462 MB (+11.3%) | +53% | +133% | 6.45% |
-| legacy + s32 | 379.91 s | 9914 MB (+5.4%) | +165% | **+303%** | 3.05% |
+| **flipped** | **89.40 s** | 9403 MB | −34% | — | — |
+| legacy | 134.48 s | 9403 MB | — | +50% | — |
+| legacy + s8 | 136.23 s | 11663 MB (+24.0%) | **+1.3%** | **+52%** | 14.02% |
+| legacy + s16 *(loaded)* | 219.06 s | 10462 MB (+11.3%) | +63% | +145% | 6.45% |
+| legacy + s32 *(loaded)* | 379.91 s | 9914 MB (+5.4%) | +182% | **+325%** | 3.05% |
+
+**s=8 is slower than plain legacy (+1.3%), not faster.** On the loaded run it
+appeared to win by 1.8%; the clean re-run reverses the sign. So on chr1's
+realistic in-graph workload the samples design delivers **no benefit at all**
+over the legacy baseline, while costing +2.26 GB of resident memory.
 
 **D. Perf, out-of-graph (HG00097, L=25, N=3 medians).**
 
 | config | median | RSS | vs legacy | vs flipped | fast-path |
 |:--|--:|--:|--:|--:|--:|
-| **flipped** | **76.97 s** | 8579 MB | −33% | — | — |
-| legacy + s8 | 92.55 s | 10839 MB (+26.4%) | −20% | +20% | 13.73% |
-| legacy | 115.41 s | 8578 MB | — | +50% | — |
-| legacy + s16 | 120.55 s | 9637 MB (+12.3%) | +4% | +57% | 6.43% |
-| legacy + s32 | 184.40 s | 9090 MB (+6.0%) | +60% | +140% | 3.07% |
+| **flipped** | **76.71 s** | 8578 MB | −33% | — | — |
+| legacy + s8 | 83.09 s | 10839 MB (+26.3%) | **−27%** | **+8.3%** | 13.73% |
+| legacy | 113.75 s | 8579 MB | — | +48% | — |
+| legacy + s16 *(loaded)* | 120.55 s | 9637 MB (+12.3%) | +6% | +57% | 6.43% |
+| legacy + s32 *(loaded)* | 184.40 s | 9090 MB (+6.0%) | +62% | +140% | 3.07% |
+
+On the clean machine s=8 improves markedly here (−20% → −27% vs legacy;
++20% → +8.3% vs flipped) — the opposite direction to the in-graph readset.
+This mode- and readset-dependent sensitivity to background load is why the
+original numbers could not simply be rescaled.
 
 **E. The direct like-for-like comparison — the result inverts.**
 
@@ -4438,9 +4450,9 @@ Same L=25, same HG00438 alt-noisy readset family, same metric:
 
 | | chr6 (JR-019) | chr1 in-graph | |
 |:--|--:|--:|:--|
-| flipped | 48.34 s | 94.19 s | |
-| legacy + s8 | 39.10 s | 140.84 s | |
-| **s8 vs flipped** | **−19.1%** ✅ | **+49.5%** ❌ | **reversed** |
+| flipped | 48.34 s | 89.40 s | |
+| legacy + s8 | 39.10 s | 136.23 s | |
+| **s8 vs flipped** | **−19.1%** ✅ | **+52.4%** ❌ | **reversed** |
 
 **F. Correctness preserved throughout.** All samples configs produce `.bin` and
 `seq_id_starts` byte-identical to the legacy baseline on both readsets. Flipped's
@@ -4464,11 +4476,12 @@ rate kept the slow-path fraction down, low tag density kept emits per MEM down,
 and the seed cost being replaced was proportionally large. On chr1 all three move
 against it at once. The seed saving is fixed; the replacement cost is not.
 
-**s=8 is the only setting that beats legacy at all (−1.8% in-graph), and it is
-the one that busts the +10% RSS ceiling — by 2.4×.** The only setting inside the
-ceiling (s=32) is 4× slower than flipped. There is no viable operating point.
+**On the in-graph workload no `s` value beats even the legacy baseline** — s=8
+is +1.3%, and it is also the setting that busts the +10% RSS ceiling, by 2.4×.
+The only setting inside the ceiling (s=32) is ~4× slower than flipped. There is
+no viable operating point.
 
-**In-graph is markedly harsher than out-of-graph** (s=8: −1.8% vs −20% relative
+**In-graph is markedly harsher than out-of-graph** (s=8: +1.3% vs −27% relative
 to legacy). In-graph reads match the pangenome more, producing more MEMs and more
 tag-run emits per MEM — precisely the quantity the slow-path cost scales with,
 while the seed saving does not. Anyone extrapolating from out-of-graph numbers
@@ -4695,10 +4708,11 @@ resolution, measured directly as `.bin` bytes / 16:
 chr1 performs **21× more emits** than mc-chr6/alt_noisy at a *higher* hit rate,
 so it pays ~24× the slow-path LF cost.
 
-**The model closes quantitatively.** chr1 in-graph: legacy 143.42 s → s=8
-140.84 s, a net −2.6 s. Predicted: ~71 s of eliminated seed cost minus ~68.5 s
-of slow-path cost = −2.5 s. The two nearly cancel, which is exactly the
-observed "s=8 barely beats legacy" result.
+**The model closes quantitatively.** chr1 in-graph (clean-machine N=3):
+legacy 134.48 s → s=8 136.23 s, a net **+1.75 s**. Predicted: ~66.8 s of
+eliminated seed cost minus ~68.5 s of slow-path cost = +1.7 s. The two terms
+very nearly cancel with the slow path marginally ahead — which is exactly the
+observed result that s=8 fails to beat even the legacy baseline on chr1.
 
 ### Corrected model
 
@@ -4721,14 +4735,42 @@ being the wrong causal variable. mc-chr6's two readsets separate them: same
 graph, same coincidence rate, 2.9× the emits on `hg002`, and the margin falls
 from −32% to −13%. Coincidence rate cannot explain that; emit volume does.
 
-### Secondary caveat on JR-023's numbers
+### Background-load contamination: measured, and it was not uniform
 
-Both chr1 benchmarks ran while mc-chr6's single-threaded build occupied one
-core; both mc-chr6 benchmarks ran on a quiet machine. Relative deltas within
-each run are sound (constant load, contiguous per-mode ordering), but the two
-halves of the cross-dataset comparison were **not measured under identical
-conditions**. The chr1 absolute walls are inflated by an unquantified amount.
-A clean-machine re-run of both chr1 benchmarks (~2 h) would remove this.
+> **Revised 2026-08-22.** Originally this section flagged the chr1 benchmarks as
+> running under background load and recommended a clean re-run. That re-run has
+> since been done (flipped / legacy / s=8, both readsets, N=3, quiet machine)
+> and the numbers above are the clean ones.
+
+Both chr1 benchmarks originally ran while mc-chr6's single-threaded build
+occupied one core; both mc-chr6 benchmarks ran on a quiet machine. The
+assumption at the time was that constant load plus contiguous per-mode ordering
+would preserve relative deltas. **That assumption was wrong.**
+
+| readset | mode | loaded | clean | recovery |
+|:--|:--|--:|--:|--:|
+| in-graph | flipped | 94.19 s | 89.40 s | −5.1% |
+| in-graph | legacy | 143.42 s | 134.48 s | −6.2% |
+| in-graph | s=8 | 140.84 s | 136.23 s | −3.3% |
+| out-of-graph | flipped | 76.97 s | 76.71 s | −0.3% |
+| out-of-graph | legacy | 115.41 s | 113.75 s | −1.4% |
+| out-of-graph | s=8 | 92.55 s | 83.09 s | **−10.2%** |
+
+Recovery ranged from 0.3% to 10.2% and varied by both mode and readset, so the
+contamination was a **distortion, not a scale factor**. It changed one
+conclusion's sign: in-graph s=8 vs legacy went from −1.8% (a marginal win) to
++1.3% (a marginal loss). Clean-machine per-trial spread was ±0.1 s on most arms
+versus up to ±4 s loaded.
+
+s=16 and s=32 were not re-run; those rows in JR-023 remain loaded-run values and
+are marked as such.
+
+**Methodological note.** "Load is constant across arms, so relative deltas hold"
+is not safe for memory-latency-bound workloads. Modes with different working-set
+sizes contend differently for cache and memory bandwidth — here s=8 carries an
+extra 2.19 GB resident, and it was the arm whose sensitivity differed most.
+Benchmarks that will be compared against each other should be run on a quiet
+machine, not merely under equal load.
 
 ### Open questions
 
