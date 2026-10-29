@@ -145,6 +145,9 @@ won't have the same context you do.
 | [JR-023](#jr-023--tag-head-sa-samples-do-not-scale-to-whole-genome-the-chr6-recommendation-inverts-on-chr1) | 2026-08-22 | Tag-head SA samples do not scale to whole-genome: the chr6 recommendation inverts on chr1 | resolved | tag-head-samples, scaling, whole-genome, perf, benchmark, chr1, hprc, flipped, vesuvio, jr-016, jr-018, jr-019 |
 | [JR-024](#jr-024--tag-array-structural-characteristics-coincidence-rate-as-the-samples-design-predictor) | 2026-08-22 | Tag-array structural characteristics: coincidence rate as the samples-design predictor | resolved | tag-head-samples, characterization, tag-array, coincidence-rate, density, chr1, mc-chr6, hprc, vesuvio |
 | [JR-025](#jr-025--correction-to-jr-023-emit-volume-not-coincidence-rate-drives-samples-query-cost) | 2026-08-22 | Correction to JR-023: emit volume, not coincidence rate, drives samples query cost | resolved | tag-head-samples, correction, model, emit-volume, perf, chr1, mc-chr6, vesuvio |
+| [JR-026](#jr-026--hg002-performance-reversal-traced-to-a-real-pericentromeric-repeat-not-a-bug) | 2026-08-25 | HG002 performance reversal traced to a real pericentromeric repeat, not a bug | resolved | hg002, repeat, pericentromeric, tag-head-samples, correctness-audit, hprc, chr6, vesuvio |
+| [JR-027](#jr-027--chr1-hg002-clean-tail-traced-to-a-near-universal-hsat2-locus-mc-chr1-clips-almost-every-sample-there-not-just-hg002) | 2026-08-27 | chr1 HG002-clean tail traced to a near-universal HSAT2 locus; MC-chr1 clips almost every sample there, not just HG002 | resolved | hg002, chr1, hsat2, satellite, repeat, mc-chr1, benchmark-graph, correctness-audit, hprc, vesuvio |
+| [JR-028](#jr-028--holdout-confirmation-chr1-vs-chr6-hg002-tail-removal-diverges-because-of-tag-density-clipping-and-reference-anchored-collapse) | 2026-08-27 | Holdout confirmation: chr1 vs chr6 HG002 tail removal diverges because of tag density, clipping, and reference-anchored collapse | resolved | hg002, chr1, chr6, hsat2, pericentromeric, holdout, tag-density, clipping, mc, pggb, tag-head-samples, hprc, vesuvio |
 
 ---
 
@@ -4785,5 +4788,405 @@ machine, not merely under equal load.
 ### Commits
 
 No code changes — measurement-only entry against `f3cedcf`.
+
+---
+
+## JR-026 — HG002 performance reversal traced to a real pericentromeric repeat, not a bug
+
+```yaml
+id: JR-026
+date: 2026-08-25
+author: claude-sonnet-5 (session with hlakshmidevi)
+status: resolved
+tags: [hg002, repeat, pericentromeric, tag-head-samples, correctness-audit, hprc, chr6, vesuvio]
+refs:
+  follows: [JR-021]
+```
+
+### Context
+
+JR-018/019/021 recommended `legacy+tag-head-samples(s=8)` as the new default
+based on in-graph HPRC chr6 benchmarks. On HG002 reads (not a sample in
+HPRCv1 chr6), the win **reverses**: `legacy+s8` runs ~29% slower end-to-end
+than `flipped` (single-trial, L=25, noisy). Given JR-004/007's history with a
+real bug (Risk E) producing a superficially similar symptom, this needed the
+same standard of proof before trusting either the numbers or an explanation.
+
+> Note on numbering: this entry was originally drafted as JR-022 before a
+> collision was discovered with a concurrent session's JR-022-025 (the
+> block-count off-by-one fix and the whole-genome tag-head-samples scaling
+> work below). Renumbered to JR-026 per the append-only convention; the
+> content is otherwise unchanged from the original draft.
+
+### Method
+
+`test_flipped_mems` + `dump_mem_size_distribution` (correctness),
+`find_mems --debug-classify` (per-MEM `num_tag_runs`), targeted
+`find_mems --tsv` + `gafpack` runs on specific reads/MEM subsets to recover
+real node IDs, path names, and `path_bp` coordinates, `verify_tag_runs`
+(independent tag-array ground truth), and the official HPRC
+`hprc-v2.0-mc-chm13.missing.tar.gz` clip-interval release for
+cross-validation. All against `hprc-chr6-2026-06-02` (HPRCv1) unless noted.
+
+### Findings
+
+**Correctness -- not a Risk-E-style bug.**
+
+| Check | Result |
+|:--|:--|
+| `test_flipped_mems`, 20K HG002 reads | 0 flipped-missed, 0 flipped-extra, 0 legacy-spurious, 0 SA mismatches |
+| `dump_mem_size_distribution` left-maximality, both datasets | 0 violations |
+| `verify_tag_runs` (independent GFA-path walker) | 710,216,152 / 710,216,158 valid runs (99.9999%); 6 "invalid" are a known sequence-boundary edge case (count = 2x1,410 = sequence count) |
+
+**Performance (single-trial, L=25, noisy, not yet N=3-confirmed).**
+
+| | flipped | legacy+s8 | delta |
+|:--|--:|--:|--:|
+| find_mems | 57.37s | 81.28s | +41.7% |
+| Total wall (find_mems+gafpack) | 84.28s | 109.07s | **+29.4%** |
+
+**Cost is extremely concentrated.** Of 253,872 HG002 MEMs: top 622 (0.25%)
+= **83.32%** of all tag-run volume; top 1,000 (0.4%) = **93.85%**.
+
+**All of it traces to one locus.** 100% of the top-622 MEMs (by
+`num_tag_runs`) have a grch38 hit inside the region; 8 of 9 hand-picked
+high-volume reads independently converge on the same locus. Exact
+coordinates (real `path_bp`, not approximated):
+
+| Reference | Range | Span |
+|:--|:--|--:|
+| GRCh38 | chr6:58,450,165 - 61,323,106 | 2.87 Mb |
+| CHM13 | chr6:56,971,285 - 61,352,367 | 4.38 Mb |
+
+**Sequence evidence.** ~340bp repeat unit (~2x171bp alpha-satellite monomer
+-- consistent with a dimeric HOR, not independently confirmed as D6Z1's
+actual unit size). Node IDs are capped at exactly 1024bp (`gfa2gbwt -m
+1024`); GFA edge topology shows this causes only a ~3x secondary
+node-splitting effect. The dominant driver (~382x) is cross-haplotype
+non-collapse: PGGB did not merge this repeat's copies across 382 distinct
+haplotypes/contigs into shared graph structure.
+
+**Web-sourced corroboration.** Region confirmed pericentromeric; chr6
+centromere position (~59.8Mb, per search) matches our median (59.23Mb);
+GRCh38's documented centromeric incompleteness ("reference models," not
+fully assembled sequence) explains why CHM13 shows a wider span than
+GRCh38. Officially confirmed against HPRC's own `HG002.{1,2}.bed` (from
+`hprc-v2.0-mc-chm13.missing.tar.gz`): HG002's hap1/hap2 copies of
+chr6:58.4-63.8Mb are marked `missing` (clipped) from the HPRCv2-MC graph --
+overlapping our independently-computed range almost exactly.
+
+**Provenance of the source sequence confirms this.**
+`chr6.hg002_noisy.reads.txt` was generated via:
+```
+vg paths -x hprcv2/chr6.gbz -F -S HG002 | \
+    awk '/^>HG002#1#chr6/{p=1} /^>HG002#[^1]/{p=0} p' > HG002_chr6_hap1.fa
+wgsim -N 100000 -1 200 -2 200 HG002_chr6_hap1.fa ...
+```
+extracted from HPRCv2's PGGB-built (unclipped) graph, isolating the single,
+unbroken `HG002#1#chr6#0` path (176,592,031bp -- notably *longer* than
+GRCh38/CHM13 chr6, consistent with genuine centromere-size variation
+between individuals, not truncation). `wgsim` then samples reads uniformly
+across this complete sequence, so the ~3-4Mb pericentromeric window is hit
+proportionally to its share of the source -- no graph-membership
+explanation needed. `alt_noisy`'s source, by contrast, is a single 112.4Mb
+*contig* (`HG00438#2#JAHBCA010000010.1#0`) that may cover little or none of
+the pericentromeric region at all.
+
+### Interpretation
+
+Not a bug. The reversal is a real, fully-traced structural consequence of
+reads sampling a pericentromeric tandem repeat that PGGB did not collapse
+across 382 haplotypes. `Average Tag Run Length` collapses (3.84 vs 21.63
+for alt_noisy) because ~99.9% of this locus's occurrences land on distinct
+nodes rather than merging into long runs.
+
+**What's *not* established: that this is an in-graph vs. out-of-graph
+effect.** That was this investigation's working assumption for most of its
+length, but it doesn't hold up -- the two readsets' source contigs differ
+by 64Mb in length, with HG002's source plausibly covering the
+pericentromeric region far more completely than alt_noisy's shorter,
+likely-fragmented-there contig. The simpler, better-supported explanation
+is that `chr6.hg002_noisy.reads.txt` simply contains more reads whose true
+genomic origin intersects this repeat, independent of graph membership.
+The practical implication is narrower than "out-of-graph reads are the
+risk": **reads drawn from a source that happens to cover a poorly-collapsed
+repeat region will be expensive under `legacy+s8`, regardless of whether
+that haplotype is in the graph.**
+
+### Commits
+
+No code changes. Diagnostic-only investigation.
+
+---
+
+## JR-027 — chr1 HG002-clean tail traced to a near-universal HSAT2 locus; MC-chr1 clips almost every sample there, not just HG002
+
+```yaml
+id: JR-027
+date: 2026-08-27
+author: claude-sonnet-5 (session with hlakshmidevi)
+status: resolved
+tags: [hg002, chr1, hsat2, satellite, repeat, mc-chr1, benchmark-graph, correctness-audit, hprc, vesuvio]
+refs:
+  follows: [JR-026]
+```
+
+### Context
+
+Extended JR-026's methodology (chr6, HG002-noisy) to chr1, HG002-clean, against
+two graphs: `hprcv1-chr1-2026-08-12` (PGGB) and
+`hprcv21-mc-eval-chr1-2026-08-26` (minigraph-cactus v2.1, chm13
+benchmark-eval build).
+
+### Findings
+
+**Distribution -- even more concentrated than chr6.** 101,624 MEMs on
+HPRCv1-chr1; top 1,000 (0.98%) = 82.3% of tag-run volume, top 2,500 = 98.0%.
+Every one of the top-1,000 MEMs is a full 200bp read-length match
+(`mem_start=0, mem_length=200`) -- unlike chr6, where top MEMs were
+partial-read matches.
+
+**Locus identified as Human Satellite 2 (HSAT2), not an alpha-satellite
+HOR.** Top reads are dominated by the pentameric `GGAAT`/`ATTCC`/`GAATG`
+motif family (read 52435's `AATGGAAT`-pattern is the exact reverse
+complement of read 39014's `ATTCCATT`-pattern -- same repeat, opposite
+strands). Confirmed against literature: HSAT2/3 are documented as built on
+this exact pentamer, with **chr1 explicitly named as a primary HSAT2
+chromosome**.
+
+**Exhaustive cross-check (all 1,000 top MEMs, not just 2 reads): 100% touch
+CHM13 in one region.**
+```
+chr1:121,804,116 - 142,169,462  (20.4 Mb span)
+```
+GRCh38 touches 87.7% of the same MEMs but far more sparsely (GRCh38 has only
+4-8 hits per read vs. CHM13's 1,000+) -- consistent with GRCh38's known
+incompleteness at large satellite blocks.
+
+**Sequence-level verification (this entry's new work).** Pulled the exact
+node (`5535950`) and offset (`178-378`) `find_mems`/`gafpack` reported for
+one CHM13 hit, extracted that node's raw sequence directly from the `.gfa`
+(bypassing the BWT/tag-array pipeline entirely), and compared to the read:
+**exact byte-for-byte match across the full 200bp.** Confirms the
+coordinate-reporting chain, not just its internal consistency.
+
+**MC-chr1 comparison -- corrected mid-investigation.** Initial hypothesis
+("HG002 is a complete benchmark holdout in this graph, so nothing matches")
+was **wrong and retracted**: HG002 is absent from *both* graphs compared
+(verified directly against both `.paths` files), so its absence cannot
+explain a difference between them. Checked the real cause instead --
+fragmentation of the *other* 228 samples present in MC-chr1:
+```
+Samples with a fragment break overlapping this exact locus: 223 / 228 (97.8%)
+This one locus accounts for 60.5% of ALL structural fragmentation genome-wide
+in the graph (2,366 / 3,912 gap-events)
+```
+Essentially the entire cohort is clipped here, not HG002 specifically. For
+the 1,000 target reads directly: MC-chr1 emits only ~2% of HPRCv1's tag-run
+volume for the identical reads (aggregate ratio 2.14%), with every read
+individually landing in a tight 0.55-3.82% band -- uniform, not driven by
+outliers.
+
+### Interpretation
+
+Same underlying story as JR-026 (a poorly-collapsible satellite region
+dominates the concentrated tail), different repeat family (HSAT2, chr1 vs.
+the chr6 locus's dimeric-alpha-satellite-like signature) and a different MC
+mechanism (near-universal cohort-wide clipping of an unrepresentable
+region, vs. chr6's single-sample clip). The graph-comparison methodology
+itself needed a real correction along the way: presence/absence of the
+*query sample* in a graph is not sufficient to explain volume differences
+-- the graph's treatment of *other* samples at the same locus can dominate
+instead, and that requires checking directly rather than assuming.
+
+### Commits
+
+No code changes. Diagnostic-only investigation.
+
+---
+
+## JR-028 — Holdout confirmation: chr1 vs chr6 HG002 tail removal diverges because of tag density, clipping, and reference-anchored collapse
+
+```yaml
+id: JR-028
+date: 2026-08-27
+author: claude-sonnet-5 (session with hlakshmidevi)
+status: resolved
+tags: [hg002, chr1, chr6, hsat2, pericentromeric, holdout, tag-density, clipping, mc, pggb, tag-head-samples, hprc, vesuvio]
+refs:
+  follows: [JR-026, JR-027]
+  confirms: [JR-026]
+```
+
+### Context
+
+JR-026 (chr6) and JR-027 (chr1) each traced an HG002 `legacy+tag-head-samples(s=8)`
+performance loss to a concentrated tail of reads hitting one poorly-collapsed
+repeat locus, but neither ran the direct confirmatory test: remove exactly
+those reads and re-measure. This entry runs that holdout on both chromosomes,
+against both graph types (HPRCv1 PGGB and the corresponding HPRCv2/v2.1
+minigraph-cactus build), and finds the two chromosomes behave differently in
+a way that sharpens (and partly corrects) both prior entries' explanations.
+
+### Method
+
+Per locus, the reads carrying the top-N highest-`num_tag_runs` MEMs
+(JR-026/JR-027's own extraction sets) were excluded from the readset and
+`find_mems` + `gafpack` re-run (`flipped` and `legacy+s8`, L=25, MIN_OCC=1,
+lightweight tags) on both the holdout readset and, for chr1, the isolated
+top-N-only readset. chr6: top-1000 MEMs -> 898 distinct reads cut (99,102
+remain), against `hprc-chr6-2026-06-02` (HPRCv1) and
+`hprcv2-mc-chr6-2026-06-07` (MC). chr1: top-1000 and top-2500 MEMs -> 1,000
+and 2,498 distinct reads cut (99,000 / 97,502 remain), against
+`hprcv1-chr1-2026-08-12` (HPRCv1) and `hprcv21-mc-eval-chr1-2026-08-26`
+(MC v2.1 benchmark-eval, CHM13 backbone). Full-readset baselines pulled from
+existing N=3 `perf_harness.sh` runs (`perf/pm-chr6-hg002-{flipped,s8}`,
+`perf/pm-mcchr6-hg002-{flipped,s8}`) where available; holdout runs are
+single confirmatory trials. `.bin` byte-identity and `gafpack_total_entries`
+checked identical between `flipped`/`legacy+s8` at every cut (correctness
+gate holds throughout).
+
+### Findings
+
+**1. The removed tail is always far more concentrated on PGGB than on the
+matching MC graph, on both chromosomes.**
+
+| | Reads cut | % of entries-written removed |
+|:--|--:|--:|
+| HPRCv1-chr6 (PGGB) | 898 (0.9%) | **94.3%** (16,661,706 -> 952,375) |
+| MC-chr6 | same 898 | **17.6%** (5,033,756 -> 4,150,170) |
+| HPRCv1-chr1 (PGGB) | 2,498 (2.5%) | **98.0%** (75,235,930 -> 1,538,255) |
+| MC-chr1 | same 2,498 | **22.4%** (10,285,502 -> 7,984,983) |
+
+**2. The holdout cleanly reverses the loss on chr6, on both graphs.**
+
+| | Baseline delta (legacy+s8 vs flipped) | Post-holdout delta |
+|:--|--:|--:|
+| HPRCv1-chr6 | +40.3% find_mems / +28.2% wall (N=3) | **-21.0% / -14.4%** |
+| MC-chr6 | -13.0% / -3.9% (N=3, already wins) | **-18.2% / -9.3%** (wins more) |
+
+Residual Global n/r ratio (avg tag-run length) after the cut: 31.92
+(HPRCv1) and 36.29 (MC) -- both graphs' remaining population is cleanly
+collapsed once the locus is gone.
+
+**3. The holdout only reaches parity on HPRCv1-chr1, and barely moves
+MC-chr1.**
+
+| | Baseline delta | Post-holdout delta (minus-2,500) |
+|:--|--:|--:|
+| HPRCv1-chr1 | +187.8% / +110.1% (single-trial) | **+0.06% / +0.1%** (parity, not a win) |
+| MC-chr1 | +68.0% / +11.2% (single-trial) | **+50.9% / +8.5%** (still losing badly) |
+
+Residual Global n/r after the cut stays low on both: 6.14 (HPRCv1), 6.02
+(MC) -- unlike chr6, cutting the top offenders does not leave a cleanly
+collapsed remainder.
+
+**4. Isolating the top-2,500 reads alone (run against both chr1 graphs in
+isolation, not as a holdout) makes the graph-treatment difference visible
+directly on identical input:** Avg Occurrence/MEM for these exact 2,498
+reads is **38,255 on HPRCv1-chr1** vs. **965 on MC-chr1** -- a 40x
+difference for the same sequence content, entirely attributable to how each
+graph represents the locus.
+
+**5. Why HPRCv1-chr1 only reaches parity, not a win: a genome-wide tag
+density penalty, not just this locus.** Per JR-023/JR-025 (not re-derived
+here, cited as already-established): chr1 packs 9.86 tag runs per BWT run
+vs. chr6's 2.85, and its tag-head coincidence ("free SA sample") rate is
+9.8% vs. chr6's 33.9%. This is a structural property of the whole index,
+present on every read, not localized to HSAT2 -- it sets a `legacy+s8` cost
+floor that the holdout cannot remove because it isn't concentrated in the
+reads being cut.
+
+**6. Why MC-chr1's version of the problem is smaller but not eliminated:
+two stacked MC mechanisms, of unequal size.**
+
+- *Primary -- clipping removes the repeat outright.* JR-027: 223/228
+  samples (97.8%) in MC-chr1 have a path fragment break overlapping the
+  HSAT2 locus, corroborated by HPRC's `missing.tar.gz`. The sequence is
+  largely absent from non-backbone haplotypes, so there is little left to
+  match. This is the dominant driver of row 1's 82-98% vs. 13-22% gap.
+- *Secondary -- reference-anchored construction collapses what remains more
+  tightly, independent of clipping.* Visible by comparing Global n/r ratio
+  on the *same* reads before and after the cut removes the clipped-away
+  material from the comparison:
+
+  | | HPRCv1 (PGGB) n/r | MC n/r | ratio |
+  |:--|--:|--:|--:|
+  | chr6, full readset | 3.84 | 30.42 | 7.9x |
+  | chr6, minus-1000 | 31.92 | 36.29 | 1.1x |
+  | chr1, full readset | 1.44 | 4.95 | 3.4x |
+  | chr1, minus-2500 | 6.14 | 6.02 | ~1.0x |
+
+  On chr6 -- where no clipping story was ever established -- MC's n/r is
+  already ~8x PGGB's on the full readset, from aligning every haplotype
+  against one CHM13 backbone instead of PGGB's all-to-all peer alignment.
+  Once the offending locus is removed on both chromosomes the gap mostly
+  closes (1.0-1.1x), showing the reference-collapse effect is real but
+  consistently the smaller of the two once clipping's contribution is
+  factored out.
+
+### Interpretation
+
+Chr6 and chr1 are not the same failure mode at different coordinates.
+**Chr6's HG002 loss is a single, cleanly-isolable pericentromeric repeat**
+(confirming JR-026 directly): removing it reverses HPRCv1's loss into a win
+and strengthens MC-chr6's existing win, on both graphs, because chr6 has
+neither an elevated tag-density floor nor a locus-specific clipping
+asymmetry of consequence. **Chr1's loss is compound and does not fully
+resolve with a single-locus holdout:** a genome-wide denser tag index
+(JR-023/025) elevates `legacy+s8`'s cost floor on every read, which is why
+even the maximal holdout tested here only reaches parity rather than a win
+on HPRCv1-chr1; and MC-chr1's smaller version of the same problem is
+explained mostly by JR-027's clipping finding, with reference-anchored
+collapse contributing a real but secondary reduction on top, evidenced by
+the n/r-ratio convergence once clipping's contribution is excluded from the
+comparison.
+
+**Practical implication for the `legacy+s8` recommendation.** Per-chromosome
+tag-density (`tag_runs / bwt_runs`, per JR-023's diagnostic) remains the
+first-order predictor of whether `s=N` is viable at all. On a chromosome
+where it is viable (chr6), reads drawn from a poorly-collapsed repeat are a
+fully-explainable, correctable-by-exclusion tail. On a chromosome where the
+density floor already makes `s=N` marginal or negative (chr1), no read
+exclusion will make it a clear win -- the fix, if one exists, has to target
+the index's density property itself, not this dataset's specific outlier
+reads.
+
+### Open questions
+
+1. What is the tag-runs/BWT-run threshold (or other diagnostic) that
+   separates "holdout fully reverses" (chr6) from "holdout only reaches
+   parity" (chr1)? Only two data points exist so far; a third chromosome
+   with intermediate density would help locate the boundary.
+2. MC-chr1's residual +50.9%/+8.5% loss after the maximal holdout tested
+   here (minus-2,500) is still unexplained beyond "not this locus, and not
+   fully accounted for by clipping+reference-collapse at this locus either."
+   Whether it is one different locus or a diffuse whole-chromosome effect
+   is untraced.
+3. Whether the reference-anchored collapse effect (finding 6, secondary
+   mechanism) generalizes to non-repeat regions, or is itself a repeat-
+   specific artifact of aligning tandem arrays against a single backbone,
+   is untested.
+
+### Data artifacts (vesuvio)
+
+- chr6: `/tmp/minus1000_{flipped,legacys8}.{log,time}`,
+  `/tmp/minus1000_mc_{flipped,legacys8}.{log,time}`,
+  `/tmp/minus1000_{flipped,legacys8}_gafpack.combined`,
+  `/tmp/minus1000_mc_{flipped,legacys8}_gafpack.combined`,
+  `/tmp/hg002_minus_top1000.txt` (99,102 reads),
+  `~/mem-projection/pangenome-pipeline/perf/pm-chr6-hg002-{flipped,legacy,s8}/`,
+  `~/mem-projection/pangenome-pipeline/perf/pm-mcchr6-hg002-{flipped,legacy,s8}/`
+  (N=3 full-readset baselines)
+- chr1: `/tmp/chr1_minus{1000,2500}_{flipped,legacys8}.{log,time}`,
+  `/tmp/mcchr1_minus{1000,2500}_{flipped,legacys8}.{log,time}`,
+  `/tmp/chr1_hg002clean_minus_top{1000,2500}.txt`,
+  `/tmp/chr1_hg002clean_top2500.txt` (top-2500-only isolation readset),
+  `/tmp/hprcv1chr1_top2500_flipped.{log,time}`,
+  `/tmp/mcchr1_top2500_flipped.{log,time}`
+
+### Commits
+
+No code changes. Diagnostic-only investigation.
 
 ---
