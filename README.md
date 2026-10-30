@@ -1,6 +1,6 @@
 # Pangenome-Index
 
-A toolkit for building and querying pangenome indexes using an r-index and tag arrays. It is the indexing and MEM-finding backend for [MEM-Projection](https://github.com/hlakshmidevi10/MEM-Projection).
+A toolkit for building and querying pangenome indexes using an r-index and tag arrays. It is the indexing and MEM-finding backend for [MEM-Projection](https://github.com/hlakshmidevi10/MEM-Projection), forked from [pangenome-index](https://github.com/parsaeskandar/pangenome-index).
 
 It finds MEMs between reads and the pangenome using a lightweight tag index (`.ltags`), and writes them in a binary format that [path-walker](https://github.com/hlakshmidevi10/path-walker) reads directly to compute node coverage.
 
@@ -11,7 +11,6 @@ It finds MEMs between reads and the pangenome using a lightweight tag index (`.l
 - [Building an Index](#building-an-index)
 - [Finding MEMs](#finding-mems)
 - [Known Limitations](#known-limitations)
-- [Citation](#citation)
 
 ## Dependencies
 
@@ -199,12 +198,6 @@ The run summary (MEM counts, tag runs, timings, memory) goes to stdout.
 ## Known Limitations
 
 - **Node length**: `build_tags` aborts on any node longer than 1024 bp. When building the GBZ from a GFA, use `gfa2gbwt -m 1024`. Minigraph-Cactus graphs are already chopped at 1024 bp.
-
-## Citation
-
-If you use this software in your research, please cite:
-
-Parsa Eskandar, Benedict Paten, and Jouni Sirén: Lossless Pangenome Indexing Using Tag Arrays. bioRxiv 2025.05.12.653561, 2025. DOI: 10.1101/2025.05.12.653561
 
 ## License
 
