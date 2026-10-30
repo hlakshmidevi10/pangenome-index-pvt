@@ -2,7 +2,7 @@
 
 A toolkit for building and querying pangenome indexes using an r-index and tag arrays. It is the indexing and MEM-finding backend for [MEM-Projection](https://github.com/hlakshmidevi10/MEM-Projection).
 
-It finds MEMs between reads and the pangenome using a lightweight tag index (`.ltags`), and writes them in a binary format that [gafpack](https://github.com/hlakshmidevi10/gafpack-pvt) reads directly to compute node coverage.
+It finds MEMs between reads and the pangenome using a lightweight tag index (`.ltags`), and writes them in a binary format that [path-walker](https://github.com/hlakshmidevi10/path-walker) reads directly to compute node coverage.
 
 ## Table of Contents
 
@@ -26,7 +26,7 @@ It finds MEMs between reads and the pangenome using a lightweight tag index (`.l
 ### System Dependencies
 
 - **C++ compiler** with OpenMP (GCC, or Homebrew LLVM on macOS)
-- **CMake** and **Make**
+- **CMake**, **Make** and **pkg-config**
 - **OpenSSL**, **zstd**, **zlib**
 
 **macOS**:
@@ -36,10 +36,12 @@ brew install llvm@17 libomp cmake zstd zlib openssl@3 pkg-config
 
 **Linux (Debian/Ubuntu)**:
 ```bash
-sudo apt install build-essential cmake libssl-dev libzstd-dev zlib1g-dev
+sudo apt install build-essential cmake pkg-config libssl-dev libzstd-dev zlib1g-dev
 ```
 
 ## Installation
+
+**Using MEM-Projection?** Its `install.sh` builds this repository and all its dependencies at pinned versions; you don't need the steps below.
 
 All dependencies install into `$HOME/include` and `$HOME/lib`. Keep that prefix: the grlBWT submodule only looks for SDSL there. The makefiles also expect `sdsl-lite` to sit next to the other repos, so clone everything into one directory.
 
@@ -103,7 +105,7 @@ make -j 8
 ```
 
 The build will:
-1. Build the grlBWT submodule (`deps/grlBWT/build/`, including `grlbwt-cli`)
+1. Build the grlBWT submodule's library and `grlbwt-cli` (`deps/grlBWT/build/`)
 2. Create the `lib/` directory with the library
 3. Create the `bin/` directory with all executables
 
@@ -144,14 +146,17 @@ convert_tags graph.tags graph_compressed.tags --num-seq $NUM_SEQ
 # Build the lightweight tag index used by find_mems
 build_lightweight_tags graph_compressed.tags graph.ltags
 
-# Path names, needed by gafpack
+# Path names, needed by path-walker
 path_extract graph.gbz graph.paths
+
+# GFA with the GBZ's node IDs, needed by path-walker (requires vg)
+vg convert -fW --no-translation graph.gbz > graph.gfa
 
 # Index summary
 print_stats graph.ri graph_compressed.tags
 ```
 
-**Outputs used by queries**: `graph.ri`, `graph.ltags`, `graph.paths`. Keep `graph_compressed.tags` too if you want to run `find_mems` without `--lightweight-tags`.
+**Outputs used by queries**: `graph.ri`, `graph.ltags`, `graph.paths`, `graph.gfa`. Keep `graph_compressed.tags` too if you want to run `find_mems` without `--lightweight-tags`.
 
 **Optional** tag-head samples (`--tag-head-samples` in `find_mems`):
 ```bash
@@ -174,19 +179,19 @@ find_mems <r_index.ri> <tag_index> <reads.txt> <min_mem_length> <min_occurrences
 
 **Example** (what MEM-Projection runs by default):
 ```bash
-find_mems graph.ri graph.ltags reads.txt 25 1 mems --lightweight-tags
+find_mems graph.ri graph.ltags reads.txt 25 1 mems --lightweight-tags --use-flipped-mems
 ```
 
 **Options**:
-- `--lightweight-tags`: Read a `.ltags` file. This is the default mode in MEM-Projection.
-- `--use-flipped-mems`: Use the right-to-left flipped MEM finder. Gives the same coverage as the default finder; requires `--lightweight-tags`.
-- `--tag-head-samples=<file>`: Use a `.tag_samples.s<N>` file. Faster on HPRC chr6 but not on chr1, so it is off by default; requires `--lightweight-tags`.
+- `--lightweight-tags`: Read a `.ltags` file. MEM-Projection always uses this.
+- `--use-flipped-mems`: Right-to-left MEM finder with toehold recovery, so each MEM comes with SA[sp]. Requires `--lightweight-tags`.
+- `--tag-head-samples=<file>`: Use SA samples at tag-run heads (`.tag_samples.s<N>` from `build_tag_head_samples`). Requires `--lightweight-tags`.
 - `--tsv`: Also write a human-readable `_path_pos.tsv`.
 - `--all-positions`: Verification only. Skips the tag array and emits every BWT position of every MEM; output gets very large.
 - `--debug-stats`, `--verbose`: Extra logging.
 
 **Output Files**:
-- `<output_prefix>_path_pos_v2.bin`: MEM positions as 16-byte records, bucketed by path and sorted by path position (read by gafpack)
+- `<output_prefix>_path_pos_v2.bin`: MEM positions as 16-byte records, bucketed by path and orientation and sorted by path position (read by path-walker)
 - `<output_prefix>_seq_id_starts.out`: Start offset of each path's bucket in the `.bin` file
 
 The run summary (MEM counts, tag runs, timings, memory) goes to stdout.
