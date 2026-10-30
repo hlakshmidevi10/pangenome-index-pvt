@@ -68,9 +68,10 @@ PROGRAMS = $(addprefix $(BUILD_BIN)/,build_tags merge_tags build_rindex query_ta
 
 all: grlbwt directories $(LIBRARY) $(PROGRAMS)
 
+# Only the library and grlbwt-cli are used; grlBWT's other tools do not all build on GCC 15.
 grlbwt:
 	mkdir -p deps/grlBWT/build
-	cd deps/grlBWT/build && cmake .. && make
+	cd deps/grlBWT/build && cmake .. && $(MAKE) grlbwt grlbwt-cli
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
 
