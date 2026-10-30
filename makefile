@@ -78,13 +78,14 @@ directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
 $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ):
 	mkdir -p $@
 
-$(BUILD_OBJ)/%.o: $(SOURCE_DIR)/%.cpp $(HEADERS)
+$(BUILD_OBJ)/%.o: $(SOURCE_DIR)/%.cpp $(HEADERS) | $(BUILD_OBJ)
 	$(MY_CXX) $(CPPFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
-$(LIBRARY): $(LIBOBJS)
+$(LIBRARY): $(LIBOBJS) | $(BUILD_LIB)
 	ar rcs $@ $(LIBOBJS)
 
-$(BUILD_BIN)/%: $(BUILD_OBJ)/%.o $(LIBRARY)
+# Order-only on grlbwt so 'make -j' links against libgrlbwt.a only after it is built.
+$(BUILD_BIN)/%: $(BUILD_OBJ)/%.o $(LIBRARY) | grlbwt $(BUILD_BIN)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXX_FLAGS) -o $@ $< $(LIBRARY) $(LIBS)
 
 test: $(LIBRARY)
